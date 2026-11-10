@@ -41,9 +41,12 @@ pub mod morse;
 pub mod profiles;
 
 pub use config::{EngineConfig, OfdmBand, HF_MAX_SPEED_LEVEL};
+/// The air-protocol version (`docs/SPEC.md` §0.3), re-exported from
+/// `coppa-protocol`; equal to [`WIRE_FORMAT_VERSION`].
+pub use coppa_protocol::AIR_PROTOCOL_VERSION;
 pub use engine::{
-    CoppaCore, StreamFrame, MAX_TUNE_SECONDS, TUNE_SINGLE_MAX_HZ, TUNE_SINGLE_MIN_HZ,
-    TUNE_TONE_HIGH_HZ, TUNE_TONE_LOW_HZ, WIRE_FORMAT_VERSION,
+    CoppaCore, StreamFrame, HOST_API_VERSION, MAX_TUNE_SECONDS, TUNE_SINGLE_MAX_HZ,
+    TUNE_SINGLE_MIN_HZ, TUNE_TONE_HIGH_HZ, TUNE_TONE_LOW_HZ, WIRE_FORMAT_VERSION,
 };
 pub use link::{DisconnectReason, Link, LinkConfig, LinkError, LinkEvent, LinkState};
 pub use profiles::{Profile, EMERGENCY, HF_ROBUST, HF_STANDARD, VHF_FAST};

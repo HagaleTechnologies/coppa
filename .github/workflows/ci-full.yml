@@ -1,7 +1,7 @@
 name: ci
 
 # HAG-78: this file replaces the old ci.yml's own codex-clean-gated jobs (test-full, bench-fuzz,
-# clippy, msrv, deny, audit, wiki-lint; COP-90 added semver). It runs ONLY via workflow_dispatch (once
+# clippy, msrv, deny, audit, wiki-lint; COP-90 added semver, COP-178 ffi-abi). It runs ONLY via workflow_dispatch (once
 # wait-for-codex.yml's event-driven gate confirms a revision clean), plus push/merge_group for
 # the non-PR paths -- there is no mid-review-loop skip state to guard against here, since this
 # whole workflow only ever runs once a revision is already confirmed clean or has no PR review
@@ -243,6 +243,64 @@ jobs:
             --exclude coppa-cli --exclude coppa-daemon --exclude coppa-bench --exclude gen_nr_bg2 \
             --baseline-rev "$base"
 
+  # COP-178: the C ABI promise (docs/DECISIONS/2026-11-03-c-abi-versioning.md). The semver
+  # job above guards the Rust API only; this one compares crates/coppa-ffi/coppa.h and the
+  # built library's exports with the newest stable vX.Y.Z release tag in the target history,
+  # or with the bootstrap commit in tools/ffi-abi-baseline.json while no tag exists
+  # (docs/testing/c-abi-check.md). A removed or changed function, struct layout, enum value or
+  # COPPA_* constant fails unless COPPA_ABI_VERSION_MAJOR went up. Tool, fetch and build
+  # failures fail the job; nothing here passes by skipping. Linux x86_64 only.
+  ffi-abi:
+    name: C ABI compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Install ALSA and libudev dev headers, and libclang for the declaration extractor
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+          # A venv, since the runner's system Python is externally managed (PEP 668).
+          python3 -m venv "$RUNNER_TEMP/abi-venv"
+          "$RUNNER_TEMP/abi-venv/bin/pip" install 'libclang==18.1.1'
+          echo "ABI_PY=$RUNNER_TEMP/abi-venv/bin/python" >> "$GITHUB_ENV"
+      - name: Build coppa-ffi with strict header generation and require a fresh coppa.h
+        run: |
+          set -euo pipefail
+          touch crates/coppa-ffi/src/lib.rs
+          COPPA_FFI_STRICT_HEADER=1 cargo build -p coppa-ffi
+          git diff --exit-code -- crates/coppa-ffi/coppa.h
+      - name: Checker unit tests
+        run: |
+          "$ABI_PY" -m unittest discover -s tools/tests -p 'test_check_ffi_abi.py' -v
+      - name: C ABI matches the last release, or the ABI version says it does not
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # A PR revision (workflow_dispatch) takes its baseline from the merge base with main;
+          # push and merge_group take it from their own history, so HEAD == main still compares.
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            base=$(git merge-base HEAD origin/main)
+          else
+            base=HEAD
+          fi
+          "$ABI_PY" tools/check_ffi_abi.py --base-ref "$base" --fetch-tags --baseline-exports build \
+            --smoke --write-manifests "$RUNNER_TEMP/c-abi"
+      - name: Upload the baseline and current C ABI manifests and their diff
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: c-abi-manifests
+          path: ${{ runner.temp }}/c-abi
+          if-no-files-found: warn
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
@@ -379,7 +437,7 @@ jobs:
             wait_for_all "Create CI check-run on the reviewed SHA"
           fi
           SECONDS=0
-          wait_for_all "Full test suite" "Bench & Fuzz Compilation" Clippy "MSRV Check" "Supply-chain check (cargo-deny)" "Semver check (cargo-semver-checks)" "Security Audit" "Wiki lint"
+          wait_for_all "Full test suite" "Bench & Fuzz Compilation" Clippy "MSRV Check" "Supply-chain check (cargo-deny)" "Semver check (cargo-semver-checks)" "C ABI compatibility" "Security Audit" "Wiki lint"
 
       - name: Mint a hagale-agent installation token for the CI check-run
         id: app-token
@@ -461,6 +519,7 @@ jobs:
         msrv,
         deny,
         semver,
+        ffi-abi,
         audit,
         wiki-lint,
         checks-queue-watchdog,
@@ -524,11 +583,12 @@ jobs:
           MSRV: ${{ needs.msrv.result }}
           DENY: ${{ needs.deny.result }}
           SEMVER: ${{ needs.semver.result }}
+          FFI_ABI: ${{ needs.ffi-abi.result }}
           AUDIT: ${{ needs.audit.result }}
           WIKI_LINT: ${{ needs.wiki-lint.result }}
           CHECKS_QUEUE_WATCHDOG: ${{ needs.checks-queue-watchdog.result }}
         run: |
-          echo "test-full=$TEST_FULL bench-fuzz=$BENCH_FUZZ clippy=$CLIPPY msrv=$MSRV deny=$DENY semver=$SEMVER audit=$AUDIT wiki-lint=$WIKI_LINT checks-queue-watchdog=$CHECKS_QUEUE_WATCHDOG"
+          echo "test-full=$TEST_FULL bench-fuzz=$BENCH_FUZZ clippy=$CLIPPY msrv=$MSRV deny=$DENY semver=$SEMVER ffi-abi=$FFI_ABI audit=$AUDIT wiki-lint=$WIKI_LINT checks-queue-watchdog=$CHECKS_QUEUE_WATCHDOG"
           # create-ci-check legitimately reports "skipped" on every event but workflow_dispatch
           # (its own `if:` only runs for workflow_dispatch) -- excluded from the generic loop
           # below via an explicit re-check instead, so a real create-ci-check FAILURE (which is
@@ -537,7 +597,7 @@ jobs:
             echo "outcome=failure" >> "$GITHUB_OUTPUT"
             exit 1
           fi
-          for r in "$TEST_FULL" "$BENCH_FUZZ" "$CLIPPY" "$MSRV" "$DENY" "$SEMVER" "$AUDIT" "$WIKI_LINT" "$CHECKS_QUEUE_WATCHDOG"; do
+          for r in "$TEST_FULL" "$BENCH_FUZZ" "$CLIPPY" "$MSRV" "$DENY" "$SEMVER" "$FFI_ABI" "$AUDIT" "$WIKI_LINT" "$CHECKS_QUEUE_WATCHDOG"; do
             if [ "$r" != success ]; then
               echo "outcome=failure" >> "$GITHUB_OUTPUT"
               exit 1

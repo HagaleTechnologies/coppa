@@ -51,8 +51,14 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
+/// The air-protocol version these committed vectors guard (COP-178,
+/// `docs/SPEC.md` §0.3). A literal, independent of the production constant.
+const GUARDED_AIR_PROTOCOL_VERSION: u8 = 1;
+
 #[derive(serde::Deserialize)]
 struct ManifestFile {
+    /// Air-protocol version of every vector (COP-178). Required.
+    air_protocol_version: Option<u8>,
     vectors: Vec<VectorEntry>,
 }
 
@@ -85,7 +91,19 @@ fn read_manifest() -> ManifestFile {
             manifest_path.display()
         )
     });
-    toml::from_str(&text).expect("failed to parse golden manifest.toml")
+    let manifest: ManifestFile =
+        toml::from_str(&text).expect("air protocol v1: failed to parse golden manifest.toml");
+    match manifest.air_protocol_version {
+        Some(GUARDED_AIR_PROTOCOL_VERSION) => manifest,
+        Some(other) => panic!(
+            "air protocol v1: golden manifest declares air_protocol_version = {other}; \
+             these vectors guard version {GUARDED_AIR_PROTOCOL_VERSION} (docs/SPEC.md §0.3)"
+        ),
+        None => panic!(
+            "air protocol v1: golden manifest is missing its top-level \
+             `air_protocol_version = {GUARDED_AIR_PROTOCOL_VERSION}` key (docs/SPEC.md §0.3)"
+        ),
+    }
 }
 
 /// vhf_wide is only reachable via `coppa rx --profile VHF_FAST` when the
@@ -147,7 +165,7 @@ fn golden_vectors_rx_cli_decodes_and_prints_payloads() {
 
     assert!(
         failures.is_empty(),
-        "golden vector rx CLI failures ({}/{}):\n{}",
+        "air protocol v1: golden vector rx CLI failures ({}/{}):\n{}",
         failures.len(),
         manifest.vectors.len(),
         failures.join("\n")
