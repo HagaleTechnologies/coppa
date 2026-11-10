@@ -44,14 +44,14 @@ link here.
    permissively licensed projects and other Hagale Technologies repositories. Ask in a
    GitHub issue before you copy. The PR links the approval, names the source and its
    licence, and keeps the source's copyright notice.
-6. **cargo-deny's licence allowlist is the enforcement point.** `deny.toml:45-68` lists the
-   licences a dependency may carry, and the "Supply-chain check (cargo-deny)" job
-   (`.github/workflows/ci-full.yml:199-206`) fails a PR that adds a dependency outside the
-   list. MPL-2.0 is on the list (`deny.toml:59`). It is file-level copyleft that applies to
-   the dependency's own files. Adding a licence to the list is an owner decision. The check
-   reads dependency metadata, not source files, so it does not see pasted source. COP-174
-   tested both cases on 2026-11-09 with cargo-deny 0.20.2. A source file with a
-   `GPL-2.0-or-later` header pasted into `crates/coppa-dsp/src/` passed
+6. **cargo-deny's licence allowlist is the enforcement point.** The `[licenses]` section of
+   `deny.toml` (lines 45-68) lists the licences a dependency may carry. The "Supply-chain
+   check (cargo-deny)" job (`.github/workflows/ci-full.yml:199-206`) fails a PR that adds a
+   dependency outside the list. MPL-2.0 is on the list (`deny.toml:59`). It is file-level
+   copyleft that applies to the dependency's own files. Adding a licence to the list is an
+   owner decision. The check reads dependency metadata, not source files, so it does not see
+   pasted source. COP-174 tested both cases on 2026-11-09 with cargo-deny 0.20.2. A source
+   file with a `GPL-2.0-or-later` header pasted into `crates/coppa-dsp/src/` passed
    `cargo deny check licenses`. A path dependency declared `license = "GPL-3.0-only"` failed
    it with `rejected: license is not explicitly allowed`. The PR template's clean-room
    confirmation and review cover source provenance.
@@ -61,22 +61,29 @@ link here.
 
 ## Prior practice
 
-These items predate this policy. Each record says that no implementation code was copied.
-The rules apply from 2026-11-09 and do not reopen this work.
+These items predate this policy. They are listed so the rules do not read as a claim that
+nothing of the kind happened. Each item says what its record states. The rules apply from
+2026-11-09 and do not reopen this work.
 
 - `tools/gen_nr_bg2/src/main.rs:10-33`: the BG2 LDPC base-graph table was cross-checked
-  against srsRAN Project (AGPL-3.0) and NVIDIA Sionna (Apache-2.0). The values are the
-  3GPP TS 38.212 table.
-- `crates/coppa-codec/src/afsk.rs:177-180` (COP-113): the receiver constants are Direwolf's
-  profile A values, cited to WB2OSZ's paper. The implementer read Direwolf's source to learn
-  the stages and constants.
-- `crates/coppa-host/src/agw.rs` (COP-137): the AGWPE server was written after reading
-  Direwolf's `server.c` for protocol behaviour.
+  against srsRAN Project (AGPL-3.0) and NVIDIA Sionna (Apache-2.0). The comment says the
+  197 shift values are "copied verbatim from that cross-checked intersection". They are the
+  values of 3GPP TS 38.212 Table 5.3.2-3, a standard's data table, not implementation code.
+- `crates/coppa-codec/src/afsk.rs:177-179` (COP-113): the comment cites the receiver
+  constants to WB2OSZ's paper as Direwolf's profile A values, "used as numbers only".
+  COP-113's research records that the implementer read Direwolf's source to learn the
+  stages and constants, and that no Direwolf code was copied.
+- `crates/coppa-host/src/agw.rs` (COP-137, COP-164): COP-137's research read Direwolf's
+  `server.c` for protocol behaviour before the AGWPE server was written, and told the
+  implementer not to copy its code. `docs/LIMITATIONS.md:314-315` records one value, the
+  9600 baud code in the `g` reply, taken from a `server.c` comment (COP-164).
 - `tools/fx25-interop/README.md` and `testdata/il2p/README.md`: the fixture generators
-  patch a scratch Direwolf checkout. Decision 4 now rules that out, so regenerating fixtures
-  that way needs the owner's explicit approval as an exception.
-- `tests/codex_gate_auto_resolve_head.rs:9`: a test ported from propagation, a Hagale
-  Technologies repository.
+  patch a scratch Direwolf checkout. Both READMEs say no Direwolf implementation code is
+  copied into this repository. Decision 4 now rules that method out, so regenerating
+  fixtures that way needs the owner's explicit approval as an exception.
+- `tests/codex_gate_auto_resolve_head.rs:9`: the comment says the workflow's head re-check
+  was "ported from propagation f8e1243", a Hagale Technologies repository. Decision 5 now
+  puts porting code from another repository behind the owner's approval.
 
 ## Not done yet
 
@@ -85,6 +92,8 @@ The rules apply from 2026-11-09 and do not reopen this work.
   README and `Cargo.toml` are where MIT OR Apache-2.0 is stated.
 - `ARCHITECTURE.md`, `docs/PAT.md`, `docs/ARDOP.md` and `crates/coppa-host/src/vara/mod.rs`
   still describe the VARA relationship in their own words and do not link here.
+- `tools/fx25-interop/README.md` and `testdata/il2p/README.md` still describe regenerating
+  fixtures from a patched Direwolf checkout and do not point at decision 4.
 
 ## Rejected alternatives
 

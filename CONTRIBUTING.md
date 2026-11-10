@@ -65,7 +65,7 @@ with what counts as public documentation and the history before it, is
 - **Copied code from any source needs the owner's explicit approval first.** This
   includes permissively licensed projects and other Hagale Technologies repositories.
   Ask in a GitHub issue before you copy, then link the approval and the source's
-  licence in the PR.
+  licence in the PR, and keep the source's copyright notice.
 - **cargo-deny's licence allowlist is the enforcement point.** `deny.toml`
   `[licenses] allow` lists the licences a dependency may carry. The
   "Supply-chain check (cargo-deny)" job in `ci-full.yml` fails a PR that adds a
