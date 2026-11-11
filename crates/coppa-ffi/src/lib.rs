@@ -156,8 +156,9 @@ pub const COPPA_NONE_PENDING: i32 = 1;
 /// ABI major version: changes when an exported function, struct layout or
 /// constant changes incompatibly or is removed (COP-139).
 pub const COPPA_ABI_VERSION_MAJOR: u32 = 1;
-/// ABI minor version: changes when something is added (COP-139).
-pub const COPPA_ABI_VERSION_MINOR: u32 = 0;
+/// ABI minor version: changes when something is added (COP-139). 1 adds
+/// `coppa_air_protocol_version` and `coppa_host_api_version` (COP-178).
+pub const COPPA_ABI_VERSION_MINOR: u32 = 1;
 
 const POISONED_REASON: &str =
     "handle is unusable: an earlier internal panic poisoned its lock; destroy it and create a new one";
@@ -246,6 +247,28 @@ fn lock_or_poisoned<'a, T>(m: &'a Mutex<T>, func: &str) -> Result<MutexGuard<'a,
 #[no_mangle]
 pub extern "C" fn coppa_abi_version() -> u32 {
     (COPPA_ABI_VERSION_MAJOR << 16) | COPPA_ABI_VERSION_MINOR
+}
+
+/// The air-protocol version this library transmits and decodes
+/// (`docs/SPEC.md` §0.3): the value in the PHY and MAC header version
+/// fields. Two stations interoperate only when this matches. Separate from
+/// [`coppa_version`]'s crate version, [`coppa_host_api_version`] and
+/// [`coppa_abi_version`]. Needs ABI 1.1 or later (COP-178). Always safe to
+/// call; never touches [`coppa_last_error`].
+#[no_mangle]
+pub extern "C" fn coppa_air_protocol_version() -> u32 {
+    u32::from(coppa_engine::AIR_PROTOCOL_VERSION)
+}
+
+/// The host-API version this library implements (`docs/HOST-API.md`): the
+/// same number coppad reports over TCP (`VERSIONINFO`) and WebSocket
+/// (`hello.host_api_version`). Separate from [`coppa_version`]'s crate
+/// version, [`coppa_air_protocol_version`] and [`coppa_abi_version`]. Needs
+/// ABI 1.1 or later (COP-178). Always safe to call; never touches
+/// [`coppa_last_error`].
+#[no_mangle]
+pub extern "C" fn coppa_host_api_version() -> u32 {
+    coppa_engine::HOST_API_VERSION
 }
 
 /// The calling thread's message for its most recent failed `coppa_*` call,
@@ -3105,7 +3128,37 @@ mod tests {
             (COPPA_ABI_VERSION_MAJOR << 16) | COPPA_ABI_VERSION_MINOR
         );
         assert_eq!(COPPA_ABI_VERSION_MAJOR, 1);
-        assert_eq!(COPPA_ABI_VERSION_MINOR, 0);
+        assert_eq!(COPPA_ABI_VERSION_MINOR, 1);
+        assert_eq!(coppa_abi_version(), 0x0001_0001);
+    }
+
+    /// COP-178: the air-protocol and host-API versions are their own
+    /// numbers, reported without a handle, and match the engine's.
+    #[test]
+    fn test_air_protocol_and_host_api_versions() {
+        assert_eq!(coppa_air_protocol_version(), 1, "air protocol v1");
+        assert_eq!(coppa_host_api_version(), 1, "host API v1");
+        assert_eq!(
+            coppa_air_protocol_version(),
+            u32::from(coppa_engine::WIRE_FORMAT_VERSION)
+        );
+        assert_eq!(coppa_host_api_version(), coppa_engine::HOST_API_VERSION);
+        // Infallible: the last-error slot is untouched.
+        assert!(coppa_last_error().is_null());
+    }
+
+    #[test]
+    fn test_checked_in_header_declares_version_accessors() {
+        let h = header();
+        for needle in [
+            "uint32_t coppa_air_protocol_version(void);",
+            "uint32_t coppa_host_api_version(void);",
+            "uint32_t coppa_abi_version(void);",
+            "const char *coppa_version(void);",
+            "#define COPPA_ABI_VERSION_MINOR 1",
+        ] {
+            assert!(h.contains(needle), "coppa.h is missing {needle:?}");
+        }
     }
 
     #[test]
@@ -3113,7 +3166,7 @@ mod tests {
         let h = header();
         for needle in [
             "#define COPPA_ABI_VERSION_MAJOR 1",
-            "#define COPPA_ABI_VERSION_MINOR 0",
+            "#define COPPA_ABI_VERSION_MINOR 1",
             "coppa_abi_version(void)",
             " * Thread safety",
             "must not",

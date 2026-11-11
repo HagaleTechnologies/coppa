@@ -63,6 +63,8 @@ __all__ = [
     "NONE_PENDING",
     "OK",
     "abi_version",
+    "air_protocol_version",
+    "host_api_version",
     "last_error",
     "strerror",
     "version",
@@ -81,6 +83,21 @@ def abi_version():
     """The loaded library's C ABI version as ``(major, minor)``."""
     packed = int(_ffi.lib.coppa_abi_version())
     return (packed >> 16, packed & 0xFFFF)
+
+
+def air_protocol_version():
+    """The air-protocol version the loaded library transmits and decodes
+    (docs/SPEC.md section 0.3), for example ``1``. Stations interoperate only
+    when it matches. Separate from :func:`version`, :func:`host_api_version`
+    and :func:`abi_version`."""
+    return int(_ffi.lib.coppa_air_protocol_version())
+
+
+def host_api_version():
+    """The host-API version the loaded library implements, for example ``1``:
+    the same number coppad reports over TCP (``VERSIONINFO``) and WebSocket
+    (``hello.host_api_version``)."""
+    return int(_ffi.lib.coppa_host_api_version())
 
 
 def strerror(code):
