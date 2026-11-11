@@ -268,12 +268,16 @@ const RV_MASK: u8 = 0x03;
 /// trigger: those evict by a fixed retained-sample budget, this one by LRU
 /// recency + an explicit count cap).
 struct HarqRxBuffers {
-    /// seq -> (accumulated mother-length LLR buffer, the speed level that
-    /// buffer was built from). COP-68: the level guard -- a combine whose
-    /// header level differs from the buffered level drops the entry and
-    /// starts fresh (see `get_or_create`), so LLRs from differently
-    /// rate-matched geometries are never added together.
-    map: HashMap<u8, (Vec<f32>, u8)>,
+    /// key -> accumulated mother-length LLR buffer plus the tag it was built
+    /// under. The key is `seq_num & HarqPolicy::key_mask` (COP-168; the
+    /// default mask 0xFF makes it the whole `seq_num`, as before). COP-68:
+    /// the level guard -- a combine whose header level differs from the
+    /// buffered level drops the entry and starts fresh (see
+    /// `get_or_create`), so LLRs from differently rate-matched geometries are
+    /// never added together. COP-168 widens the tag to the payload length,
+    /// for the same reason: a different payload length pins a different
+    /// known pad, so it is a different codeword.
+    map: HashMap<u8, HarqEntry>,
     /// Recency order, least-recently-used at the front, most-recently-used at
     /// the back. Each live seq appears at most once (enforced by `touch`). A
     /// linear scan/removal is fine at this size (capped at
@@ -284,6 +288,46 @@ struct HarqRxBuffers {
 /// LRU cap on the number of distinct in-flight seqs [`HarqRxBuffers`] holds
 /// buffers for simultaneously (decision 3: "LRU cap of 32 seqs").
 const HARQ_MAX_BUFFERS: usize = 32;
+
+/// One [`HarqRxBuffers`] entry: the running mother-length LLR sum and the
+/// tag that must match before another transmission is added into it.
+struct HarqEntry {
+    /// Elementwise sum of every combined transmission's dematched LLRs.
+    llrs: Vec<f32>,
+    /// Speed level the buffer was built at (COP-68 guard).
+    level: u8,
+    /// Payload bits (payload plus CRC) the buffer was built for (COP-168
+    /// guard).
+    payload_bits: usize,
+    /// Transmissions added into `llrs` so far.
+    attempts: u32,
+}
+
+/// Receive-side IR-HARQ combining policy (COP-168).
+///
+/// [`HarqPolicy::default`] is the behaviour every receiver had before
+/// COP-168: the whole `seq_num` keys the soft buffer and an RV0 frame adds
+/// into whatever the key already holds (Chase combining of a repeat).
+/// A windowed session (COP-168 design rule 5) packs a `following` count
+/// into the high nibble of `seq_num`, so it keys on the low nibble only and
+/// starts a fresh buffer on every RV0 frame, because RV0 marks a first
+/// transmission there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HarqPolicy {
+    /// Mask applied to `seq_num` to form the soft-buffer key.
+    pub key_mask: u8,
+    /// Whether an RV0 frame drops its key's buffer before combining.
+    pub rv0_starts_fresh: bool,
+}
+
+impl Default for HarqPolicy {
+    fn default() -> Self {
+        Self {
+            key_mask: 0xFF,
+            rv0_starts_fresh: false,
+        }
+    }
+}
 
 impl HarqRxBuffers {
     fn new() -> Self {
@@ -314,12 +358,16 @@ impl HarqRxBuffers {
     /// COP-68's drop-to-a-robust-level retransmissions make cross-level
     /// combines ordinary rather than rare). Research's five-line
     /// recommendation, now enforced.
-    fn get_or_create(&mut self, seq: u8, level: u8) -> &mut Vec<f32> {
-        let level_mismatch = self
+    ///
+    /// COP-168 adds `payload_bits` to the same guard: a buffer built for a
+    /// different payload length is a different codeword, so it is dropped
+    /// rather than added into.
+    fn get_or_create(&mut self, seq: u8, level: u8, payload_bits: usize) -> &mut HarqEntry {
+        let tag_mismatch = self
             .map
             .get(&seq)
-            .is_some_and(|(_, buffered_level)| *buffered_level != level);
-        if level_mismatch {
+            .is_some_and(|e| e.level != level || e.payload_bits != payload_bits);
+        if tag_mismatch {
             self.evict(seq);
         }
         if !self.map.contains_key(&seq) {
@@ -327,15 +375,25 @@ impl HarqRxBuffers {
                 let lru = self.order.remove(0);
                 self.map.remove(&lru);
             }
-            self.map
-                .insert(seq, (vec![0.0f32; NrLdpc::MOTHER_LEN], level));
+            self.map.insert(
+                seq,
+                HarqEntry {
+                    llrs: vec![0.0f32; NrLdpc::MOTHER_LEN],
+                    level,
+                    payload_bits,
+                    attempts: 0,
+                },
+            );
         }
         self.touch(seq);
-        &mut self
-            .map
+        self.map
             .get_mut(&seq)
             .expect("just inserted or already present above")
-            .0
+    }
+
+    /// Transmissions combined so far under `key`, or 0 when it has no buffer.
+    fn attempts(&self, key: u8) -> u32 {
+        self.map.get(&key).map_or(0, |e| e.attempts)
     }
 
     /// Evict `seq`'s buffer, if any (decision 3: CRC pass or an explicit
@@ -343,6 +401,12 @@ impl HarqRxBuffers {
     fn evict(&mut self, seq: u8) {
         self.map.remove(&seq);
         self.order.retain(|&s| s != seq);
+    }
+
+    /// Drop every buffer (COP-168: a `key_mask` change re-keys the space).
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
     }
 
     /// Number of distinct seqs currently buffered (test/introspection only).
@@ -442,6 +506,12 @@ pub struct CoppaTransceiver {
     /// doesn't work here (its value isn't `Copy`), so `RefCell` is the natural
     /// next step up, not a new pattern.
     harq_rx: RefCell<HarqRxBuffers>,
+    /// Receive-side combining policy (COP-168); `Cell` for the same reason
+    /// as `harq_rx`. See [`HarqPolicy`].
+    harq_policy: Cell<HarqPolicy>,
+    /// CRC passes whose key held more than one transmission (COP-168). See
+    /// [`Self::harq_combined_successes`] for what it does and does not show.
+    harq_combined_successes: Cell<u64>,
 }
 
 impl std::fmt::Debug for CoppaTransceiver {
@@ -652,6 +722,8 @@ impl CoppaTransceiver {
             turbo_rescues: Cell::new(0),
             cross_codeword_interleave_override: None,
             harq_rx: RefCell::new(HarqRxBuffers::new()),
+            harq_policy: Cell::new(HarqPolicy::default()),
+            harq_combined_successes: Cell::new(0),
         }
     }
 
@@ -946,15 +1018,23 @@ impl CoppaTransceiver {
         );
 
         let mut dematched = {
+            let key = self.harq_key(seq);
             let mut harq = self.harq_rx.borrow_mut();
+            // COP-168: under a windowed-session policy an RV0 frame is a
+            // first transmission, so whatever its key holds is stale.
+            if rv == 0 && self.harq_policy.get().rv0_starts_fresh {
+                harq.evict(key);
+            }
             // COP-68: `level` (this transmission's header speed level) rides
             // along so the buffer can evict a differently-leveled entry
-            // instead of combining across rate-matched geometries.
-            let acc = harq.get_or_create(seq, level);
-            for (a, &d) in acc.iter_mut().zip(per_tx.iter()) {
+            // instead of combining across rate-matched geometries. COP-168
+            // adds `payload_bits` to that tag.
+            let entry = harq.get_or_create(key, level, payload_bits);
+            for (a, &d) in entry.llrs.iter_mut().zip(per_tx.iter()) {
                 *a += d;
             }
-            acc.clone()
+            entry.attempts += 1;
+            entry.llrs.clone()
         };
 
         pin_known_pad(&mut dematched, payload_bits, k_used, PIN_LLR);
@@ -973,8 +1053,57 @@ impl CoppaTransceiver {
     /// state for it is stale and can be freed immediately rather than waiting
     /// for LRU eviction to reclaim it. A no-op if `seq` has no buffer (e.g. it
     /// already decoded on the first attempt, or was already evicted).
+    ///
+    /// COP-168: `seq` is masked with the current [`HarqPolicy::key_mask`]
+    /// first, so under the default policy this evicts exactly `seq`.
     pub fn harq_evict(&self, seq: u8) {
-        self.harq_rx.borrow_mut().evict(seq);
+        self.harq_rx.borrow_mut().evict(self.harq_key(seq));
+    }
+
+    /// Set the receive-side combining policy (COP-168). Takes effect from the
+    /// next received frame. A change of `key_mask` drops every buffer held,
+    /// because their keys were formed under the old mask: kept, they could
+    /// combine with an unrelated frame under the new mask and could no longer
+    /// be evicted by `seq_num`.
+    pub fn set_harq_policy(&self, policy: HarqPolicy) {
+        if policy.key_mask != self.harq_policy.get().key_mask {
+            self.harq_rx.borrow_mut().clear();
+        }
+        self.harq_policy.set(policy);
+    }
+
+    /// The current receive-side combining policy (COP-168).
+    pub fn harq_policy(&self) -> HarqPolicy {
+        self.harq_policy.get()
+    }
+
+    /// Number of single-codeword frames that passed CRC while their key held
+    /// more than one transmission (COP-168). A frame that decodes on the
+    /// first transmission under its key does not count. The count does not
+    /// prove the combining did the work: a pass that turbo re-estimation of
+    /// the latest transmission alone produced counts too, and so does a pass
+    /// under the default policy whose key also held an earlier frame of the
+    /// same level and length. Monotonic for the transceiver's lifetime.
+    pub fn harq_combined_successes(&self) -> u64 {
+        self.harq_combined_successes.get()
+    }
+
+    /// Soft-buffer key for a frame's `seq_num` under the current policy.
+    fn harq_key(&self, seq: u8) -> u8 {
+        seq & self.harq_policy.get().key_mask
+    }
+
+    /// CRC pass for a single-codeword frame (COP-168 split out of
+    /// `receive_single_codeword`): count it as a combined success when its
+    /// key held more than one transmission, then evict the key (decision 3).
+    fn harq_record_success(&self, seq: u8) {
+        let key = self.harq_key(seq);
+        let mut harq = self.harq_rx.borrow_mut();
+        if harq.attempts(key) > 1 {
+            self.harq_combined_successes
+                .set(self.harq_combined_successes.get() + 1);
+        }
+        harq.evict(key);
     }
 
     #[cfg(test)]
@@ -1270,8 +1399,9 @@ impl CoppaTransceiver {
 
         // CRC pass (Phase 3 Task 3, decision 3): this seq is fully, correctly
         // delivered -- evict its IR-HARQ accumulator now rather than waiting
-        // for LRU eviction to reclaim it.
-        self.harq_rx.borrow_mut().evict(seq);
+        // for LRU eviction to reclaim it (and count a combined success,
+        // COP-168).
+        self.harq_record_success(seq);
 
         // SNR estimate from the same per-carrier noise variances used for LLR scaling.
         let mean_nv = if noise_vars.is_empty() {
@@ -1473,7 +1603,7 @@ impl CoppaTransceiver {
         let payload: Vec<u8> = outcomes.into_iter().flat_map(|(_, bytes)| bytes).collect();
 
         let seq = header.seq_num;
-        self.harq_rx.borrow_mut().evict(seq);
+        self.harq_rx.borrow_mut().evict(self.harq_key(seq));
 
         let mean_nv = if noise_vars.is_empty() {
             1.0
@@ -2718,6 +2848,227 @@ mod tests {
             payload,
             "Chase-combined decode must recover the exact original payload"
         );
+    }
+
+    // ── COP-168 Phase 2: receive-side HARQ policy ───────────────────────
+
+    /// Whether a `harq_combine_and_decode` result recovered `payload` exactly.
+    fn decoded_ok(result: &(Vec<f32>, Vec<u8>, bool, usize), payload: &[u8]) -> bool {
+        result.2 && descramble_to_payload(&result.1, payload.len()) == payload
+    }
+
+    /// COP-168: the default policy is the pre-COP-168 behaviour -- whole
+    /// `seq_num` key, no RV0 reset -- so an explicit default still combines
+    /// RV0+RV1 of one seq, and does not combine across seqs that differ only
+    /// in the high nibble.
+    #[test]
+    fn default_policy_matches_todays_combining() {
+        assert_eq!(
+            HarqPolicy::default(),
+            HarqPolicy {
+                key_mask: 0xFF,
+                rv0_starts_fresh: false
+            }
+        );
+        let payload = vec![0x42u8; 198];
+        let (tx, mother, k_used, payload_bits) = harq_test_fixture(&payload);
+        assert_eq!(tx.harq_policy(), HarqPolicy::default());
+        tx.set_harq_policy(HarqPolicy::default());
+
+        let llrs_rv0 = erased_coded_llrs(&mother, k_used, 0, 0.30, 8.0, 0xA11CE);
+        let llrs_rv1 = erased_coded_llrs(&mother, k_used, 1, 0.30, 8.0, 0xB0B1E5);
+
+        let first = tx.harq_combine_and_decode(200, 9, 0, k_used, payload_bits, &llrs_rv0);
+        assert!(!decoded_ok(&first, &payload));
+        let combined = tx.harq_combine_and_decode(200, 9, 1, k_used, payload_bits, &llrs_rv1);
+        assert!(
+            decoded_ok(&combined, &payload),
+            "the default policy must still combine RV0+RV1 of one seq"
+        );
+
+        let first = tx.harq_combine_and_decode(0x35, 9, 0, k_used, payload_bits, &llrs_rv0);
+        assert!(!decoded_ok(&first, &payload));
+        let other = tx.harq_combine_and_decode(0x05, 9, 1, k_used, payload_bits, &llrs_rv1);
+        assert!(
+            !decoded_ok(&other, &payload),
+            "the default 0xFF mask must keep 0x35 and 0x05 in separate buffers"
+        );
+    }
+
+    /// COP-168: with `key_mask: 0x0F` two transmissions whose `seq_num`
+    /// differs only in the high nibble (a windowed session's `following`
+    /// count) share one buffer and combine; with 0xFF they do not.
+    #[test]
+    fn key_mask_combines_frames_whose_high_nibble_differs() {
+        let payload = vec![0x5Au8; 198];
+        let llr_seeds = (0xC0FF_EE01, 0xC0FF_EE02);
+
+        for (mask, expect_decode) in [(0x0Fu8, true), (0xFFu8, false)] {
+            let (tx, mother, k_used, payload_bits) = harq_test_fixture(&payload);
+            tx.set_harq_policy(HarqPolicy {
+                key_mask: mask,
+                rv0_starts_fresh: false,
+            });
+            let llrs_rv0 = erased_coded_llrs(&mother, k_used, 0, 0.30, 8.0, llr_seeds.0);
+            let llrs_rv1 = erased_coded_llrs(&mother, k_used, 1, 0.30, 8.0, llr_seeds.1);
+
+            let first = tx.harq_combine_and_decode(0x35, 9, 0, k_used, payload_bits, &llrs_rv0);
+            assert!(
+                !decoded_ok(&first, &payload),
+                "RV0 alone (30% erasure) must not decode -- fixture invariant"
+            );
+            let second = tx.harq_combine_and_decode(0x05, 9, 1, k_used, payload_bits, &llrs_rv1);
+            assert_eq!(
+                decoded_ok(&second, &payload),
+                expect_decode,
+                "mask {mask:#04x}: 0x35 then 0x05 combined decode should be {expect_decode}"
+            );
+        }
+    }
+
+    /// COP-168: with `rv0_starts_fresh`, an RV0 frame drops a stale buffer
+    /// under its key (left by a failed frame of a different payload of the
+    /// same length) instead of adding into it.
+    #[test]
+    fn rv0_starts_fresh_discards_a_stale_buffer() {
+        let p1 = vec![0x11u8; 198];
+        let p2 = vec![0xEEu8; 198];
+
+        for (fresh, expect_attempts) in [(true, 1u32), (false, 2u32)] {
+            let (tx, mother1, k_used, payload_bits) = harq_test_fixture(&p1);
+            let (_, mother2, _, _) = harq_test_fixture(&p2);
+            tx.set_harq_policy(HarqPolicy {
+                key_mask: 0x0F,
+                rv0_starts_fresh: fresh,
+            });
+
+            let stale = erased_coded_llrs(&mother1, k_used, 0, 0.30, 8.0, 0x57A1E);
+            let first = tx.harq_combine_and_decode(0x13, 9, 0, k_used, payload_bits, &stale);
+            assert!(
+                !decoded_ok(&first, &p1),
+                "P1 must fail -- fixture invariant"
+            );
+
+            let clean = erased_coded_llrs(&mother2, k_used, 0, 0.0, 8.0, 0xF4E54);
+            let second = tx.harq_combine_and_decode(0x03, 9, 0, k_used, payload_bits, &clean);
+            assert_eq!(
+                tx.harq_rx.borrow().attempts(3),
+                expect_attempts,
+                "rv0_starts_fresh={fresh}: attempts held under key 3"
+            );
+            if fresh {
+                assert!(
+                    decoded_ok(&second, &p2),
+                    "a fresh RV0 buffer must decode the clean P2 frame"
+                );
+            }
+        }
+    }
+
+    /// COP-168: a transmission whose payload length differs from the
+    /// buffered one under the same key starts a fresh buffer, under every
+    /// policy.
+    #[test]
+    fn tag_mismatch_restarts_the_buffer() {
+        let payload = vec![0x24u8; 100];
+        let (tx, mother, k_used, payload_bits_100) = harq_test_fixture(&payload);
+        let payload_bits_101 = (101 + PAYLOAD_CRC_LEN) * 8;
+        let llrs = erased_coded_llrs(&mother, k_used, 0, 0.30, 8.0, 0x7A6);
+
+        for policy in [
+            HarqPolicy::default(),
+            HarqPolicy {
+                key_mask: 0x0F,
+                rv0_starts_fresh: true,
+            },
+        ] {
+            tx.set_harq_policy(policy);
+            tx.harq_evict(7);
+            let _ = tx.harq_combine_and_decode(7, 9, 0, k_used, payload_bits_100, &llrs);
+            let _ = tx.harq_combine_and_decode(7, 9, 1, k_used, payload_bits_100, &llrs);
+            assert_eq!(
+                tx.harq_rx.borrow().attempts(7),
+                2,
+                "{policy:?}: same tag adds"
+            );
+            let _ = tx.harq_combine_and_decode(7, 9, 1, k_used, payload_bits_101, &llrs);
+            assert_eq!(
+                tx.harq_rx.borrow().attempts(7),
+                1,
+                "{policy:?}: a different payload length must restart the buffer"
+            );
+        }
+    }
+
+    /// COP-168: changing `key_mask` drops the buffers formed under the old
+    /// mask, so a stale buffer cannot combine with a frame under the new mask
+    /// and none is left that `harq_evict` can no longer reach. Setting the same
+    /// mask again keeps them.
+    #[test]
+    fn key_mask_change_drops_buffers_formed_under_the_old_mask() {
+        let payload = vec![0x3Cu8; 198];
+        let (tx, mother, k_used, payload_bits) = harq_test_fixture(&payload);
+        let llrs = erased_coded_llrs(&mother, k_used, 0, 0.30, 8.0, 0xD1CE);
+
+        let _ = tx.harq_combine_and_decode(0x35, 9, 0, k_used, payload_bits, &llrs);
+        assert!(tx.harq_rx.borrow().contains(0x35));
+        tx.set_harq_policy(HarqPolicy::default());
+        assert!(
+            tx.harq_rx.borrow().contains(0x35),
+            "an unchanged mask keeps the buffers"
+        );
+
+        tx.set_harq_policy(HarqPolicy {
+            key_mask: 0x0F,
+            rv0_starts_fresh: false,
+        });
+        assert_eq!(
+            tx.harq_buffer_count(),
+            0,
+            "a mask change drops every buffer"
+        );
+        let _ = tx.harq_combine_and_decode(0x35, 9, 1, k_used, payload_bits, &llrs);
+        assert_eq!(
+            tx.harq_rx.borrow().attempts(0x05),
+            1,
+            "the first frame under the new mask starts fresh"
+        );
+    }
+
+    /// COP-168: `harq_combined_successes` counts a CRC pass only when the key
+    /// held more than one transmission.
+    #[test]
+    fn combined_success_counter_counts_only_multi_attempt_decodes() {
+        // First-attempt decode through the real receive path: no count.
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let payload = vec![0x66u8; 20];
+        let header = make_header(2, payload.len() as u16);
+        let samples = tx.transmit(&header, &payload).unwrap();
+        let (_, decoded, _) = tx.receive(&samples).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(tx.harq_combined_successes(), 0);
+
+        // Two combined transmissions, then the CRC-pass bookkeeping.
+        let payload = vec![0x42u8; 198];
+        let (tx, mother, k_used, payload_bits) = harq_test_fixture(&payload);
+        let llrs_rv0 = erased_coded_llrs(&mother, k_used, 0, 0.30, 8.0, 0xA11CE);
+        let llrs_rv1 = erased_coded_llrs(&mother, k_used, 1, 0.30, 8.0, 0xB0B1E5);
+        let _ = tx.harq_combine_and_decode(9, 9, 0, k_used, payload_bits, &llrs_rv0);
+        let combined = tx.harq_combine_and_decode(9, 9, 1, k_used, payload_bits, &llrs_rv1);
+        assert!(decoded_ok(&combined, &payload));
+        tx.harq_record_success(9);
+        assert_eq!(tx.harq_combined_successes(), 1);
+        assert!(
+            !tx.harq_rx.borrow().contains(9),
+            "success must evict the key"
+        );
+
+        // A single-transmission success on the same transceiver: no count.
+        let clean = erased_coded_llrs(&mother, k_used, 0, 0.0, 8.0, 0x1);
+        let alone = tx.harq_combine_and_decode(10, 9, 0, k_used, payload_bits, &clean);
+        assert!(decoded_ok(&alone, &payload));
+        tx.harq_record_success(10);
+        assert_eq!(tx.harq_combined_successes(), 1);
     }
 
     /// Task 3 failing-test scenario (c), part 1: a clean, CRC-passing decode

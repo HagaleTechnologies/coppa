@@ -31,6 +31,15 @@ Older releases have no entry here. Their on-air breaks are listed in
   `ProtocolError::WindowedArqMismatch` variant: the wire
   primitives for windowed session ARQ. The windowed sender and receiver are not built yet
   (`docs/LIMITATIONS.md`).
+- **Rust API, additive (receive-side HARQ):** `modem::HarqPolicy`,
+  `CoppaTransceiver::{set_harq_policy, harq_policy, harq_combined_successes}`,
+  `StreamingReceiver::{set_harq_policy, harq_policy, harq_combined_successes,
+  take_failed_headers}`, `streaming::MAX_FAILED_HEADERS` and
+  `CoppaCore::{encode_bytes_tagged, set_harq_policy, take_failed_headers,
+  harq_combined_successes}`. The default policy keeps the old combining.
+- **Behaviour change:** a soft-combining buffer now restarts when a frame under the same
+  key has a different payload length, not only a different level, so two frames of
+  different lengths that share `seq_num` 0 no longer add their soft bits together.
 
 ## Unreleased: 0.12.0
 
