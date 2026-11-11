@@ -77,6 +77,17 @@
 pub mod error;
 pub use error::ProtocolError;
 
+/// The Coppa air-protocol version this implementation transmits and decodes
+/// (`docs/SPEC.md` §0.1 and §0.3, COP-178).
+///
+/// It is the value stamped in both the PHY header's and the MAC header's
+/// four-bit version field, and it keys the preamble and probe sequences.
+/// Version 1 is frozen from crate release 0.12.0: an incompatible change to
+/// any field, FEC parameter or session message listed in SPEC §0.3 must
+/// allocate a new value. It is independent of the crate semver, the host-API
+/// version and the C ABI version.
+pub const AIR_PROTOCOL_VERSION: u8 = 1;
+
 pub mod app;
 pub mod app_stream;
 pub mod arq;

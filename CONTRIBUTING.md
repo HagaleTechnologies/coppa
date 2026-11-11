@@ -34,9 +34,10 @@ cargo fmt --all -- --check
   (default, all and no default features), `cargo test --lib` with features, `cargo fmt --check`,
   the tutorial checks, rustdoc with `-D warnings`, and a Linux/macOS/Windows matrix (`--lib`
   only). `ci-full.yml` runs the full `cargo test --workspace` suite, clippy with `-D warnings`,
-  the MSRV check, cargo-semver-checks, cargo-deny, the security audit, bench and fuzz builds, and `wiki-lint` on
-  `wiki/`. Run the full `cargo test --workspace` locally before pushing; it is faster feedback
-  than waiting for `ci-full.yml`.
+  the MSRV check, cargo-semver-checks, the C ABI compatibility check
+  (`docs/testing/c-abi-check.md`), cargo-deny, the security audit, bench and fuzz builds, and
+  `wiki-lint` on `wiki/`. Run the full `cargo test --workspace` locally before pushing; it is
+  faster feedback than waiting for `ci-full.yml`.
 - To exercise feature-gated code, use CI's feature set:
   `--features cpal-backend,websocket,kiss-tnc,gpio-ptt,ardop,mdns`. `cpal-backend` needs
   `libasound2-dev`. The `serial-ptt` feature (and so `--all-features`) also needs `libudev-dev`.
@@ -118,7 +119,7 @@ records why existing WAVs are preserved.
 ## Adding a speed level or profile
 
 A speed level touches all of these; [ADR-009](docs/adr/009-cop24-speed-ladder-renumber.md) is
-the precedent for a ladder change:
+the precedent for a ladder change, from before the air-protocol version 1 freeze described below:
 
 - `SPEED_LEVELS` in `crates/coppa-codec/src/ofdm/coppa_modem.rs` (a fixed-size array).
 - `speed_level_components`, `k_used_for_level` and `max_payload_for_level` in
@@ -129,11 +130,20 @@ the precedent for a ladder change:
 - [docs/SPEC.md](docs/SPEC.md) §5.2 (rate matching) and §6 (speed-level table).
 - The golden-vector grid in `golden_vectors_gen.rs` (see above).
 - A `waterfall_bracket_level_N` test in `crates/coppa-bench/src/runner.rs`.
+- `air_v1_speed_level_fec_parameters` in `crates/coppa-protocol/tests/air_v1_conformance.rs`,
+  which pins the version-1 level table.
 - An ADR.
 
 A new profile touches the `CoppaProfile` constructors in `crates/coppa-codec/src/ofdm/mod.rs`,
 `profile_by_name` and `select_profile` in `crates/coppa-bench/src/scenario.rs`, and the named
 profiles in `crates/coppa-engine/src/profiles.rs`.
+
+[docs/SPEC.md](docs/SPEC.md) §0.3 (COP-178) freezes air-protocol version 1, including the
+per-level and profile parameters (`air_v1_profile_parameters` guards the latter). A change to a
+frozen item, or an on-air addition that no existing negotiation mechanism gates, is incompatible
+(§0.3.4). It must allocate a new air-protocol version, add a §0.1 history entry and a new freeze
+table, and record the break in `CHANGELOG.md` (§0.3.1, §0.3.2). ADR-009 kept header `version: 1`
+for its ladder change; §0.3.1 no longer allows that.
 
 ## Licensing and clean-room rules
 

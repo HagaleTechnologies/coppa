@@ -8,9 +8,12 @@ PHY header (§4.2) and the MAC header (§17.1).
 | 2 (adds §16–§21, COP-130) | 2026-11-04 | 0.6.0 | `edb17bc` |
 | 3 (adds §22, COP-119) | 2026-11-04 | 0.9.0 | `79ee3aa` |
 | 4 (adds §23, COP-121) | 2026-11-08 | 0.11.0 | COP-121 branch, based on `f6e9951` |
+| 5 (adds §0.3 air-protocol v1 contract, COP-178) | 2026-11-09 | 0.12.0 | COP-178 branch, based on `4237273` |
 
-There is no in-band version negotiation and no changelog beyond §0.1's
-wire-break history.
+There is no in-band version negotiation. §0.1 records the wire-break
+history; §0.3 states what air-protocol version 1 freezes from crate 0.12.0
+onward and how an incompatible change is signalled. Release notes live in
+`CHANGELOG.md`.
 
 ## 0. Purpose, audience, and how to read this document
 
@@ -116,6 +119,130 @@ stack.** The generic stack's types (`OfdmProfile::HF_STANDARD`,
 `SignalField`, Schmidl-Cox `generate_sts`/`generate_lts`, MCS_TABLE) are
 mentioned nowhere below except this note, precisely so a reader does not
 mistake them for the wire format.
+
+### 0.3 Air-protocol version 1 compatibility contract (COP-178)
+
+This subsection is normative. It states what a station built against
+air-protocol version 1 can rely on in later releases. The "air-protocol
+version" is the value carried in the PHY header `version` field (§4.2) and the
+MAC header version nibble (§17.1); earlier text in this document calls it the
+"wire-format version". It is independent of the crate (package) version, the
+host-API version (`docs/HOST-API.md`) and the C ABI version
+(`docs/DECISIONS/2026-11-03-c-abi-versioning.md`). A host reads all of them at
+runtime as separate fields: `VERSIONINFO` on the TCP command port, the
+WebSocket `hello` message, and `coppa_air_protocol_version()`,
+`coppa_host_api_version()`, `coppa_version()` and `coppa_abi_version()` in the
+C library.
+
+#### 0.3.1 The rule
+
+Air-protocol version 1 freezes the canonical format described by this specification
+at the COP-178 compatibility-contract release, crate version 0.12.0. Historical
+releases that reused version 1 are covered only by the recorded break history.
+An incompatible change MUST allocate a new air-protocol version, stamp that
+version in both PHY and MAC headers, and use its version-keyed preamble and probe.
+Release notes MUST name the old and new versions, the incompatible fields, the
+first affected crate release, and the required peer upgrade or retained decoder.
+No in-band version negotiation or automatic downgrade is promised.
+
+The releases listed in §0.1 before 0.12.0 all carry header `version: 1`
+although they are not mutually compatible. The promise starts at 0.12.0: a
+0.12.0 station and any later release that still sends air-protocol version 1
+MUST interoperate on every frozen item below. Nothing is promised about a
+pre-0.12.0 peer.
+
+#### 0.3.2 Signalling an incompatible change
+
+- **On the air.** The new format carries its new version number in the PHY
+  header `version` nibble (§4.2) and in the MAC header version nibble
+  (§17.1), and its preamble and probe PN sequences are keyed by that number
+  (§3). A version-1 receiver therefore fails preamble correlation on the new
+  format instead of mis-decoding it.
+- **In the release notes.** `CHANGELOG.md` MUST carry, for that release, the
+  old and new air-protocol versions, the list of incompatible fields (by the
+  §-numbers of this document), the first crate release that transmits the new
+  version, and whether peers must upgrade or whether the release keeps a
+  version-1 decoder.
+- **In this document.** The change adds a §0.1 history entry and a new
+  freeze table for the new version. The version-1 table below is never edited
+  to describe a different format.
+
+The current receiver decodes exactly one version (§0.1). It does not
+negotiate, does not fall back, and does not reliably tell its host that a
+peer uses another version: it may simply fail acquisition and report nothing.
+
+#### 0.3.3 Version-number capacity
+
+The PHY `version` field is four bits. Value `0` is reserved and MUST NOT be
+sent. Value `1` is this version. Values `2` through `15` are allocated in
+order, one per incompatible format, and never reused. Before value `15` is
+allocated, a separate framing decision MUST define how versions beyond 15 are
+signalled.
+
+The MAC header version nibble keeps its documented receive leniency (§17.6):
+a receiver parses a MAC header whatever its version nibble. This contract
+adds no rejection behavior.
+
+#### 0.3.4 What is frozen, what may change
+
+- **Required core.** Every row below marked *core* is mandatory for every
+  version-1 station.
+- **Negotiated optional features.** Rows marked *negotiated* apply only when
+  both stations enable them through an existing negotiation mechanism
+  (CONNECT capability flags, §20.1, or the CP-switch exchange, §20.4). A
+  station that does not negotiate a feature never sees its format.
+- **Reserved values stay reserved.** Reserved bits, nibble values and enum
+  values listed in this document keep their reserved meaning in version 1.
+  Senders MUST keep writing the documented value.
+- **Additions without a new version.** A later release MAY add a format and
+  keep version 1 only when an existing negotiation mechanism prevents a peer
+  that does not know the addition from ever receiving it (for example, a new
+  CONNECT capability flag bit). Every other on-air change is incompatible.
+- **Outside the freeze.** Receiver tuning (synchronisation thresholds,
+  channel estimation, equalisation, LDPC decoder iterations and scheduling),
+  local timers and retry policy (§19.6), and any section marked
+  **(Informative)** may change in any release. They change how well a
+  station receives, not what it sends.
+
+#### 0.3.5 Freeze table
+
+Tests named `air_v1_*` live in
+`crates/coppa-protocol/tests/air_v1_conformance.rs`; the vector tests live in
+`crates/coppa-protocol/tests/`. Each guard compares the implementation with
+literal expected values. The `air_v1_*` tests and the protocol, compression
+and golden vector tests name `air protocol v1` in their failure messages;
+the older unit and `app_stream_vectors` guards listed below pin the same
+literals without that label.
+
+| Frozen item | Kind | Defined in | Executable guard |
+|---|---|---|---|
+| PHY header bit assignments (version, phy_mode, frame_type, bandwidth, fec_type, speed_level, seq_num, payload_len, codewords) | core | §4.2 | `air_v1_phy_header_bit_layout`; `protocol_vectors::phy_header_over_p04_is_p28` |
+| PHY frame types (0-6; 7-15 invalid) | core | §4.2 | `air_v1_phy_frame_type_values` |
+| Profile carrier and timing parameters (FFT, sample rate, CP, data and pilot carriers, carrier offset, bandwidth id) | core | §1.1, §2, §3 | `air_v1_profile_parameters`; `golden_vectors` WAVs |
+| Preamble, probe and pilot pattern | core | §3 | `golden_vectors::golden_vectors_decode_to_expected_payloads` (committed WAVs) |
+| Protected-header coding (48 to 144 bits) | core | §4.3 | `air_v1_protected_header_coding` |
+| Payload FEC: NR BG2 mother code, Zc = 176, base graph table | core | §5.1 | `air_v1_bg2_mother_code` |
+| Per-level K_used, payload budget, code rate, modulation (levels 1-9; 0 and 10-15 invalid) | core | §5.2, §6 | `air_v1_speed_level_fec_parameters` |
+| Shortening and circular-buffer rate matching, redundancy versions RV0-RV3 | core | §5.2, §5.3 | `air_v1_rate_matching_rv0_to_rv3`; retransmission entries in `golden_vectors::golden_vectors_decode_through_the_streaming_receiver` |
+| Scrambler sequence and known-pad convention | core | §5.4 | `air_v1_scrambler_sequence` |
+| Per-codeword payload CRC-32 | core | §5.5 | unit test `air_v1_payload_crc32_check_value` in `coppa-protocol` `modem::transceiver` (polynomial and trailer length); trailer byte order end to end in `golden_vectors::golden_vectors_decode_to_expected_payloads` |
+| Constellation bit order (BPSK, QPSK, 8PSK, 16-QAM, 64-QAM) | core | §6.1 | `air_v1_constellation_bit_order` |
+| Intra-codeword block interleaver | core | §7.1 | `air_v1_block_interleaver_permutation` |
+| Cross-codeword interleaver and its level gate | core | §7.2, §9.3 | multi-codeword entries `L7_awgn12_cw3`, `L9_awgn12_cw8` in `golden_vectors` |
+| Multi-codeword payload splitting | core | §9.1 | `L4_awgn12_cw3`, `L7_awgn12_cw3`, `L9_awgn12_cw8` in `golden_vectors`; unit test `split_payload_across_codewords_matches_800_byte_level6_example` in `coppa-protocol` `modem::transceiver` |
+| Payload compression envelope and fixed Huffman table | negotiated (capability flag bit 0) | §15 | `compression_vectors::huffman_vectors_match_spec_15_6`, `compression_vectors::envelope_vector_matches_spec_15_6`, `protocol_vectors::compression_envelope_over_p04_is_p29` |
+| MAC header layout, callsign encoding, SSID | core | §17.1, §17.2 | `air_v1_mac_frame_type_values`; `protocol_vectors::handshake_emits_p01_to_p03_and_establishes` |
+| MAC frame types 0-10 (11-15 reserved) | core | §17.3 | `air_v1_mac_frame_type_values` |
+| Transport header and types | core | §18 | `air_v1_transport_type_values`; `protocol_vectors::transport_rows_p14_to_p17` |
+| ACK semantics: cumulative ACK, selective bitmap, wrap | core | §19.2, §19.3 | `protocol_vectors::data_ack_exchange_is_p04_to_p07`, `protocol_vectors::sack_across_wrap_is_p13` |
+| Capabilities blob and every flag bit | core layout; each flag negotiated | §20.1 | `air_v1_capability_bits`; `protocol_vectors::capabilities_are_p23_to_p27` |
+| Session messages: CONNECT_REQ/ACK/CFM, Data, Ack, Keepalive, Disconnect, Beacon | core | §17.5, §20.1-§20.3 | `protocol_vectors::handshake_emits_p01_to_p03_and_establishes`, `protocol_vectors::connect_req_with_ssid_5_is_p12`, `protocol_vectors::keepalive_and_disconnect_are_p08_p09`, `protocol_vectors::beacons_are_p10_p11` |
+| CP control (short-CP switch) | negotiated (CP-switch exchange) | §20.4 | `protocol_vectors::cp_negotiation_is_p18_to_p22` |
+| Datagrams (MAC type 9) | core | §11, §17.3 | `air_v1_mac_frame_type_values` |
+| Broadcast file records | core (carried in datagrams) | Broadcast file application, after §21.4 | unit test `fixed_vector` in `coppa-protocol` `broadcast_file` |
+| RS(12,6) outer-code session packets (MAC type 10) | negotiated (capability flag bits 2 and 3) | §22 | unit test `known_answer_vector` in `coppa-protocol` `fec::outer_rs`; `air_v1_capability_bits` |
+| Chat and application records on stream 1 | negotiated (capability flag bit 4) | §23 | `app_stream_vectors::a01_to_a04_come_from_the_public_encoders`, `app_stream_vectors::spec_23_rows_carry_the_frozen_hex` |
+| Golden waveforms (42 entries, every level, multi-codeword, retransmission) | core | §14 | `golden_vectors` and `coppa-cli` `rx_golden`; `testdata/golden/manifest.toml` declares `air_protocol_version = 1` and both readers refuse a manifest without it |
 
 ---
 
@@ -1166,6 +1293,11 @@ The manifest holds 42 entries in three families (COP-129):
   and `L4_awgn12_rtx_rv2` (an HF level). Each WAV holds two frames, as
   described below.
 
+The manifest's top-level `air_protocol_version = 1` key (COP-178) names
+the air-protocol version (§0.3) every vector was encoded with. Both readers
+refuse a manifest without it, or with another value, and every failure
+message names `air protocol v1`.
+
 Two optional keys describe the newer entries; an entry without them has
 the default:
 
@@ -1187,6 +1319,9 @@ the payload and the last RV in `rv_sequence`.
 of `cargo test --workspace`):
 
 - `golden_manifest_covers_the_full_grid` asserts the 42-entry shape above.
+- `golden_manifest_requires_air_protocol_version_1` asserts the manifest
+  declares air-protocol version 1 and that a manifest missing the key, or
+  declaring another version, is refused.
 - `golden_vectors_decode_to_expected_payloads` checks every single-frame
   entry: it constructs a `CoppaTransceiver` for that level's profile, calls
   `receive()` on the WAV samples, and asserts the recovered `speed_level`,
