@@ -134,6 +134,10 @@ name = "session"
 path = "diagnostics/session.rs"
 
 [[example]]
+name = "session_harq"
+path = "diagnostics/session_harq.rs"
+
+[[example]]
 name = "short_cp_fading_gate"
 path = "diagnostics/short_cp_fading_gate.rs"
 

@@ -204,22 +204,40 @@ pub fn phy_following(phy_seq: u8) -> u8 {
     phy_seq >> 4
 }
 
-/// COP-168 (COP-168 design, RV table): the redundancy-version order per speed level for a
+/// COP-168 (COP-186 measurement): the redundancy-version order per speed level for a
 /// windowed session, indexed by level (index 0 is unused).
 ///
 /// Entry 0 of every row is RV0, the first transmission. Retransmission
 /// attempt `k` (k >= 1) uses entry `((k - 1) % 3) + 1`, so a retransmission
 /// never repeats RV0 and an RV0 frame always starts a fresh soft buffer.
 ///
-/// **Provisional.** Every row is `[0, 1, 3, 2]` until the per-level
-/// `session_harq` measurement (COP-168 Phase 2) replaces it. The order puts
-/// RV2 last because the COP-168 plan-phase probe, recorded in
-/// `docs/LIMITATIONS.md`'s COP-129 bullet, found RV2 the worst first
-/// retransmission at levels 2 and 3 on Watterson Moderate and useless at
-/// level 3 on AWGN (0 of 36 failed frames rescued, against 21 for a same-RV
-/// repeat). 3GPP's `[0, 2, 3, 1]`
-/// ([`rv_for_attempt`]) would make those retransmissions worse than today's.
-pub const RV_SCHEDULE: [[u8; 4]; 10] = [[0, 1, 3, 2]; 10];
+/// Measured, not assumed. Every row is the selection rule (best
+/// first-retransmission rescue; tie within one frame -> best after the
+/// second retransmission; tie -> the order closest to 3GPP's `[0, 2, 3, 1]`,
+/// [`rv_for_attempt`]) applied to the paired `session_harq` measurement
+/// pasted in `BENCHMARKS.md`'s "COP-186: `session_harq` per-level
+/// retransmission rescue (2026-11-11)" section: Watterson Moderate, 120
+/// failed RV0 frames per level, identical channel draws across arms. RV3,
+/// not 3GPP's RV2, is the best first retransmission at levels 1-4 and 7-8,
+/// and RV1 at levels 5-6; an RV2-first order lost at every level, the
+/// COP-129 level-3 AWGN pathology (0 of 36 rescued) being the recorded
+/// extreme. Level 9 is VHF-only and copies level 8's row. At levels 1 and 2
+/// the chosen order does not beat a Chase repeat on the first retransmission
+/// (at level 2 every order trails Chase), and levels 4-8 were measured on
+/// Watterson-Moderate's outage floor rather than in the 25-35% FER window;
+/// `docs/LIMITATIONS.md` records both facts.
+pub const RV_SCHEDULE: [[u8; 4]; 10] = [
+    [0, 3, 1, 2], // 0: unused (levels are 1-9); mirrors level 1
+    [0, 3, 1, 2], // level 1
+    [0, 3, 1, 2], // level 2
+    [0, 3, 1, 2], // level 3
+    [0, 3, 2, 1], // level 4
+    [0, 1, 2, 3], // level 5
+    [0, 1, 3, 2], // level 6
+    [0, 3, 1, 2], // level 7
+    [0, 3, 2, 1], // level 8
+    [0, 3, 2, 1], // level 9 (VHF-only): copies level 8
+];
 
 /// COP-168 (COP-168 design rule 4): the redundancy version for transmission
 /// `attempt` of a segment at speed `level` in a windowed session.

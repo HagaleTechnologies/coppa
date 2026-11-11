@@ -13,6 +13,424 @@ payload → OFDM modulate → AWGN → demodulate/decode. SNR is **audio-band SN
 Eb/N0), swept −6…30 dB in 3 dB steps. "Goodput" = `payload_bits × (1 − FER) / frame_airtime`.
 Raw per-point data is regenerable into `results/awgn.csv` (gitignored).
 
+## COP-186: `session_harq` per-level retransmission rescue (2026-11-11)
+
+Measured 2026-11-11 on x86_64 Linux (32 cores), release build, by the new
+`session_harq` diagnostic (`cargo run --release -p coppa-bench --example session_harq`),
+run on the COP-186 branch built on `1ac3273` (the diagnostic, its helpers in
+`coppa_bench::session_harq`, and the `RV_SCHEDULE` fill are this branch's diff).
+Total wall time 901 s. Session-like frames per the COP-168 plan's method:
+`max_multi_payload_for_level(level, cw) - 21` random payload bytes, a 1200-sample
+zero tail, Watterson-Moderate then AWGN at the 3 kHz HF noise convention referenced
+to the clean frame's power, a fresh channel seed per physical transmission. Paired
+arms over identical draws: Chase (RV0 again, combined, under the default
+`HarqPolicy`) and all six orders of {1,2,3} for retransmissions 1-3, every arm
+replaying the same failed RV0 contribution first.
+
+Targets were reduced from the plan's defaults under its wall-time clause
+("if wall time forces fewer trials ... record the achieved counts"):
+`SESSION_HARQ_CAL_TRIALS=100` (default 400), `SESSION_HARQ_MAX_TRIALS=1600` (2000),
+`SESSION_HARQ_TARGET_FAILURES=120` (400), `SESSION_HARQ_BUDGET_SECS=540` per level;
+every level reached the full 120 failed RV0 frames, and the achieved trial counts
+are in each level's row below. Calibration is a coarse 2 dB pass then 0.5 dB steps
+(the printed curve); a level whose FER never reaches 0.20 anywhere in 0-44 dB is
+flagged `FLOORED` — Watterson-Moderate's outage floor — and measured at the floor's
+best point (levels 4-8; level 5's chosen point, FER 0.312, is nonetheless inside
+the 25-35% window, level 4's is FER 0.450).
+
+Shipped `arq::RV_SCHEDULE` rows (selection rule: best first-retransmission rescue;
+tie within one frame -> best after retransmission 2; tie -> order closest to 3GPP's
+[0, 2, 3, 1]; level 9 copies level 8, VHF-only). First-retransmission margin
+against Chase is in percentage points of 120 failures:
+
+| level | shipped order | rescue<=1 vs Chase | margin |
+|---|---|---|---|
+| 1 | [0, 3, 1, 2] | 83/120 vs 83/120 | +0.0 (tie; does not beat Chase) |
+| 2 | [0, 3, 1, 2] | 83/120 vs 87/120 | -3.3 (every order trails Chase) |
+| 3 | [0, 3, 1, 2] | 109/120 vs 106/120 | +2.5 |
+| 4 | [0, 3, 2, 1] | 112/120 vs 99/120 | +10.8 (at the FER 0.45 floor point) |
+| 5 | [0, 1, 2, 3] | 95/120 vs 62/120 | +27.5 |
+| 6 | [0, 1, 3, 2] | 105/120 vs 67/120 | +31.7 |
+| 7 | [0, 3, 1, 2] | 83/120 vs 40/120 | +35.8 |
+| 8 | [0, 3, 2, 1] | 52/120 vs 14/120 | +31.7 |
+
+Levels where the shipped schedule does not beat Chase on the first retransmission:
+levels 1 and 2 (level 1 ties at 83/120 and Chase leads after retransmission 2,
+114 vs 112; at level 2 every order trails Chase after every retransmission count —
+the same level-2 "IR does not beat Chase" finding the `task3_harq_ir_bench` module
+doc records). At level 2 the schedule's win has to come from airtime elsewhere or
+not at all; `docs/LIMITATIONS.md` carries both facts. An RV2-first order lost at
+every level, confirming COP-129's level-3 pathology generalizes: 3GPP's [0, 2, 3, 1]
+would have been the wrong schedule everywhere on this channel.
+
+The level-4 8-codeword row is informational for the transmit follow-up:
+multi-codeword receive has no cross-attempt IR combining (Phase 3 Task 5 scope
+cut), and on Watterson Moderate the 8-codeword frame sat on a total outage floor
+(FER 1.000 at every SNR through 44 dB, 0 rescues in 80 failures across all arms).
+
+Verbatim output (calibration prints interleave by thread):
+
+```
+session_harq (COP-186): targets cal_trials=100 max_trials=1600 target_failures=120 budget=Some(540.0)
+channel: Watterson Moderate + AWGN (3 kHz reference), fresh seed per TX
+  calibration: coarse 2 dB pass, 16 trials/point ...
+  calibration: coarse 2 dB pass, 16 trials/point ...
+  calibration: coarse 2 dB pass, 16 trials/point ...
+  calibration: coarse 2 dB pass, 16 trials/point ...
+  calibration: coarse 2 dB pass, 16 trials/point ...
+  calibration: coarse 2 dB pass, 16 trials/point ...
+  calibration: coarse 2 dB pass, 16 trials/point ...
+  calibration: coarse 2 dB pass, 16 trials/point ...
+  calibration: coarse 2 dB pass, 16 trials/point ...
+    snr_db=  0.0 first_tx_fer=1.000 (coarse)
+    snr_db=  0.0 first_tx_fer=1.000 (coarse)
+    snr_db=  0.0 first_tx_fer=1.000 (coarse)
+    snr_db=  0.0 first_tx_fer=1.000 (coarse)
+    snr_db=  0.0 first_tx_fer=1.000 (coarse)
+    snr_db=  0.0 first_tx_fer=1.000 (coarse)
+    snr_db=  2.0 first_tx_fer=1.000 (coarse)
+    snr_db=  2.0 first_tx_fer=1.000 (coarse)
+    snr_db=  2.0 first_tx_fer=1.000 (coarse)
+    snr_db=  2.0 first_tx_fer=1.000 (coarse)
+    snr_db=  0.0 first_tx_fer=0.938 (coarse)
+    snr_db=  0.0 first_tx_fer=0.875 (coarse)
+    snr_db=  4.0 first_tx_fer=1.000 (coarse)
+    snr_db=  2.0 first_tx_fer=0.938 (coarse)
+    snr_db=  4.0 first_tx_fer=1.000 (coarse)
+    snr_db=  2.0 first_tx_fer=1.000 (coarse)
+    snr_db=  4.0 first_tx_fer=1.000 (coarse)
+    snr_db=  4.0 first_tx_fer=1.000 (coarse)
+    snr_db=  6.0 first_tx_fer=1.000 (coarse)
+    snr_db=  6.0 first_tx_fer=0.938 (coarse)
+    snr_db=  4.0 first_tx_fer=0.812 (coarse)
+    snr_db=  6.0 first_tx_fer=1.000 (coarse)
+    snr_db=  6.0 first_tx_fer=0.938 (coarse)
+    snr_db=  2.0 first_tx_fer=0.812 (coarse)
+    snr_db=  2.0 first_tx_fer=0.750 (coarse)
+    snr_db=  8.0 first_tx_fer=1.000 (coarse)
+    snr_db=  4.0 first_tx_fer=1.000 (coarse)
+    snr_db=  8.0 first_tx_fer=0.938 (coarse)
+    snr_db= 10.0 first_tx_fer=1.000 (coarse)
+    snr_db=  6.0 first_tx_fer=0.375 (coarse)
+    snr_db=  8.0 first_tx_fer=0.938 (coarse)
+    snr_db=  8.0 first_tx_fer=1.000 (coarse)
+    snr_db= 10.0 first_tx_fer=0.875 (coarse)
+    snr_db=  4.0 first_tx_fer=0.500 (coarse)
+    snr_db=  6.0 first_tx_fer=0.875 (coarse)
+    snr_db= 12.0 first_tx_fer=1.000 (coarse)
+    snr_db= 10.0 first_tx_fer=0.750 (coarse)
+    snr_db=  4.0 first_tx_fer=0.562 (coarse)
+    snr_db=  8.0 first_tx_fer=0.312 (coarse)
+    snr_db= 10.0 first_tx_fer=1.000 (coarse)
+    snr_db= 12.0 first_tx_fer=0.688 (coarse)
+    snr_db=  8.0 first_tx_fer=0.875 (coarse)
+    snr_db= 14.0 first_tx_fer=1.000 (coarse)
+    snr_db= 12.0 first_tx_fer=0.625 (coarse)
+    snr_db=  0.0 first_tx_fer=1.000 (coarse)
+    snr_db= 12.0 first_tx_fer=0.938 (coarse)
+    snr_db= 10.0 first_tx_fer=0.250 (coarse)
+    snr_db= 14.0 first_tx_fer=0.625 (coarse)
+    snr_db=  6.0 first_tx_fer=0.375 (coarse)
+    snr_db= 14.0 first_tx_fer=0.438 (coarse)
+    snr_db= 16.0 first_tx_fer=1.000 (coarse)
+    snr_db= 10.0 first_tx_fer=0.750 (coarse)
+    snr_db=  6.0 first_tx_fer=0.438 (coarse)
+    snr_db= 14.0 first_tx_fer=0.875 (coarse)
+    snr_db= 12.0 first_tx_fer=0.125 (coarse)
+  calibration: fine 0.5 dB pass over [4.0, 12.0] dB, 100 trials/point ...
+    snr_db= 16.0 first_tx_fer=0.625 (coarse)
+    snr_db= 18.0 first_tx_fer=1.000 (coarse)
+    snr_db= 16.0 first_tx_fer=0.375 (coarse)
+    snr_db= 16.0 first_tx_fer=0.875 (coarse)
+    snr_db= 12.0 first_tx_fer=0.750 (coarse)
+    snr_db= 18.0 first_tx_fer=0.500 (coarse)
+    snr_db= 20.0 first_tx_fer=1.000 (coarse)
+    snr_db=  8.0 first_tx_fer=0.125 (coarse)
+  calibration: fine 0.5 dB pass over [4.0, 8.0] dB, 100 trials/point ...
+    snr_db=  8.0 first_tx_fer=0.250 (coarse)
+    snr_db= 18.0 first_tx_fer=0.312 (coarse)
+    snr_db= 18.0 first_tx_fer=0.812 (coarse)
+    snr_db= 20.0 first_tx_fer=0.438 (coarse)
+    snr_db= 14.0 first_tx_fer=0.625 (coarse)
+    snr_db= 22.0 first_tx_fer=1.000 (coarse)
+    snr_db= 20.0 first_tx_fer=0.312 (coarse)
+    snr_db= 20.0 first_tx_fer=0.812 (coarse)
+    snr_db= 22.0 first_tx_fer=0.438 (coarse)
+    snr_db= 24.0 first_tx_fer=1.000 (coarse)
+    snr_db= 10.0 first_tx_fer=0.188 (coarse)
+  calibration: fine 0.5 dB pass over [6.0, 10.0] dB, 100 trials/point ...
+    snr_db= 16.0 first_tx_fer=0.625 (coarse)
+    snr_db= 22.0 first_tx_fer=0.312 (coarse)
+    snr_db= 22.0 first_tx_fer=0.688 (coarse)
+    snr_db= 24.0 first_tx_fer=0.438 (coarse)
+    snr_db= 26.0 first_tx_fer=1.000 (coarse)
+    snr_db= 24.0 first_tx_fer=0.312 (coarse)
+    snr_db= 18.0 first_tx_fer=0.562 (coarse)
+    snr_db= 24.0 first_tx_fer=0.688 (coarse)
+    snr_db= 26.0 first_tx_fer=0.438 (coarse)
+    snr_db= 28.0 first_tx_fer=0.938 (coarse)
+    snr_db= 26.0 first_tx_fer=0.688 (coarse)
+    snr_db=  2.0 first_tx_fer=1.000 (coarse)
+    snr_db= 26.0 first_tx_fer=0.312 (coarse)
+    snr_db= 28.0 first_tx_fer=0.438 (coarse)
+    snr_db= 30.0 first_tx_fer=0.938 (coarse)
+    snr_db= 20.0 first_tx_fer=0.562 (coarse)
+    snr_db= 28.0 first_tx_fer=0.688 (coarse)
+    snr_db= 30.0 first_tx_fer=0.438 (coarse)
+    snr_db= 32.0 first_tx_fer=0.938 (coarse)
+    snr_db= 28.0 first_tx_fer=0.312 (coarse)
+    snr_db=  4.0 first_tx_fer=0.740
+    snr_db= 22.0 first_tx_fer=0.500 (coarse)
+    snr_db= 30.0 first_tx_fer=0.750 (coarse)
+    snr_db= 34.0 first_tx_fer=0.938 (coarse)
+    snr_db= 32.0 first_tx_fer=0.438 (coarse)
+    snr_db= 30.0 first_tx_fer=0.312 (coarse)
+    snr_db= 24.0 first_tx_fer=0.500 (coarse)
+    snr_db= 36.0 first_tx_fer=0.938 (coarse)
+    snr_db= 32.0 first_tx_fer=0.750 (coarse)
+    snr_db= 34.0 first_tx_fer=0.438 (coarse)
+    snr_db= 38.0 first_tx_fer=0.938 (coarse)
+    snr_db= 32.0 first_tx_fer=0.312 (coarse)
+    snr_db= 36.0 first_tx_fer=0.438 (coarse)
+    snr_db= 34.0 first_tx_fer=0.750 (coarse)
+    snr_db= 26.0 first_tx_fer=0.500 (coarse)
+    snr_db= 40.0 first_tx_fer=0.938 (coarse)
+    snr_db= 38.0 first_tx_fer=0.438 (coarse)
+    snr_db= 34.0 first_tx_fer=0.312 (coarse)
+    snr_db= 36.0 first_tx_fer=0.750 (coarse)
+    snr_db= 28.0 first_tx_fer=0.500 (coarse)
+    snr_db= 42.0 first_tx_fer=0.938 (coarse)
+    snr_db= 40.0 first_tx_fer=0.438 (coarse)
+    snr_db= 36.0 first_tx_fer=0.312 (coarse)
+    snr_db= 38.0 first_tx_fer=0.750 (coarse)
+    snr_db= 30.0 first_tx_fer=0.500 (coarse)
+    snr_db= 44.0 first_tx_fer=0.938 (coarse)
+  calibration: no SNR in [0, 44] dB reaches FER<=0.20 -- Watterson-Moderate outage floor; refining around the best coarse point
+    snr_db= 42.0 first_tx_fer=0.438 (coarse)
+    snr_db= 38.0 first_tx_fer=0.312 (coarse)
+    snr_db= 40.0 first_tx_fer=0.750 (coarse)
+    snr_db=  4.0 first_tx_fer=0.400
+    snr_db=  4.0 first_tx_fer=1.000 (coarse)
+    snr_db= 44.0 first_tx_fer=0.438 (coarse)
+  calibration: no SNR in [0, 44] dB reaches FER<=0.20 -- Watterson-Moderate outage floor; refining around the best coarse point
+    snr_db= 32.0 first_tx_fer=0.500 (coarse)
+    snr_db= 42.0 first_tx_fer=0.750 (coarse)
+    snr_db= 40.0 first_tx_fer=0.312 (coarse)
+    snr_db=  4.5 first_tx_fer=0.710
+    snr_db= 44.0 first_tx_fer=0.750 (coarse)
+  calibration: no SNR in [0, 44] dB reaches FER<=0.20 -- Watterson-Moderate outage floor; refining around the best coarse point
+    snr_db= 42.0 first_tx_fer=0.312 (coarse)
+    snr_db= 34.0 first_tx_fer=0.500 (coarse)
+    snr_db=  6.0 first_tx_fer=0.360
+    snr_db= 44.0 first_tx_fer=0.312 (coarse)
+  calibration: no SNR in [0, 44] dB reaches FER<=0.20 -- Watterson-Moderate outage floor; refining around the best coarse point
+    snr_db= 36.0 first_tx_fer=0.500 (coarse)
+    snr_db= 38.0 first_tx_fer=0.500 (coarse)
+    snr_db= 27.0 first_tx_fer=0.950
+    snr_db= 40.0 first_tx_fer=0.500 (coarse)
+    snr_db= 19.0 first_tx_fer=0.550
+    snr_db= 42.0 first_tx_fer=0.500 (coarse)
+    snr_db=  6.0 first_tx_fer=1.000 (coarse)
+    snr_db= 21.0 first_tx_fer=0.810
+    snr_db=  5.0 first_tx_fer=0.660
+    snr_db= 44.0 first_tx_fer=0.500 (coarse)
+  calibration: no SNR in [0, 44] dB reaches FER<=0.20 -- Watterson-Moderate outage floor; refining around the best coarse point
+    snr_db= 17.0 first_tx_fer=0.540
+    snr_db= 27.5 first_tx_fer=0.940
+    snr_db=  4.5 first_tx_fer=0.370
+    snr_db= 19.5 first_tx_fer=0.540
+    snr_db=  6.5 first_tx_fer=0.340
+    snr_db= 21.5 first_tx_fer=0.790
+    snr_db=  8.0 first_tx_fer=1.000 (coarse)
+    snr_db=  5.5 first_tx_fer=0.630
+    snr_db= 17.5 first_tx_fer=0.540
+    snr_db= 28.0 first_tx_fer=0.940
+    snr_db= 21.0 first_tx_fer=0.450
+    snr_db= 20.0 first_tx_fer=0.540
+    snr_db= 22.0 first_tx_fer=0.780
+    snr_db= 10.0 first_tx_fer=1.000 (coarse)
+    snr_db= 28.5 first_tx_fer=0.940
+    snr_db= 18.0 first_tx_fer=0.530
+    snr_db=  6.0 first_tx_fer=0.570
+    snr_db=  5.0 first_tx_fer=0.380
+    snr_db= 20.5 first_tx_fer=0.540
+    snr_db= 21.5 first_tx_fer=0.450
+    snr_db=  7.0 first_tx_fer=0.310
+    snr_db= 22.5 first_tx_fer=0.780
+    snr_db= 29.0 first_tx_fer=0.940
+  calibrated operating point: snr_db=28.0 first_tx_fer=0.938 (target 0.30, window 0.25-0.35, FLOORED: window unreachable)
+    snr_db= 18.5 first_tx_fer=0.520
+    snr_db= 12.0 first_tx_fer=1.000 (coarse)
+    snr_db= 21.0 first_tx_fer=0.540
+  calibrated operating point: snr_db=20.0 first_tx_fer=0.438 (target 0.30, window 0.25-0.35, FLOORED: window unreachable)
+    snr_db=  6.5 first_tx_fer=0.540
+    snr_db= 22.0 first_tx_fer=0.450
+  calibrated operating point: snr_db=21.0 first_tx_fer=0.450 (target 0.30, window 0.25-0.35, FLOORED: window unreachable)
+    snr_db= 23.0 first_tx_fer=0.770
+  calibrated operating point: snr_db=22.0 first_tx_fer=0.688 (target 0.30, window 0.25-0.35, FLOORED: window unreachable)
+    snr_db= 19.0 first_tx_fer=0.510
+  calibrated operating point: snr_db=18.0 first_tx_fer=0.312 (target 0.30, window 0.25-0.35, FLOORED: window unreachable)
+    snr_db= 14.0 first_tx_fer=1.000 (coarse)
+    snr_db=  5.5 first_tx_fer=0.340
+    snr_db=  7.5 first_tx_fer=0.290
+    snr_db=  7.0 first_tx_fer=0.510
+    snr_db= 16.0 first_tx_fer=1.000 (coarse)
+    snr_db=  7.5 first_tx_fer=0.480
+    snr_db=  6.0 first_tx_fer=0.310
+    snr_db=  8.0 first_tx_fer=0.230
+    snr_db= 18.0 first_tx_fer=1.000 (coarse)
+    snr_db=  8.0 first_tx_fer=0.440
+    snr_db= 20.0 first_tx_fer=1.000 (coarse)
+    snr_db=  6.5 first_tx_fer=0.270
+    snr_db=  8.5 first_tx_fer=0.190
+    snr_db=  8.5 first_tx_fer=0.390
+    snr_db= 22.0 first_tx_fer=1.000 (coarse)
+    snr_db=  9.0 first_tx_fer=0.360
+    snr_db= 24.0 first_tx_fer=1.000 (coarse)
+    snr_db=  7.0 first_tx_fer=0.260
+    snr_db=  9.0 first_tx_fer=0.190
+    snr_db= 26.0 first_tx_fer=1.000 (coarse)
+    snr_db=  9.5 first_tx_fer=0.350
+    snr_db= 28.0 first_tx_fer=1.000 (coarse)
+    snr_db=  9.5 first_tx_fer=0.140
+    snr_db=  7.5 first_tx_fer=0.200
+    snr_db= 10.0 first_tx_fer=0.370
+    snr_db= 30.0 first_tx_fer=1.000 (coarse)
+    snr_db= 10.5 first_tx_fer=0.350
+    snr_db= 10.0 first_tx_fer=0.130
+  calibrated operating point: snr_db=7.0 first_tx_fer=0.310 (target 0.30, window 0.25-0.35)
+    snr_db=  8.0 first_tx_fer=0.170
+  calibrated operating point: snr_db=6.0 first_tx_fer=0.310 (target 0.30, window 0.25-0.35)
+    snr_db= 32.0 first_tx_fer=1.000 (coarse)
+    snr_db= 11.0 first_tx_fer=0.340
+    snr_db= 34.0 first_tx_fer=1.000 (coarse)
+    snr_db= 11.5 first_tx_fer=0.300
+    snr_db= 36.0 first_tx_fer=1.000 (coarse)
+    snr_db= 12.0 first_tx_fer=0.270
+  calibrated operating point: snr_db=11.5 first_tx_fer=0.300 (target 0.30, window 0.25-0.35)
+    snr_db= 38.0 first_tx_fer=1.000 (coarse)
+    snr_db= 40.0 first_tx_fer=1.000 (coarse)
+    snr_db= 42.0 first_tx_fer=1.000 (coarse)
+    snr_db= 44.0 first_tx_fer=1.000 (coarse)
+  calibration: no SNR in [0, 44] dB reaches FER<=0.20 -- Watterson-Moderate outage floor; refining around the best coarse point
+    snr_db=  0.0 first_tx_fer=1.000
+    snr_db=  0.5 first_tx_fer=1.000
+    snr_db=  1.0 first_tx_fer=1.000
+  calibrated operating point: snr_db=0.0 first_tx_fer=1.000 (target 0.30, window 0.25-0.35, FLOORED: window unreachable)
+
+===== session_harq full table (total 901.0s) =====
+
+== level 1 (codewords=1, watterson Moderate) snr=6.0 dB (calibrated FER 0.310, 14 calibration points x 100 trials)
+   trials=443 failed_RV0=120 elapsed=357.1s
+   arm              rescue<=1   Wilson95      rescue<=2   rescue<=3   discordant vs Chase (b/c)
+   Chase (RV0,0,0)    83/120  [0.604,0.767]     114         116      k1 0/0  k2 0/0  k3 0/0
+   RV order 1/2/3     82/120  [0.596,0.760]     107         113      k1 5/6  k2 1/8  k3 2/5
+   RV order 1/3/2     82/120  [0.596,0.760]     112         116      k1 5/6  k2 2/4  k3 3/3
+   RV order 2/1/3     76/120  [0.544,0.714]     108         117      k1 5/12  k2 2/8  k3 3/2
+   RV order 2/3/1     76/120  [0.544,0.714]     112         117      k1 5/12  k2 2/4  k3 3/2
+   RV order 3/1/2     83/120  [0.604,0.767]     112         119      k1 3/3  k2 2/4  k3 3/0
+   RV order 3/2/1     83/120  [0.604,0.767]     110         117      k1 3/3  k2 1/5  k3 2/1
+   selected row for level 1: [0, 3, 1, 2]  (rule: best rescue<=1; tie -> rescue<=2; tie -> closest to 3GPP [0,2,3,1])
+
+== level 2 (codewords=1, watterson Moderate) snr=7.0 dB (calibrated FER 0.310, 15 calibration points x 100 trials)
+   trials=447 failed_RV0=120 elapsed=380.2s
+   arm              rescue<=1   Wilson95      rescue<=2   rescue<=3   discordant vs Chase (b/c)
+   Chase (RV0,0,0)    87/120  [0.639,0.797]     116         118      k1 0/0  k2 0/0  k3 0/0
+   RV order 1/2/3     78/120  [0.561,0.729]      97         116      k1 2/11  k2 0/19  k3 0/2
+   RV order 1/3/2     78/120  [0.561,0.729]     112         115      k1 2/11  k2 0/4  k3 0/3
+   RV order 2/1/3     15/120  [0.077,0.196]      96         112      k1 1/73  k2 1/21  k3 1/7
+   RV order 2/3/1     15/120  [0.077,0.196]      96         112      k1 1/73  k2 0/20  k3 0/6
+   RV order 3/1/2     83/120  [0.604,0.767]     111         115      k1 1/5  k2 1/6  k3 1/4
+   RV order 3/2/1     83/120  [0.604,0.767]      96         115      k1 1/5  k2 0/20  k3 0/3
+   selected row for level 2: [0, 3, 1, 2]  (rule: best rescue<=1; tie -> rescue<=2; tie -> closest to 3GPP [0,2,3,1])
+
+== level 3 (codewords=1, watterson Moderate) snr=11.5 dB (calibrated FER 0.300, 24 calibration points x 100 trials)
+   trials=411 failed_RV0=120 elapsed=302.3s
+   arm              rescue<=1   Wilson95      rescue<=2   rescue<=3   discordant vs Chase (b/c)
+   Chase (RV0,0,0)   106/120  [0.814,0.929]     118         120      k1 0/0  k2 0/0  k3 0/0
+   RV order 1/2/3    106/120  [0.814,0.929]     117         120      k1 4/4  k2 2/3  k3 0/0
+   RV order 1/3/2    106/120  [0.814,0.929]     118         120      k1 4/4  k2 2/2  k3 0/0
+   RV order 2/1/3     85/120  [0.622,0.782]     119         120      k1 4/25  k2 2/1  k3 0/0
+   RV order 2/3/1     85/120  [0.622,0.782]     119         120      k1 4/25  k2 2/1  k3 0/0
+   RV order 3/1/2    109/120  [0.843,0.948]     119         120      k1 5/2  k2 2/1  k3 0/0
+   RV order 3/2/1    109/120  [0.843,0.948]     118         120      k1 5/2  k2 2/2  k3 0/0
+   selected row for level 3: [0, 3, 1, 2]  (rule: best rescue<=1; tie -> rescue<=2; tie -> closest to 3GPP [0,2,3,1])
+
+== level 4 (codewords=1, watterson Moderate) snr=21.0 dB (calibrated FER 0.450, 26 calibration points x 100 trials, Watterson outage floor)
+   trials=274 failed_RV0=120 elapsed=228.1s
+   arm              rescue<=1   Wilson95      rescue<=2   rescue<=3   discordant vs Chase (b/c)
+   Chase (RV0,0,0)    99/120  [0.747,0.883]     117         120      k1 0/0  k2 0/0  k3 0/0
+   RV order 1/2/3    111/120  [0.864,0.960]     118         118      k1 16/4  k2 3/2  k3 0/2
+   RV order 1/3/2    111/120  [0.864,0.960]     118         118      k1 16/4  k2 3/2  k3 0/2
+   RV order 2/1/3    110/120  [0.853,0.954]     118         118      k1 14/3  k2 3/2  k3 0/2
+   RV order 2/3/1    110/120  [0.853,0.954]     118         118      k1 14/3  k2 3/2  k3 0/2
+   RV order 3/1/2    112/120  [0.874,0.966]     118         118      k1 15/2  k2 3/2  k3 0/2
+   RV order 3/2/1    112/120  [0.874,0.966]     118         118      k1 15/2  k2 3/2  k3 0/2
+   selected row for level 4: [0, 3, 2, 1]  (rule: best rescue<=1; tie -> rescue<=2; tie -> closest to 3GPP [0,2,3,1])
+
+== level 5 (codewords=1, watterson Moderate) snr=18.0 dB (calibrated FER 0.312, 28 calibration points x 100 trials, Watterson outage floor)
+   trials=193 failed_RV0=120 elapsed=218.9s
+   arm              rescue<=1   Wilson95      rescue<=2   rescue<=3   discordant vs Chase (b/c)
+   Chase (RV0,0,0)    62/120  [0.428,0.604]      97         115      k1 0/0  k2 0/0  k3 0/0
+   RV order 1/2/3     95/120  [0.711,0.855]     117         120      k1 35/2  k2 20/0  k3 5/0
+   RV order 1/3/2     95/120  [0.711,0.855]     115         120      k1 35/2  k2 20/2  k3 5/0
+   RV order 2/1/3     92/120  [0.683,0.833]     116         120      k1 32/2  k2 19/0  k3 5/0
+   RV order 2/3/1     92/120  [0.683,0.833]     117         120      k1 32/2  k2 20/0  k3 5/0
+   RV order 3/1/2     93/120  [0.692,0.841]     115         120      k1 32/1  k2 20/2  k3 5/0
+   RV order 3/2/1     93/120  [0.692,0.841]     117         120      k1 32/1  k2 20/0  k3 5/0
+   selected row for level 5: [0, 1, 2, 3]  (rule: best rescue<=1; tie -> rescue<=2; tie -> closest to 3GPP [0,2,3,1])
+
+== level 6 (codewords=1, watterson Moderate) snr=20.0 dB (calibrated FER 0.438, 28 calibration points x 100 trials, Watterson outage floor)
+   trials=224 failed_RV0=120 elapsed=200.5s
+   arm              rescue<=1   Wilson95      rescue<=2   rescue<=3   discordant vs Chase (b/c)
+   Chase (RV0,0,0)    67/120  [0.469,0.644]      99         115      k1 0/0  k2 0/0  k3 0/0
+   RV order 1/2/3    105/120  [0.804,0.923]     120         120      k1 38/0  k2 21/0  k3 5/0
+   RV order 1/3/2    105/120  [0.804,0.923]     120         120      k1 38/0  k2 21/0  k3 5/0
+   RV order 2/1/3    101/120  [0.766,0.896]     120         120      k1 35/1  k2 21/0  k3 5/0
+   RV order 2/3/1    101/120  [0.766,0.896]     120         120      k1 35/1  k2 21/0  k3 5/0
+   RV order 3/1/2    105/120  [0.804,0.923]     120         120      k1 38/0  k2 21/0  k3 5/0
+   RV order 3/2/1    105/120  [0.804,0.923]     120         120      k1 38/0  k2 21/0  k3 5/0
+   selected row for level 6: [0, 1, 3, 2]  (rule: best rescue<=1; tie -> rescue<=2; tie -> closest to 3GPP [0,2,3,1])
+
+== level 7 (codewords=1, watterson Moderate) snr=22.0 dB (calibrated FER 0.688, 28 calibration points x 100 trials, Watterson outage floor)
+   trials=154 failed_RV0=120 elapsed=211.9s
+   arm              rescue<=1   Wilson95      rescue<=2   rescue<=3   discordant vs Chase (b/c)
+   Chase (RV0,0,0)    40/120  [0.255,0.422]      74          93      k1 0/0  k2 0/0  k3 0/0
+   RV order 1/2/3     74/120  [0.527,0.699]     117         120      k1 40/6  k2 43/0  k3 27/0
+   RV order 1/3/2     74/120  [0.527,0.699]     118         120      k1 40/6  k2 44/0  k3 27/0
+   RV order 2/1/3     80/120  [0.578,0.745]     118         120      k1 41/1  k2 44/0  k3 27/0
+   RV order 2/3/1     80/120  [0.578,0.745]     117         120      k1 41/1  k2 43/0  k3 27/0
+   RV order 3/1/2     83/120  [0.604,0.767]     119         120      k1 43/0  k2 45/0  k3 27/0
+   RV order 3/2/1     83/120  [0.604,0.767]     118         120      k1 43/0  k2 44/0  k3 27/0
+   selected row for level 7: [0, 3, 1, 2]  (rule: best rescue<=1; tie -> rescue<=2; tie -> closest to 3GPP [0,2,3,1])
+
+== level 8 (codewords=1, watterson Moderate) snr=28.0 dB (calibrated FER 0.938, 28 calibration points x 100 trials, Watterson outage floor)
+   trials=129 failed_RV0=120 elapsed=212.6s
+   arm              rescue<=1   Wilson95      rescue<=2   rescue<=3   discordant vs Chase (b/c)
+   Chase (RV0,0,0)    14/120  [0.071,0.186]      28          43      k1 0/0  k2 0/0  k3 0/0
+   RV order 1/2/3     47/120  [0.309,0.481]      98         120      k1 37/4  k2 70/0  k3 77/0
+   RV order 1/3/2     47/120  [0.309,0.481]     100         120      k1 37/4  k2 73/1  k3 77/0
+   RV order 2/1/3     48/120  [0.317,0.489]     102         120      k1 34/0  k2 74/0  k3 77/0
+   RV order 2/3/1     48/120  [0.317,0.489]     103         119      k1 34/0  k2 75/0  k3 76/0
+   RV order 3/1/2     52/120  [0.348,0.523]      99         119      k1 38/0  k2 71/0  k3 76/0
+   RV order 3/2/1     52/120  [0.348,0.523]     100         118      k1 38/0  k2 72/0  k3 75/0
+   selected row for level 8: [0, 3, 2, 1]  (rule: best rescue<=1; tie -> rescue<=2; tie -> closest to 3GPP [0,2,3,1])
+
+== level 4 (codewords=8, watterson Moderate) snr=0.0 dB (calibrated FER 1.000, 26 calibration points x 100 trials, Watterson outage floor)
+   trials=80 failed_RV0=80 elapsed=901.0s
+   arm              rescue<=1   Wilson95      rescue<=2   rescue<=3   discordant vs Chase (b/c)
+   Chase (RV0,0,0)     0/80  [0.000,0.046]       0           0      k1 0/0  k2 0/0  k3 0/0
+   RV order 1/2/3      0/80  [0.000,0.046]       0           0      k1 0/0  k2 0/0  k3 0/0
+   RV order 1/3/2      0/80  [0.000,0.046]       0           0      k1 0/0  k2 0/0  k3 0/0
+   RV order 2/1/3      0/80  [0.000,0.046]       0           0      k1 0/0  k2 0/0  k3 0/0
+   RV order 2/3/1      0/80  [0.000,0.046]       0           0      k1 0/0  k2 0/0  k3 0/0
+   RV order 3/1/2      0/80  [0.000,0.046]       0           0      k1 0/0  k2 0/0  k3 0/0
+   RV order 3/2/1      0/80  [0.000,0.046]       0           0      k1 0/0  k2 0/0  k3 0/0
+   (informational row for the transmit follow-up: cw>1 receive has no cross-attempt IR combining, so these rescues decode stand-alone)
+
+Fill arq::RV_SCHEDULE rows 1-8 from the selected rows above; row 9 copies row 8 (VHF-only level, not measured here).
+```
+
 ## COP-129: golden vectors for levels 3, 4, 7 and 9, multi-codeword frames and retransmission
 
 Measured 2026-11-08 on x86_64 Linux, release build. The golden corpus
