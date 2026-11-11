@@ -1,0 +1,32 @@
+---
+id: low-rate-floor
+title: What has the low-rate floor experiment measured?
+kind: gotcha
+status: current
+maintainer: agent
+sources:
+  - BENCHMARKS.md
+  - docs/LIMITATIONS.md
+  - crates/coppa-bench/src/floor_candidate.rs
+verified:
+  date: 2026-11-11
+links:
+  - coppa-protocol
+  - band-conventions
+---
+# What has the low-rate floor experiment measured?
+
+COP-187's batch header repair reduces experimental candidate errors on paired
+development seeds. It does not select a production waveform. The remaining
+Poor failures still violate the separate acquisition bar, despite a favorable
+FER crossing. See [measurements](../../BENCHMARKS.md#cop-187-experimental-header-repair)
+and [unmet requirements](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-not-built-yet).
+
+Joint length/CRC decoding uses redundancy that independent hard nibble decisions
+discard. A legal header hypothesis alone cannot justify delivery. Preserve the
+version check, evidence threshold, payload CRC and padding checks, and continue
+to count failed headers in SyncFailed.
+
+The Capture adapter bounds history but requires an explicit batch decode. Its
+chunk-partition test does not prove continuous acquisition. The experimental
+header value 2 does not allocate a production air version.

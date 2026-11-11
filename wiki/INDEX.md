@@ -34,3 +34,4 @@
 - [What will bite you about session fade protection?](pages/session-fade-protection.md) — HARQ keys, delayed ACKs and the burst-duration guard.
 - [What will bite you about session chat streams?](pages/session-chat-streams.md) — Stream nibble needs app_messages; chat bytes stay out of BUFFER.
 - [What will bite you when LinBPQ drives coppa as a VARA-style TNC?](pages/linbpq-gateway.md) — Callsign lists, retries, scanner holds and the i386 runtime.
+- [What has the low-rate floor experiment measured?](pages/low-rate-floor.md) — Header redundancy helps the batch candidate; the production floor remains unbuilt.

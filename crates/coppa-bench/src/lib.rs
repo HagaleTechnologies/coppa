@@ -3,6 +3,8 @@
 pub mod adaptive_goodput;
 pub mod afsk_direwolf;
 pub mod cp_arm;
+pub mod floor_candidate;
+pub mod floor_sweep;
 pub mod ground_truth;
 pub mod impairment;
 pub mod metrics;
