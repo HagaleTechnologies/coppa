@@ -925,6 +925,7 @@ mod tests {
         let windowed = HarqPolicy {
             key_mask: 0x0F,
             rv0_starts_fresh: true,
+            multi_codeword: true,
         };
         core.set_harq_policy(windowed);
         core.set_speed_level(3).unwrap();

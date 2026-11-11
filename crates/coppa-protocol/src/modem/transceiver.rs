@@ -289,15 +289,19 @@ struct HarqRxBuffers {
 /// buffers for simultaneously (decision 3: "LRU cap of 32 seqs").
 const HARQ_MAX_BUFFERS: usize = 32;
 
+/// Total mother-codeword accumulators across all keys.
+const HARQ_MAX_CODEWORD_SLOTS: usize = 64;
+
 /// One [`HarqRxBuffers`] entry: the running mother-length LLR sum and the
 /// tag that must match before another transmission is added into it.
 struct HarqEntry {
     /// Elementwise sum of every combined transmission's dematched LLRs.
-    llrs: Vec<f32>,
+    llrs: Vec<Vec<f32>>,
     /// Speed level the buffer was built at (COP-68 guard).
     level: u8,
-    /// Payload bits (payload plus CRC) the buffer was built for (COP-168
-    /// guard).
+    /// Geometry tag: payload plus CRC bits for a single-codeword frame,
+    /// total payload bits for a multi-codeword frame. The slot count also
+    /// participates in the tag, so these representations cannot alias.
     payload_bits: usize,
     /// Transmissions added into `llrs` so far.
     attempts: u32,
@@ -318,6 +322,8 @@ pub struct HarqPolicy {
     pub key_mask: u8,
     /// Whether an RV0 frame drops its key's buffer before combining.
     pub rv0_starts_fresh: bool,
+    /// Keep one soft accumulator per codeword for multi-codeword frames.
+    pub multi_codeword: bool,
 }
 
 impl Default for HarqPolicy {
@@ -325,6 +331,7 @@ impl Default for HarqPolicy {
         Self {
             key_mask: 0xFF,
             rv0_starts_fresh: false,
+            multi_codeword: false,
         }
     }
 }
@@ -363,22 +370,35 @@ impl HarqRxBuffers {
     /// different payload length is a different codeword, so it is dropped
     /// rather than added into.
     fn get_or_create(&mut self, seq: u8, level: u8, payload_bits: usize) -> &mut HarqEntry {
-        let tag_mismatch = self
-            .map
-            .get(&seq)
-            .is_some_and(|e| e.level != level || e.payload_bits != payload_bits);
+        self.get_or_create_multi(seq, level, payload_bits, 1)
+    }
+
+    fn get_or_create_multi(
+        &mut self,
+        seq: u8,
+        level: u8,
+        payload_bits: usize,
+        codewords: usize,
+    ) -> &mut HarqEntry {
+        debug_assert!((1..=8).contains(&codewords));
+        let tag_mismatch = self.map.get(&seq).is_some_and(|e| {
+            e.level != level || e.payload_bits != payload_bits || e.llrs.len() != codewords
+        });
         if tag_mismatch {
             self.evict(seq);
         }
         if !self.map.contains_key(&seq) {
-            if self.map.len() >= HARQ_MAX_BUFFERS && !self.order.is_empty() {
+            while self.map.len() >= HARQ_MAX_BUFFERS
+                || self.map.values().map(|e| e.llrs.len()).sum::<usize>() + codewords
+                    > HARQ_MAX_CODEWORD_SLOTS
+            {
                 let lru = self.order.remove(0);
                 self.map.remove(&lru);
             }
             self.map.insert(
                 seq,
                 HarqEntry {
-                    llrs: vec![0.0f32; NrLdpc::MOTHER_LEN],
+                    llrs: vec![vec![0.0f32; NrLdpc::MOTHER_LEN]; codewords],
                     level,
                     payload_bits,
                     attempts: 0,
@@ -1030,11 +1050,11 @@ impl CoppaTransceiver {
             // instead of combining across rate-matched geometries. COP-168
             // adds `payload_bits` to that tag.
             let entry = harq.get_or_create(key, level, payload_bits);
-            for (a, &d) in entry.llrs.iter_mut().zip(per_tx.iter()) {
+            for (a, &d) in entry.llrs[0].iter_mut().zip(per_tx.iter()) {
                 *a += d;
             }
             entry.attempts += 1;
-            entry.llrs.clone()
+            entry.llrs[0].clone()
         };
 
         pin_known_pad(&mut dematched, payload_bits, k_used, PIN_LLR);
@@ -1061,12 +1081,10 @@ impl CoppaTransceiver {
     }
 
     /// Set the receive-side combining policy (COP-168). Takes effect from the
-    /// next received frame. A change of `key_mask` drops every buffer held,
-    /// because their keys were formed under the old mask: kept, they could
-    /// combine with an unrelated frame under the new mask and could no longer
-    /// be evicted by `seq_num`.
+    /// next received frame. Any policy change drops all buffers, so retained
+    /// soft information cannot cross a change in keying or reset semantics.
     pub fn set_harq_policy(&self, policy: HarqPolicy) {
-        if policy.key_mask != self.harq_policy.get().key_mask {
+        if policy != self.harq_policy.get() {
             self.harq_rx.borrow_mut().clear();
         }
         self.harq_policy.set(policy);
@@ -1077,7 +1095,7 @@ impl CoppaTransceiver {
         self.harq_policy.get()
     }
 
-    /// Number of single-codeword frames that passed CRC while their key held
+    /// Number of frames that passed CRC while their key held
     /// more than one transmission (COP-168). A frame that decodes on the
     /// first transmission under its key does not count. The count does not
     /// prove the combining did the work: a pass that turbo re-estimation of
@@ -1174,9 +1192,8 @@ impl CoppaTransceiver {
         // before this task and still the common case) takes the exact pre-Task-5 code path
         // (`receive_single_codeword`, unchanged), including turbo re-estimation and IR-HARQ
         // combining. A multi-codeword frame takes a separate path
-        // (`receive_multi_codeword`) that does NOT get turbo re-estimation or persistent
-        // IR-HARQ combining across retransmissions -- an explicit, documented scope
-        // decision (see `receive_multi_codeword`'s doc), not an oversight.
+        // (`receive_multi_codeword`) without turbo re-estimation. Persistent
+        // combining there is opt-in through `HarqPolicy::multi_codeword`.
         let result = if header.codewords <= 1 {
             self.receive_single_codeword(header, eq_symbols, noise_vars)
         } else {
@@ -1427,6 +1444,9 @@ impl CoppaTransceiver {
         eq_symbols: &[Complex32],
         noise_vars: &[f32],
     ) -> Option<Vec<(bool, Vec<u8>)>> {
+        if header.codewords > MAX_CODEWORDS {
+            return None;
+        }
         let comp = self.codecs.get(&header.speed_level)?;
         let bps = comp.mapper.bits_per_symbol();
         let codewords = header.codewords.max(1) as usize;
@@ -1481,6 +1501,21 @@ impl CoppaTransceiver {
         };
 
         let rv = header.fec_type & RV_MASK;
+        let combining = self.harq_policy.get().multi_codeword;
+        let key = self.harq_key(header.seq_num);
+        if combining {
+            let mut harq = self.harq_rx.borrow_mut();
+            if rv == 0 && self.harq_policy.get().rv0_starts_fresh {
+                harq.evict(key);
+            }
+            let entry = harq.get_or_create_multi(
+                key,
+                header.speed_level,
+                header.payload_len as usize * 8,
+                codewords,
+            );
+            entry.attempts += 1;
+        }
         let mut outcomes = Vec::with_capacity(codewords);
         for (k, &(_start, len)) in ranges.iter().enumerate() {
             let payload_bits = (len + PAYLOAD_CRC_LEN) * 8;
@@ -1490,13 +1525,19 @@ impl CoppaTransceiver {
             }
             let llrs = &codeword_llrs[k * CODED_BLOCK_LEN..(k + 1) * CODED_BLOCK_LEN];
 
-            // Single-shot rate-dematch (no persistent IR-HARQ accumulation across
-            // retransmissions for multi-codeword frames -- see
-            // `Self::receive_multi_codeword`'s doc for why this is an explicit,
-            // flagged scope decision rather than an oversight) + known-pad pin +
-            // NR BG2 decode.
             let mut dematched =
                 rate_match::rate_dematch(llrs, k_used, CODED_BLOCK_LEN, rv, NrLdpc::MOTHER_LEN);
+            if combining {
+                let mut harq = self.harq_rx.borrow_mut();
+                let entry = harq
+                    .map
+                    .get_mut(&key)
+                    .expect("frame accumulator prepared above");
+                for (sum, &llr) in entry.llrs[k].iter_mut().zip(&dematched) {
+                    *sum += llr;
+                }
+                dematched.clone_from(&entry.llrs[k]);
+            }
             pin_known_pad(&mut dematched, payload_bits, k_used, PIN_LLR);
             let (_, mut decoded_bits, converged, _iterations) =
                 self.ldpc.decode_soft_stats(&dematched);
@@ -1550,18 +1591,10 @@ impl CoppaTransceiver {
     ///   get re-decoded too" is a real design question none of this task's 4
     ///   failing-test scenarios exercise -- left for future work rather than
     ///   guessed at.
-    /// - **No persistent IR-HARQ combining across retransmissions.** Without
-    ///   per-codeword ARQ addressing (`(seq, codeword-index)` acking is
-    ///   explicitly OUT OF SCOPE for this task -- see the task brief), a
-    ///   retransmission of a multi-codeword frame is a full retransmission of
-    ///   every codeword at the same `seq`; combining LLRs across such
-    ///   retransmissions would need per-(seq, codeword-index) accumulator
-    ///   state this task does not add. Each receive of a multi-codeword frame
-    ///   decodes fresh from that single transmission's own LLRs only.
-    ///
-    /// Both of these preserve `codewords == 1`'s exact pre-Task-5 behavior
-    /// (that path never reaches this method at all -- see
-    /// [`Self::receive_core`]'s dispatch) and are flagged, not silent.
+    /// - **Persistent IR-HARQ is opt-in.** COP-168 adds one mother-codeword
+    ///   accumulator per codeword when `HarqPolicy::multi_codeword` is set.
+    ///   All codewords must decode and pass CRC in the same attempt. Defaults
+    ///   retain the original single-shot behaviour. Turbo stays single-codeword.
     fn receive_multi_codeword(
         &self,
         header: CoppaHeader,
@@ -1603,7 +1636,13 @@ impl CoppaTransceiver {
         let payload: Vec<u8> = outcomes.into_iter().flat_map(|(_, bytes)| bytes).collect();
 
         let seq = header.seq_num;
-        self.harq_rx.borrow_mut().evict(self.harq_key(seq));
+        if self.harq_policy.get().multi_codeword {
+            self.harq_record_success(seq);
+        } else {
+            // This single-shot path never contributed to a retained buffer.
+            // Clear an older single-codeword attempt without crediting it.
+            self.harq_evict(seq);
+        }
 
         let mean_nv = if noise_vars.is_empty() {
             1.0
@@ -2867,7 +2906,8 @@ mod tests {
             HarqPolicy::default(),
             HarqPolicy {
                 key_mask: 0xFF,
-                rv0_starts_fresh: false
+                rv0_starts_fresh: false,
+                multi_codeword: false
             }
         );
         let payload = vec![0x42u8; 198];
@@ -2908,6 +2948,7 @@ mod tests {
             tx.set_harq_policy(HarqPolicy {
                 key_mask: mask,
                 rv0_starts_fresh: false,
+                multi_codeword: false,
             });
             let llrs_rv0 = erased_coded_llrs(&mother, k_used, 0, 0.30, 8.0, llr_seeds.0);
             let llrs_rv1 = erased_coded_llrs(&mother, k_used, 1, 0.30, 8.0, llr_seeds.1);
@@ -2940,6 +2981,7 @@ mod tests {
             tx.set_harq_policy(HarqPolicy {
                 key_mask: 0x0F,
                 rv0_starts_fresh: fresh,
+                multi_codeword: false,
             });
 
             let stale = erased_coded_llrs(&mother1, k_used, 0, 0.30, 8.0, 0x57A1E);
@@ -2980,6 +3022,7 @@ mod tests {
             HarqPolicy {
                 key_mask: 0x0F,
                 rv0_starts_fresh: true,
+                multi_codeword: false,
             },
         ] {
             tx.set_harq_policy(policy);
@@ -3021,6 +3064,7 @@ mod tests {
         tx.set_harq_policy(HarqPolicy {
             key_mask: 0x0F,
             rv0_starts_fresh: false,
+            multi_codeword: false,
         });
         assert_eq!(
             tx.harq_buffer_count(),
@@ -3388,6 +3432,138 @@ mod tests {
             matches!(result, Err(ReceiveError::HeaderCorrupt)),
             "expected Err(HeaderCorrupt) for codewords={codewords} > MAX_CODEWORDS, got {result:?}"
         );
+    }
+
+    #[test]
+    fn single_shot_multi_codeword_success_does_not_credit_stale_single_buffer() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let payload = vec![0x42; 400];
+        let header = make_header_multi(4, payload.len() as u16, 3);
+        tx.harq_rx
+            .borrow_mut()
+            .get_or_create(header.seq_num, 4, 800)
+            .attempts = 2;
+        let samples = tx.transmit(&header, &payload).unwrap();
+        assert_eq!(tx.receive(&samples).unwrap().1, payload);
+        assert_eq!(tx.harq_combined_successes(), 0);
+        assert!(!tx.harq_rx.borrow().contains(header.seq_num));
+    }
+
+    #[test]
+    fn multi_codeword_buffers_are_bounded() {
+        let mut buffers = HarqRxBuffers::new();
+        for key in 0..9 {
+            buffers.get_or_create_multi(key, 4, 4000, 8);
+            assert!(buffers.map.values().map(|e| e.llrs.len()).sum::<usize>() <= 64);
+        }
+        assert!(!buffers.contains(0));
+        assert_eq!(buffers.len(), 8);
+        buffers.get_or_create_multi(1, 4, 4000, 8);
+        buffers.get_or_create_multi(9, 4, 4000, 8);
+        assert!(
+            buffers.contains(1),
+            "recently touched key must survive eviction"
+        );
+        assert!(
+            !buffers.contains(2),
+            "least recently used key is evicted as a unit"
+        );
+        // A count change under the same key must start fresh, too.
+        buffers.get_or_create_multi(8, 4, 4000, 3).attempts = 7;
+        assert_eq!(buffers.get_or_create_multi(8, 4, 4000, 2).attempts, 0);
+    }
+
+    #[test]
+    fn multi_codeword_frames_combine_per_codeword() {
+        let tx = CoppaTransceiver::new(CoppaProfile::hf_standard(), 1);
+        let level = 4;
+        let comp = tx.codecs.get(&level).unwrap();
+        let payload: Vec<u8> = (0..500).map(|i| (i * 37 + 11) as u8).collect();
+        let mut header = make_header_multi(level, payload.len() as u16, 3);
+        let ranges = split_payload_across_codewords(payload.len(), 3);
+        let mothers: Vec<_> = ranges
+            .iter()
+            .map(|&(start, len)| {
+                let bytes = &payload[start..start + len];
+                let mut info = Vec::new();
+                for byte in bytes
+                    .iter()
+                    .copied()
+                    .chain(PAYLOAD_CRC32.checksum(bytes).to_be_bytes())
+                {
+                    for shift in (0..8).rev() {
+                        info.push((byte >> shift) & 1);
+                    }
+                }
+                info.resize(NrLdpc::INFO_LEN, 0);
+                scramble(&mut info);
+                tx.ldpc.encode(&info)
+            })
+            .collect();
+        let symbols = |rv, attempt| {
+            let mut cw_llrs = Vec::new();
+            for (cw, mother) in mothers.iter().enumerate() {
+                let erased = if (attempt == 0 && cw != 1) || (attempt == 1 && cw == 1) {
+                    0.90
+                } else {
+                    0.0
+                };
+                cw_llrs.extend(erased_coded_llrs(
+                    mother,
+                    comp.k_used,
+                    rv,
+                    erased,
+                    8.0,
+                    981 + cw as u64,
+                ));
+            }
+            let slots = cw_llrs;
+            let mut symbols = Vec::new();
+            for slot in slots.chunks(CODED_BLOCK_LEN) {
+                let bits: Vec<u8> = slot.iter().map(|v| u8::from(*v < 0.0)).collect();
+                let mapped = comp.mapper.map_bits(&comp.interleaver.interleave(&bits));
+                // Erasures are represented as zero-confidence symbols.
+                let interleaved = comp.interleaver.interleave_soft(slot);
+                for (i, sym) in mapped.into_iter().enumerate() {
+                    if interleaved[i * 2..i * 2 + 2].contains(&0.0) {
+                        symbols.push(Complex32::new(0.0, 0.0));
+                    } else {
+                        symbols.push(sym);
+                    }
+                }
+            }
+            symbols
+        };
+        for enabled in [false, true] {
+            tx.set_harq_policy(HarqPolicy {
+                key_mask: 0x0F,
+                rv0_starts_fresh: true,
+                multi_codeword: enabled,
+            });
+            tx.harq_evict(header.seq_num);
+            header.fec_type = 0;
+            header.seq_num = 0x25;
+            assert!(tx
+                .receive_multi_codeword(
+                    header.clone(),
+                    symbols(0, 0),
+                    vec![0.1; 3 * CODED_BLOCK_LEN / 2]
+                )
+                .is_err());
+            header.fec_type = 2;
+            header.seq_num = 0x05;
+            let second = tx.receive_multi_codeword(
+                header.clone(),
+                symbols(2, 1),
+                vec![0.1; 3 * CODED_BLOCK_LEN / 2],
+            );
+            if enabled {
+                assert_eq!(second.unwrap().1, payload);
+            } else {
+                assert!(second.is_err());
+            }
+        }
+        assert_eq!(tx.harq_combined_successes(), 1);
     }
 
     /// Task 5 scenario (b): an 800-byte payload at level 6 (16-QAM, rate 1/2)

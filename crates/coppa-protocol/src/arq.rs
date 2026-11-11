@@ -211,15 +211,24 @@ pub fn phy_following(phy_seq: u8) -> u8 {
 /// attempt `k` (k >= 1) uses entry `((k - 1) % 3) + 1`, so a retransmission
 /// never repeats RV0 and an RV0 frame always starts a fresh soft buffer.
 ///
-/// **Provisional.** Every row is `[0, 1, 3, 2]` until the per-level
-/// `session_harq` measurement (COP-168 Phase 2) replaces it. The order puts
-/// RV2 last because the COP-168 plan-phase probe, recorded in
-/// `docs/LIMITATIONS.md`'s COP-129 bullet, found RV2 the worst first
-/// retransmission at levels 2 and 3 on Watterson Moderate and useless at
-/// level 3 on AWGN (0 of 36 failed frames rescued, against 21 for a same-RV
-/// repeat). 3GPP's `[0, 2, 3, 1]`
-/// ([`rv_for_attempt`]) would make those retransmissions worse than today's.
-pub const RV_SCHEDULE: [[u8; 4]; 10] = [[0, 1, 3, 2]; 10];
+/// Measured by `cargo run --release -p coppa-bench --example session_harq`;
+/// see BENCHMARKS.md, "COP-168 PHY HARQ schedule" for the calibrated operating
+/// points, paired rescue counts and limits. Each level's order maximizes
+/// first-retransmission rescue; ties within one frame use second-retransmission
+/// rescue, then the order closest to 3GPP's `[2, 3, 1]`. Level 9 uses level 8's
+/// order because this measurement covers HF levels 1 through 8 only.
+pub const RV_SCHEDULE: [[u8; 4]; 10] = [
+    [0, 1, 3, 2], // unused level 0
+    [0, 3, 1, 2],
+    [0, 3, 1, 2],
+    [0, 3, 2, 1],
+    [0, 3, 2, 1],
+    [0, 3, 2, 1],
+    [0, 1, 2, 3],
+    [0, 3, 2, 1],
+    [0, 3, 2, 1],
+    [0, 3, 2, 1], // VHF: copy level 8 until measured
+];
 
 /// COP-168 (COP-168 design rule 4): the redundancy version for transmission
 /// `attempt` of a segment at speed `level` in a windowed session.

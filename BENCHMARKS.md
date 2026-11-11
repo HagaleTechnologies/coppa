@@ -5649,3 +5649,99 @@ the rejected integration, not the final pilot-based tree. The final production
 recommendations and transmitted samples match the paired baseline, so no second
 candidate run is claimed after withdrawal. Further receiver redesign needs a new
 evidence-backed plan; no thresholds or controller parameters were relaxed here.
+
+
+## COP-168 PHY HARQ schedule
+
+This is a simulated PHY comparison, not an on-air throughput result. COP-184
+keeps the COP-168 protocol and PHY work in this PR; daemon windowing and the
+session throughput tables remain follow-ups. Existing coppad sessions still
+send RV0 and do not use this schedule.
+
+Built with `cargo build --release -p coppa-bench --example session_harq --offline`,
+then run as `target/release/examples/session_harq`. These measurements use the
+COP-168 working tree above base `1ac3273ed92f4ce36ce02e01102c0e1890cd9b4c`.
+The diagnostic uses real HF transceivers, random session-framed payloads,
+Watterson Moderate, fresh paired channel draws per physical attempt,
+`awgn_ref_seeded` with a 3 kHz noise reference, and a 1200-sample receive tail.
+The full output is retained in the COP-168 implementation artifact
+`session-harq.txt`.
+
+Calibration searches the 0.5 dB lattice from -10 to 50 dB with 400 independent
+frames at each sampled point. Levels 1–3 reach the requested 25–35% first-frame
+failure range. Levels 4–8 do not reach it in this search; their fading outage
+floor stays above 35%. The table reports the closest measured point rather
+than changing seeds or payloads to force the target.
+
+For each level, the paired comparison stops at 400 failed RV0 frames or 2000
+trials. Each failed frame is retried up to three times with Chase RV0 repeats
+and all six permutations of RV1/RV2/RV3. Counts after attempts 2–4 are cumulative
+rescues among failed initial frames. Intervals are 95% Wilson intervals.
+Discordant pairs list schedule-only / Chase-only rescues. Selection maximizes
+first-retry rescues, then within one frame of that maximum uses second-retry
+rescues, then the smallest Kendall distance to 3GPP's RV2/RV3/RV1 order.
+Level 9 copies level 8 because this run covers only HF levels 1–8. The
+8-codeword level-4 diagnostic uses the single-codeword calibration SNR and
+reports its own observed failure rate.
+
+Release diagnostic wall time: 1344.912 s, or 22 min 24.9 s.
+
+| Level | Codewords | SNR dB | Calibration RV0 failures / 400 | Main trials | Main RV0 failures | RV order after RV0 | First-retry margin vs Chase, pp |
+|---|---|---|---|---|---|---|---|
+| 1 | 1 | 6 | 119 | 1195 | 400 | 3 / 1 / 2 | -0.25 |
+| 2 | 1 | 6 | 138 | 1118 | 400 | 3 / 1 / 2 | -6.75 |
+| 3 | 1 | 16 | 102 | 1799 | 400 | 3 / 2 / 1 | +4.50 |
+| 4 | 1 | 42.5 | 171 | 1025 | 400 | 3 / 2 / 1 | +13.25 |
+| 4 | 8 | 42.5 | not separately calibrated | 402 | 400 | 3 / 2 / 1 | +3.00 |
+| 5 | 1 | 46.5 | 275 | 635 | 400 | 3 / 2 / 1 | +18.25 |
+| 6 | 1 | 42.5 | 220 | 694 | 400 | 1 / 2 / 3 | +29.50 |
+| 7 | 1 | 35 | 307 | 491 | 400 | 3 / 2 / 1 | +28.25 |
+| 8 | 1 | 35 | 369 | 425 | 400 | 3 / 2 / 1 | +24.75 |
+
+Rescues below are cumulative counts among the 400 failed initial frames.
+Bracketed intervals are percentages, not counts.
+
+| Level | Codewords | Attempt | Chase rescues, Wilson 95% | Selected schedule rescues, Wilson 95% | Discordant schedule-only / Chase-only |
+|---|---|---|---|---|---|
+| 1 | 1 | 2 | 279 [65.08%, 74.05%] | 278 [64.82%, 73.81%] | 10 / 11 |
+| 1 | 1 | 3 | 363 [87.51%, 93.21%] | 361 [86.95%, 92.79%] | 4 / 6 |
+| 1 | 1 | 4 | 393 [96.43%, 99.15%] | 388 [94.83%, 98.28%] | 0 / 5 |
+| 2 | 1 | 2 | 257 [59.44%, 68.79%] | 230 [52.61%, 62.25%] | 5 / 32 |
+| 2 | 1 | 3 | 355 [85.28%, 91.49%] | 342 [81.71%, 88.61%] | 4 / 17 |
+| 2 | 1 | 4 | 390 [95.46%, 98.64%] | 363 [87.51%, 93.21%] | 0 / 27 |
+| 3 | 1 | 2 | 359 [86.39%, 92.35%] | 377 [91.52%, 96.14%] | 21 / 3 |
+| 3 | 1 | 3 | 393 [96.43%, 99.15%] | 398 [98.20%, 99.86%] | 5 / 0 |
+| 3 | 1 | 4 | 399 [98.60%, 99.96%] | 399 [98.60%, 99.96%] | 0 / 0 |
+| 4 | 1 | 2 | 325 [77.13%, 84.77%] | 378 [91.81%, 96.34%] | 55 / 2 |
+| 4 | 1 | 3 | 386 [94.21%, 97.90%] | 396 [97.46%, 99.61%] | 12 / 2 |
+| 4 | 1 | 4 | 397 [97.82%, 99.74%] | 396 [97.46%, 99.61%] | 3 / 4 |
+| 4 | 8 | 2 | 8 [1.02%, 3.90%] | 20 [3.26%, 7.60%] | 13 / 1 |
+| 4 | 8 | 3 | 23 [3.86%, 8.48%] | 54 [10.50%, 17.20%] | 37 / 6 |
+| 4 | 8 | 4 | 37 [6.79%, 12.49%] | 74 [15.00%, 22.60%] | 49 / 12 |
+| 5 | 1 | 2 | 228 [52.10%, 61.76%] | 301 [70.79%, 79.23%] | 74 / 1 |
+| 5 | 1 | 3 | 337 [80.36%, 87.49%] | 388 [94.83%, 98.28%] | 53 / 2 |
+| 5 | 1 | 4 | 374 [90.65%, 95.53%] | 398 [98.20%, 99.86%] | 26 / 2 |
+| 6 | 1 | 2 | 203 [45.87%, 55.62%] | 321 [76.07%, 83.86%] | 119 / 1 |
+| 6 | 1 | 3 | 322 [76.33%, 84.08%] | 398 [98.20%, 99.86%] | 76 / 0 |
+| 6 | 1 | 4 | 372 [90.07%, 95.11%] | 400 [99.05%, 100.00%] | 28 / 0 |
+| 7 | 1 | 2 | 114 [24.30%, 33.11%] | 227 [51.85%, 61.52%] | 113 / 0 |
+| 7 | 1 | 3 | 226 [51.60%, 61.27%] | 371 [89.78%, 94.90%] | 147 / 2 |
+| 7 | 1 | 4 | 287 [67.15%, 75.94%] | 392 [96.10%, 98.98%] | 108 / 3 |
+| 8 | 1 | 2 | 34 [6.15%, 11.64%] | 133 [28.81%, 38.01%] | 99 / 0 |
+| 8 | 1 | 3 | 73 [14.77%, 22.33%] | 309 [72.89%, 81.09%] | 236 / 0 |
+| 8 | 1 | 4 | 116 [24.77%, 33.63%] | 368 [88.92%, 94.28%] | 254 / 2 |
+
+The selected IR schedules do not beat Chase on first-retry rescue at levels 1
+and 2. Their margins are -0.25 and -6.75 percentage points. At level 4, the
+single-codeword margin is +13.25 points, but the operating point is above the
+requested calibration failure range. The eight-codeword frame fails on
+400/402 initial transmissions at that same SNR. Combining rescues 20/400
+on its first retry versus 8/400 for Chase, a +3.00-point margin, but that is
+still only a 5% rescue rate. These results do not establish a session
+throughput improvement or justify replacing Chase everywhere.
+
+The plan-phase 120-trial probe, dated 2026-11-10 and recorded in the COP-168
+plan, used different seeds and operating points. This larger paired diagnostic
+replaces that probe for the shipped schedule. The level-3 AWGN 3 dB regression
+guard uses 40 deterministic trials and passes in release mode with the shipped
+RV3 first retry. It is release-only because the debug run exceeded 150 s.

@@ -13,3 +13,5 @@ pub mod runner;
 pub mod scenario;
 pub mod sync_threshold;
 pub mod transfer;
+
+pub mod session_harq;
