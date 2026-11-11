@@ -1465,7 +1465,6 @@ mod app_messages_tests {
     }
 }
 
-<<<<<<< HEAD
 /// COP-168: the `windowed_arq` capability, flags bit 5 (SPEC §20.1).
 #[cfg(test)]
 mod windowed_arq_tests {
@@ -1562,7 +1561,9 @@ mod windowed_arq_tests {
                 expected.windowed_arq
             );
         }
-=======
+    }
+}
+
 /// Maximum number of additional connect requests a TCP host may request.
 pub const MAX_HOST_CONNECT_RETRIES: u8 = 20;
 
@@ -1587,6 +1588,5 @@ mod cop172_tests {
             connect_req_retry_interval(Duration::from_secs(1), Duration::ZERO),
             Duration::from_secs(5)
         );
->>>>>>> e54eec9cd6a3f5dcddf24ab61e582936c8a7c45c
     }
 }
