@@ -16,7 +16,7 @@ Raw per-point data is regenerable into `results/awgn.csv` (gitignored).
 ## COP-169: floor-mode measurement contract and the `ofdm:1` baseline
 
 Measured 2026-11-11 on x86_64 Linux, release build, with the new
-`floor_mode` diagnostic. There is no floor waveform yet; these rows are the
+`floor_mode` diagnostic. There is no production floor waveform yet; these rows are the
 `hf_narrow` level-1 frame (56-byte payload, 6.93 s airtime) that the floor
 has to beat, measured the way the floor will be judged:
 
@@ -46,6 +46,65 @@ was delivered. The verdict is FAIL, as expected for the baseline.
 The matching Watterson Poor baseline (`--channel poor`) was started but not
 run to completion in this session; it is the first measurement of the
 follow-up, alongside the floor candidates.
+
+## COP-169 experimental 16-FSK candidate
+
+Measured 2026-11-11 with `floor_candidate`, release build, development seeds
+`0x00C0FFEE`, ten attempts per point. These are prototype batch results,
+not the 200-trial final sweeps or session acceptance evidence. Both channel
+arms use the same full 40-byte random PDUs, active TX power and paired seeds.
+
+```
+cargo run --release -p coppa-bench --example floor_candidate -- --trials 10 --out-dir results/cop-169/dev-mfsk16-awgn
+cargo run --release -p coppa-bench --example floor_candidate -- --channel poor --trials 10 --out-dir results/cop-169/dev-mfsk16-poor
+```
+
+The candidate uses 16 orthogonal tones from 600 to 1350 Hz at 50 baud,
+a 16-symbol sync sequence, four repetitions of a CRC16-protected header,
+and a fixed 40-byte PDU with CRC32, shortened NR BG2 coding and a time/bit
+permutation. Airtime is exactly eight seconds, including acquisition and
+header. All three current CONNECT PDU types fit the envelope in a clean
+roundtrip test. The header's experimental value 2 does not allocate air
+version 2 or change the production wire format. Metadata records the
+constants and seed derivation.
+
+| SNR (dB) | AWGN errors / 10 | Poor errors / 10 | Poor SyncFailed |
+|---:|---:|---:|---:|
+| -12 | 1 | 10 | 7 |
+| -10 | 0 | 7 | 7 |
+| -8 | 0 | 4 | 4 |
+| -6 | 0 | 3 | 3 |
+| -4 | 0 | 0 | 0 |
+| -2 | 0 | 0 | 0 |
+| 0 | 0 | 0 | 0 |
+| 2 | 0 | 0 | 0 |
+| 4 | 0 | 0 | 0 |
+
+AWGN's crossing is at or below the grid's −12 dB lower edge. Poor's crossing
+is −8.67 dB. Poor still FAILS the verdict because all failures at −8 and
+−6 dB are header failures, conservatively counted as SyncFailed. No wrong
+payloads were delivered. No waveform has been selected or frozen in an ADR.
+
+Additional AWGN development sweeps used the same command with `--cfo 150`,
+`--cfo -150`, and `--ssb`, writing respectively to
+`results/cop-169/dev-mfsk16-cfo-plus150/`, `dev-mfsk16-cfo-minus150/` and
+`dev-mfsk16-ssb/`. Both CFO arms lost all 90 frames with acquisition or header failure.
+The receiver has no CFO search. The SSB-filtered arm lost 2/10 at −12 dB
+and none at the other points; both losses were header failures, so its
+conservative sync-share verdict also FAILS. These characterize limits;
+they do not establish a radio operating envelope. All five sweeps saved
+raw CSV and metadata. The white-noise rejection unit test covers one
+8.02-second capture, not the planned 300-second multi-noise gate.
+
+The batch receiver retains at most ten seconds of input and tries at most
+16 separated acquisition candidates. `Capture` tests chunk partitioning
+with bounded history, but decoding is explicitly requested after capture.
+It is not a production streaming detector. Reported RX wall times cover
+batch decode only. BPSK comparison, continuous streaming acquisition,
+long noise-only runs, design selection, final seeds and production session
+integration remain unbuilt. The ticket's three scenarios remain unmet.
+This candidate was written using repository primitives and the ticket's
+parameters. No external modem source was read or copied.
 
 ## COP-129: golden vectors for levels 3, 4, 7 and 9, multi-codeword frames and retransmission
 

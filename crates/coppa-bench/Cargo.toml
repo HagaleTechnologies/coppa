@@ -212,3 +212,7 @@ path = "diagnostics/fx25_wav.rs"
 [[example]]
 name = "floor_mode"
 path = "diagnostics/floor_mode.rs"
+
+[[example]]
+name = "floor_candidate"
+path = "diagnostics/floor_candidate.rs"

@@ -355,10 +355,9 @@ update.
   protected-mode bound covers two slow HF ACKs, but does not reserve a third
   frame for a peer ID. A lost first ACK during that prepend can cause a retry.
 
-<<<<<<< HEAD
 ## COP-169 robust low-rate floor (not built yet)
 
-- There is no floor waveform yet. Below about +3 dB (3 kHz reference) on AWGN,
+- There is no production floor waveform yet. Below about +3 dB (3 kHz reference) on AWGN,
   `hf_narrow` level 1 still loses nearly every frame, and the failures are
   `SyncFailed`. A session cannot connect at −6 dB or hold through a fade to
   −6 dB. The COP-169 bars (50% FER crossing at or below −8 dB AWGN and −2 dB
@@ -377,7 +376,12 @@ update.
   COP-169 ramp). Its fading is generated at 100 Hz and linearly interpolated,
   and its streaming Hilbert FIR adds a fixed 511-sample (10.6 ms) latency on
   faded paths. No endpoint (Link or daemon) drives it yet.
-=======
+- A measurement-only 16-FSK prototype now carries a 40-byte PDU in exactly
+  eight seconds. It has no Link or daemon caller and no production streaming
+  detector. Its development Poor sweep fails the conservative sync-share
+  clause. It is not a selected floor design. See BENCHMARKS, "COP-169
+  experimental 16-FSK candidate", for raw results and scope.
+
 ## COP-178 versioned wire contract
 
 - There is no in-band air-protocol version negotiation and no automatic
@@ -401,4 +405,3 @@ update.
   commit, including the ABI 1.1 accessors `coppa_air_protocol_version` and
   `coppa_host_api_version`, is compared only as an addition: a later change
   to one of them is not caught. Tagging the 0.12.0 release closes this.
->>>>>>> 28d4c9a7fe64e71b31891ffafafeaf5f07318517
