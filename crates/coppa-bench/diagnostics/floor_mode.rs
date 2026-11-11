@@ -23,8 +23,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use coppa_bench::floor_sweep::{
-    evaluate, run_sweep, snr_grid, SweepChannel, CSV_HEADER, DEV_SEED_BASE, LEAD_IN_S, TAIL_S,
+    acceptance_grid, evaluate, run_sweep, snr_grid, SweepChannel, CSV_HEADER, DEV_SEED_BASE,
+    FINAL_SESSION_SEED_BASE, FINAL_SWEEP_SEED_BASE, LEAD_IN_S, TAIL_S, TRIALS_PER_POINT,
 };
+use coppa_channel::persistent::SnrProfile;
 use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
 
@@ -87,7 +89,7 @@ fn main() -> anyhow::Result<ExitCode> {
     let tx = CoppaTransceiver::new(CoppaProfile::hf_narrow(), 1);
     let payload_bytes = coppa_protocol::modem::speed_levels::max_payload_for_level(LEVEL)
         .ok_or_else(|| anyhow::anyhow!("no level {LEVEL}"))?;
-    let points = run_sweep(&tx, LEVEL, payload_bytes, channel, &grid, trials, seed);
+    let points = run_sweep(&tx, LEVEL, payload_bytes, channel, &grid, trials, seed)?;
 
     fs::create_dir_all(&out_dir)?;
     let mut csv = String::from(CSV_HEADER);
@@ -101,7 +103,12 @@ fn main() -> anyhow::Result<ExitCode> {
     fs::write(out_dir.join("sweep.csv"), csv)?;
 
     let verdict = evaluate(&points, channel.bar_db());
-    let meta = format!(
+    // Only the locked grid, trial count and final seed base make an acceptance
+    // run; anything else is a development measurement.
+    let acceptance_run =
+        grid == acceptance_grid() && trials == TRIALS_PER_POINT && seed == FINAL_SWEEP_SEED_BASE;
+    let ramp = SnrProfile::cop169_ramp();
+    let mut meta = format!(
         "waveform={WAVEFORM}\nprofile=hf_narrow\nlevel={LEVEL}\npayload_bytes={payload_bytes}\n\
          rx_path=batch\nchannel={}\nsnr_grid_db={grid:?}\ntrials_per_point={trials}\n\
          seed_base={seed:#x}\nseed_rule=attempt_seed(base, point, trials, trial) = base + point*trials + trial; \
@@ -115,6 +122,11 @@ fn main() -> anyhow::Result<ExitCode> {
         verdict.wrong_payloads,
         verdict.passes(),
     );
+    meta.push_str(&format!(
+        "acceptance_run={acceptance_run}\nfinal_sweep_seed_base={FINAL_SWEEP_SEED_BASE:#x}\n\
+         final_session_seed_base={FINAL_SESSION_SEED_BASE:#x}\nsession_ramp={ramp:?} ({} s)\n",
+        ramp.duration_s()
+    ));
     fs::write(out_dir.join("metadata.txt"), &meta)?;
     print!("{meta}");
     Ok(if verdict.passes() {

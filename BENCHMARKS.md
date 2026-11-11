@@ -13,6 +13,40 @@ payload → OFDM modulate → AWGN → demodulate/decode. SNR is **audio-band SN
 Eb/N0), swept −6…30 dB in 3 dB steps. "Goodput" = `payload_bits × (1 − FER) / frame_airtime`.
 Raw per-point data is regenerable into `results/awgn.csv` (gitignored).
 
+## COP-169: floor-mode measurement contract and the `ofdm:1` baseline
+
+Measured 2026-11-11 on x86_64 Linux, release build, with the new
+`floor_mode` diagnostic. There is no floor waveform yet; these rows are the
+`hf_narrow` level-1 frame (56-byte payload, 6.93 s airtime) that the floor
+has to beat, measured the way the floor will be judged:
+
+```
+cargo run --release -p coppa-bench --example floor_mode -- sweep --channel awgn --trials 200 --out-dir results/cop-169/baseline-ofdm1-awgn
+```
+
+Each attempt runs the production batch receiver over a capture from the
+persistent channel (`coppa_channel::persistent`): 0.35-0.40 s of noise, the
+frame, 0.25 s of noise. Noise is set from the clean frame's power in 3 kHz.
+Seeds are the development base `0x00C0FFEE + i`. `SyncFailed` is the
+conservative count (no detection, mistiming or a failed header decode).
+Raw rows and metadata: `results/cop-169/baseline-ofdm1-awgn/`.
+
+AWGN, 200 attempts per point:
+
+| SNR (dB) | Frame errors | `SyncFailed` | FER | 95% Wilson |
+|---:|---:|---:|---:|---|
+| −12 to 0 | 200 each | 200 each | 1.000 | 0.981-1.000 |
+| +2 | 181 | 181 | 0.905 | 0.856-0.938 |
+| +4 | 25 | 25 | 0.125 | 0.086-0.178 |
+
+The 50% crossing is +3.04 dB against a −8 dB bar. Every failure is
+`SyncFailed`, so the sync-share clause fails at +4 dB too. No wrong payload
+was delivered. The verdict is FAIL, as expected for the baseline.
+
+The matching Watterson Poor baseline (`--channel poor`) was started but not
+run to completion in this session; it is the first measurement of the
+follow-up, alongside the floor candidates.
+
 ## COP-129: golden vectors for levels 3, 4, 7 and 9, multi-codeword frames and retransmission
 
 Measured 2026-11-08 on x86_64 Linux, release build. The golden corpus

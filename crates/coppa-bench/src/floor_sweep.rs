@@ -112,7 +112,9 @@ pub enum AttemptOutcome {
     Delivered,
     /// No trustworthy header (conservative `SyncFailed`).
     SyncFailed(SyncCause),
-    /// A header decoded but its fields were invalid.
+    /// A header decoded and passed its check but its fields were invalid.
+    /// Only a receiver that can tell this from a failed header decode reports
+    /// it; anything less certain is [`SyncCause::HeaderDecode`].
     HeaderCorrupt,
     /// The header was trusted but the payload did not decode.
     PayloadFailed,
@@ -123,14 +125,17 @@ pub enum AttemptOutcome {
 impl AttemptOutcome {
     /// Classify a batch [`CoppaTransceiver::receive`] result. The legacy
     /// receiver does not say which acquisition stage failed, so its
-    /// `SyncFailed` is recorded as [`SyncCause::NoDetection`].
+    /// `SyncFailed` is recorded as [`SyncCause::NoDetection`]. Its
+    /// `HeaderCorrupt` covers both a protected header that did not decode and
+    /// one with impossible fields, and it cannot tell the two apart, so all of
+    /// it is counted conservatively as [`SyncCause::HeaderDecode`].
     #[must_use]
     pub fn from_receive(result: Result<&[u8], &ReceiveError>, sent: &[u8]) -> Self {
         match result {
             Ok(rx) if rx == sent => Self::Delivered,
             Ok(_) => Self::WrongPayload,
             Err(ReceiveError::SyncFailed) => Self::SyncFailed(SyncCause::NoDetection),
-            Err(ReceiveError::HeaderCorrupt) => Self::HeaderCorrupt,
+            Err(ReceiveError::HeaderCorrupt) => Self::SyncFailed(SyncCause::HeaderDecode),
             Err(ReceiveError::LdpcNotConverged { .. } | ReceiveError::CrcMismatch) => {
                 Self::PayloadFailed
             }
@@ -211,10 +216,12 @@ impl PointTally {
         self.sync_failed + self.header_corrupt + self.payload_failed + self.wrong_payload
     }
 
-    /// True when each attempt is counted exactly once.
+    /// True when the point has attempts and each is counted exactly once. A
+    /// point with no attempts measured nothing, so it never passes.
     #[must_use]
     pub fn is_partition(&self) -> bool {
-        self.delivered + self.frame_errors() == self.trials
+        self.trials > 0
+            && self.delivered + self.frame_errors() == self.trials
             && self.sync_no_detection + self.sync_mistimed + self.sync_header_decode
                 == self.sync_failed
     }
@@ -359,7 +366,8 @@ pub struct Verdict {
 
 impl Verdict {
     /// True when the crossing meets the bar, the sync-share clause holds above
-    /// it, no wrong payload was delivered and the accounting is exact.
+    /// it, no wrong payload was delivered and the accounting is exact (every
+    /// point has attempts). An empty sweep has no crossing, so it fails.
     #[must_use]
     pub fn passes(&self) -> bool {
         let crossing_ok = self
@@ -439,7 +447,11 @@ impl SweepChannel {
 /// noise lead-in, the frame, a noise tail, then the production receiver over
 /// the whole capture (no oracle timing or header). Returns the outcome and the
 /// frame's airtime in samples.
-#[must_use]
+///
+/// # Errors
+///
+/// A payload over 65535 bytes or one `tx` refuses to transmit is a harness
+/// configuration error, returned rather than counted as a channel failure.
 pub fn run_attempt(
     tx: &CoppaTransceiver,
     level: u8,
@@ -447,7 +459,10 @@ pub fn run_attempt(
     channel: SweepChannel,
     snr_db: f32,
     seed: u64,
-) -> (AttemptOutcome, usize) {
+) -> anyhow::Result<(AttemptOutcome, usize)> {
+    let payload_len = u16::try_from(payload_bytes).map_err(|_| {
+        anyhow::anyhow!("payload of {payload_bytes} bytes exceeds the header's u16")
+    })?;
     let mut rng = StdRng::seed_from_u64(seed);
     let payload: Vec<u8> = (0..payload_bytes).map(|_| rng.random::<u8>()).collect();
     let header = CoppaHeader {
@@ -458,12 +473,12 @@ pub fn run_attempt(
         fec_type: 0,
         speed_level: level,
         seq_num: 0,
-        payload_len: payload_bytes as u16,
+        payload_len,
         codewords: 1,
     };
-    let Ok(clean) = tx.transmit(&header, &payload) else {
-        return (AttemptOutcome::PayloadFailed, 0);
-    };
+    let clean = tx
+        .transmit(&header, &payload)
+        .map_err(|e| anyhow::anyhow!("level {level} cannot carry {payload_bytes} bytes: {e:?}"))?;
     let p_clean = coppa_channel::mean_power(&clean);
     let fading = match channel {
         SweepChannel::Awgn => None,
@@ -495,11 +510,14 @@ pub fn run_attempt(
         }
         Err(e) => AttemptOutcome::from_receive(Err(e), &payload),
     };
-    (outcome, clean.len())
+    Ok((outcome, clean.len()))
 }
 
 /// Run a batch-receive sweep over `grid` and return one tally per point.
-#[must_use]
+///
+/// # Errors
+///
+/// Propagates [`run_attempt`]'s configuration errors.
 pub fn run_sweep(
     tx: &CoppaTransceiver,
     level: u8,
@@ -508,7 +526,7 @@ pub fn run_sweep(
     grid: &[i32],
     trials: usize,
     seed_base: u64,
-) -> Vec<PointTally> {
+) -> anyhow::Result<Vec<PointTally>> {
     grid.iter()
         .enumerate()
         .map(|(pi, &snr)| {
@@ -516,10 +534,10 @@ pub fn run_sweep(
             for trial in 0..trials {
                 let seed = attempt_seed(seed_base, pi, trials, trial);
                 let (outcome, airtime) =
-                    run_attempt(tx, level, payload_bytes, channel, snr as f32, seed);
+                    run_attempt(tx, level, payload_bytes, channel, snr as f32, seed)?;
                 tally.record(outcome, airtime, payload_bytes);
             }
-            tally
+            Ok(tally)
         })
         .collect()
 }
@@ -592,6 +610,10 @@ mod tests {
             AttemptOutcome::SyncFailed(SyncCause::NoDetection)
         );
         assert_eq!(
+            AttemptOutcome::from_receive(Err(&ReceiveError::HeaderCorrupt), &sent),
+            AttemptOutcome::SyncFailed(SyncCause::HeaderDecode)
+        );
+        assert_eq!(
             AttemptOutcome::from_receive(Err(&ReceiveError::CrcMismatch), &sent),
             AttemptOutcome::PayloadFailed
         );
@@ -659,6 +681,22 @@ mod tests {
     }
 
     #[test]
+    fn empty_points_and_sweeps_never_pass() {
+        assert!(!PointTally::new(-12.0).is_partition());
+        let v = evaluate(&[PointTally::new(-12.0), PointTally::new(4.0)], -2.0);
+        assert_eq!(v.accounting_errors, vec![-12.0, 4.0]);
+        assert!(!v.passes());
+        assert!(!evaluate(&[], -2.0).passes());
+    }
+
+    #[test]
+    fn harness_errors_are_returned_not_counted() {
+        let tx = CoppaTransceiver::new(coppa_codec::ofdm::CoppaProfile::hf_narrow(), 1);
+        assert!(run_attempt(&tx, 1, 70_000, SweepChannel::Awgn, 30.0, 1).is_err());
+        assert!(run_attempt(&tx, 1, 4_000, SweepChannel::Awgn, 30.0, 1).is_err());
+    }
+
+    #[test]
     fn verdict_checks_sync_share_only_above_the_crossing() {
         // Crossing between -10 (FER 1.0) and -8 (FER 0.25): -9.33 dB.
         let points = [
@@ -701,7 +739,8 @@ mod tests {
     #[test]
     fn production_receiver_decodes_a_clean_attempt_through_the_cable() {
         let tx = CoppaTransceiver::new(coppa_codec::ofdm::CoppaProfile::hf_narrow(), 1);
-        let (outcome, airtime) = run_attempt(&tx, 1, 16, SweepChannel::Awgn, 30.0, DEV_SEED_BASE);
+        let (outcome, airtime) =
+            run_attempt(&tx, 1, 16, SweepChannel::Awgn, 30.0, DEV_SEED_BASE).unwrap();
         assert_eq!(outcome, AttemptOutcome::Delivered);
         assert!(airtime > 0);
     }
