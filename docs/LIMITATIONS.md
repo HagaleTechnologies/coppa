@@ -355,3 +355,53 @@ update.
   an ACK. This also affects the existing plain multi-codeword path. The new
   protected-mode bound covers two slow HF ACKs, but does not reserve a third
   frame for a peer ID. A lost first ACK during that prepend can cause a retry.
+
+## COP-178 versioned wire contract
+
+- There is no in-band air-protocol version negotiation and no automatic
+  downgrade. The receiver decodes exactly one air-protocol version. A peer
+  sending another version most likely just fails preamble acquisition: the
+  receiver does not reliably report the mismatch to its host. SPEC §0.3.
+- The air-protocol version 1 promise starts at crate 0.12.0. Earlier releases
+  also put `version: 1` in their headers but broke the format several times
+  (SPEC §0.1), so a pre-0.12.0 peer is not covered even though it claims
+  version 1.
+- The PHY header version field is four bits. Versions 2 to 15 remain; a
+  framing decision is needed before version 15 is allocated.
+- The per-codeword payload CRC-32 (SPEC §5.5) has a literal guard for its
+  polynomial and trailer length only. Its big-endian trailer byte order is
+  pinned end to end by the golden WAV vectors, not by a standalone test.
+- The C ABI compatibility check compares the header and exported symbols on
+  Linux x86_64 only. It does not prove the ABI on macOS, Windows or other
+  architectures. While the repository has no release tag, it compares against
+  a pinned pre-release baseline commit (C ABI 1.0) rather than a published
+  release. Until the first release tag exists, anything added after that
+  commit, including the ABI 1.1 accessors `coppa_air_protocol_version` and
+  `coppa_host_api_version`, is compared only as an addition: a later change
+  to one of them is not caught. Tagging the 0.12.0 release closes this.
+
+## LinBPQ/BPQ32 gateway (COP-172)
+
+The lab uses LinBPQ 6.0.26.1 i386 Linux as a B2F BBS peer, with no RMS
+account, CMS or RMS-user forwarding queue. BPQ32, RF, a rig, Raspberry Pi
+and the root apt installation route were not run. Use a dwell of at least
+7 s so five intervals cover the 35 s handshake timeout; LISTEN OFF cancels
+a shorter scanner hold. A gateway dying mid-session leaves Pat waiting
+for dead-link detection (prior black-box measurements: DISCONNECT at 174 s,
+exit 1 at 263 s). RETRIES covers VARA-style dials only; Pat sends one
+request by default. LinBPQ needs a tmpfs working directory where the host
+filesystem allocates inode numbers above 2**32. See [BPQ.md](BPQ.md).
+
+An idle session with no outstanding application data can keep sending
+KEEPALIVE after its peer dies. The COP-172 black-box restart probe stayed
+up for the full 400 s harness limit when the gateway was killed before
+the BBS banner. The restart experiment now interrupts an outstanding
+B2F write to exercise the existing data-retry dead-link bound. Idle-peer
+liveness is a separate follow-up, not a finite-bound claim.
+
+Closing a VARA command connection does not end the dial that client
+started. The dial lasts until the handshake reaper ends it, 30 to 35 s
+after its last request, and in the COP-172 lab a new dial on that coppad
+in that window was refused with `another session is active`. A host that
+drops its connection mid-dial should send `ABORT` first; the BPQ lab's
+stall scenario does (`docs/testing/bpq-session.md`).

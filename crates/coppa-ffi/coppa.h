@@ -32,6 +32,24 @@
  * crate version that coppa_version() returns. A library built before
  * COP-139 does not export coppa_abi_version.
  *
+ * Within one ABI major, the layout of every existing public struct is
+ * frozen: struct_size lets a library detect a caller built against a
+ * different header, but it does not make growing a struct compatible.
+ *
+ * Version discovery (COP-178)
+ *
+ * Four separate numbers, all library-level, none needing a handle:
+ * - coppa_version(): the crate semver string, e.g. "0.12.0" (static; do not
+ *   free).
+ * - coppa_air_protocol_version(): the on-air protocol version (SPEC.md
+ *   section 0.3). Stations interoperate only when it matches.
+ * - coppa_host_api_version(): the host-API version, the same number coppad
+ *   reports over TCP (VERSIONINFO) and WebSocket (hello).
+ * - coppa_abi_version(): this C ABI's (MAJOR << 16) | MINOR.
+ * coppa_air_protocol_version and coppa_host_api_version need ABI 1.1: before
+ * resolving them dynamically, check that coppa_abi_version() >> 16 == 1 and
+ * (coppa_abi_version() & 0xFFFF) >= 1.
+ *
  * Thread safety
  *
  * - Any function may be called from any thread. The library starts no
@@ -47,8 +65,9 @@
  *   may use the handle after it. Join or stop the other threads first.
  * - coppa_last_error is per thread: it reports the calling thread's last
  *   failed call only.
- * - coppa_version, coppa_abi_version and coppa_strerror return static
- *   strings or values and are always safe to call.
+ * - coppa_version, coppa_abi_version, coppa_air_protocol_version,
+ *   coppa_host_api_version and coppa_strerror return static strings or
+ *   values and are always safe to call.
  *
  * Errors
  *
@@ -112,9 +131,10 @@
 #define COPPA_ABI_VERSION_MAJOR 1
 
 /**
- * ABI minor version: changes when something is added (COP-139).
+ * ABI minor version: changes when something is added (COP-139). 1 adds
+ * `coppa_air_protocol_version` and `coppa_host_api_version` (COP-178).
  */
-#define COPPA_ABI_VERSION_MINOR 0
+#define COPPA_ABI_VERSION_MINOR 1
 
 /**
  * Link state: idle (`coppa_link_state`).
@@ -386,6 +406,26 @@ extern "C" {
  * version. Always safe to call; never touches [`coppa_last_error`].
  */
 COPPA_API uint32_t coppa_abi_version(void);
+
+/**
+ * The air-protocol version this library transmits and decodes
+ * (`docs/SPEC.md` §0.3): the value in the PHY and MAC header version
+ * fields. Two stations interoperate only when this matches. Separate from
+ * [`coppa_version`]'s crate version, [`coppa_host_api_version`] and
+ * [`coppa_abi_version`]. Needs ABI 1.1 or later (COP-178). Always safe to
+ * call; never touches [`coppa_last_error`].
+ */
+COPPA_API uint32_t coppa_air_protocol_version(void);
+
+/**
+ * The host-API version this library implements (`docs/HOST-API.md`): the
+ * same number coppad reports over TCP (`VERSIONINFO`) and WebSocket
+ * (`hello.host_api_version`). Separate from [`coppa_version`]'s crate
+ * version, [`coppa_air_protocol_version`] and [`coppa_abi_version`]. Needs
+ * ABI 1.1 or later (COP-178). Always safe to call; never touches
+ * [`coppa_last_error`].
+ */
+COPPA_API uint32_t coppa_host_api_version(void);
 
 /**
  * The calling thread's message for its most recent failed `coppa_*` call,

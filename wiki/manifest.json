@@ -466,6 +466,28 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:1310fd27302f68df34fbd91fe181e0759953074f6d6e16d1286c89ee706a948e",
+      "id": "daemon-test-ports",
+      "kind": "gotcha",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/daemon-test-ports.md",
+      "sources": [
+        "crates/coppa-daemon/tests/support/mod.rs",
+        "crates/coppa-daemon/tests/runtime_smoke.rs",
+        "crates/coppa-daemon/tests/cli.rs",
+        "crates/coppa-daemon/src/vara_wiring.rs"
+      ],
+      "status": "current",
+      "title": "What will bite you when a test hands coppad a port?",
+      "verified_commit": "2662e93",
+      "verified_date": "2026-11-09",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:7163a3fc6b088923b3e2d9392c8d2f4215b3f120c2b85a81327a1019f8afa56f",
       "id": "ldpc-non-convergence",
       "kind": "gotcha",
@@ -488,6 +510,28 @@
       "title": "What will bite you about LDPC at speed levels 9 and 10?",
       "verified_commit": "3cbfd1e",
       "verified_date": "2026-10-28",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:88ea203b70d7ac0a35b7561d61ceebbfdfcc632899700d5a30f9d495c4c7b06d",
+      "id": "linbpq-gateway",
+      "kind": "gotcha",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/linbpq-gateway.md",
+      "sources": [
+        "crates/coppa-daemon/src/event_loop.rs",
+        "crates/coppa-host/src/vara/protocol.rs",
+        "docs/BPQ.md",
+        "tools/bpq-loop/run.sh"
+      ],
+      "status": "current",
+      "title": "What will bite you when LinBPQ drives coppa as a VARA-style TNC?",
+      "verified_commit": "28d4c9a",
+      "verified_date": "2026-11-11",
       "visibility": "public"
     },
     {

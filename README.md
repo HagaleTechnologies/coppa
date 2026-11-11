@@ -1,6 +1,14 @@
 # Coppa
 
-Open-source ham radio digital communications system written in Rust.
+Coppa is an open-source OFDM modem and Rust library for amateur radio on HF and VHF,
+licensed MIT OR Apache-2.0. Its waveform, FEC and protocol are published as a normative,
+versioned specification ([docs/SPEC.md](docs/SPEC.md)), detailed enough to build an
+interoperable implementation without reading the Rust source. Host programs such as Pat
+drive it over the de-facto TCP TNC command sets they already speak: VARA-style, ARDOP,
+AGWPE and KISS ([docs/HOST-API.md](docs/HOST-API.md)). The OFDM modem is not RF-compatible
+with VARA or any other proprietary modem, and by policy it never will be. Every contribution
+follows the
+[clean-room and licensing policy](docs/DECISIONS/2026-11-09-clean-room-and-licensing-policy.md).
 
 [![CI](https://github.com/HagaleTechnologies/coppa/actions/workflows/ci.yml/badge.svg)](https://github.com/HagaleTechnologies/coppa/actions)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
@@ -243,3 +251,5 @@ dual licensed as above, without any additional terms or conditions.
 
 Send a small file to multiple OFDM stations with the
 [broadcast file commands](docs/BROADCAST.md), using a configured KISS service.
+
+[LinBPQ/BPQ32 gateway setup](docs/BPQ.md) uses the VARA-style TCP ports.

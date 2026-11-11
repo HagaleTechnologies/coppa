@@ -26,10 +26,15 @@
 - [What will bite you when persisting coppa CLI settings?](pages/cli-settings.md) — Profile, band and TNC gotchas.
 - [Which stream and exit code does coppa use?](pages/cli-output.md) — stdout is data only; broken pipe, Ctrl-C and 130 rules.
 - [What will bite you when testing coppad's mDNS discovery?](pages/mdns-discovery.md) — Loopback answers and glibc's missing .local lookup fool same-host tests.
+- [What will bite you when a test hands coppad a port?](pages/daemon-test-ports.md) — A picked-then-released port can be taken; bind port 0 and read the log.
 - [What will bite you when calling coppa from C or Python?](pages/c-ffi-and-python-link.md) — SONAME, struct_size, stale header, debug speed, profile and C++ traps.
 - [What will bite you when a paused-clock test drives the daemon's timers?](pages/paused-clock-timers.md) — Under start_paused only tokio's clock is virtual; daemon timers must use clock_now().
 - [What will bite you when measuring coppa's TNC against Direwolf?](pages/tnc-direwolf-benchmark.md) — Misnamed track, two Direwolf defaults, 48 kHz input.
 - [What will bite you about the 9600 baud G3RUH TNC?](pages/tnc-g3ruh-9600.md) — Discriminator wiring, duplicate window and fixed phases.
 - [What will bite you about session fade protection?](pages/session-fade-protection.md) — HARQ keys, delayed ACKs and the burst-duration guard.
 - [What will bite you about session chat streams?](pages/session-chat-streams.md) — Stream nibble needs app_messages; chat bytes stay out of BUFFER.
+<<<<<<< HEAD
 - [What will bite you when building or installing coppa release binaries?](pages/release-binaries.md) — glibc 2.39 trap, no libudev, binstall needs @version.
+=======
+- [What will bite you when LinBPQ drives coppa as a VARA-style TNC?](pages/linbpq-gateway.md) — Callsign lists, retries, scanner holds and the i386 runtime.
+>>>>>>> e54eec9cd6a3f5dcddf24ab61e582936c8a7c45c

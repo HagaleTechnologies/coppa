@@ -5,10 +5,20 @@ dashboard, a script, or your own host. It lists every TCP interface coppad serve
 one accepts, what it sends back, and where coppa's VARA-style port differs from VARA. To set up
 Pat itself, read [PAT.md](PAT.md) first; it links back here for the protocol details.
 
-coppa is **not** RF- or waveform-compatible with VARA or ARDOP. The VARA-style and ARDOP ports
-copy those modems' TCP control interfaces so existing hosts can drive coppa. Both ends of a
-radio link must run coppa, and both stations need coppad 0.3.0 or later
+coppa is **not** RF- or waveform-compatible with VARA or ARDOP. Its VARA-style and ARDOP ports
+implement the TCP command sets those hosts already speak, so existing hosts can drive coppa. The
+VARA-style port follows EA5HVK's published command list (see
+[How coppa differs from VARA](#how-coppa-differs-from-vara)). Both ends of a radio link must run
+coppa, and both stations need coppad 0.3.0 or later
 ([OPERATING.md](OPERATING.md#connected-sessions-delivery-and-buffer)).
+
+Two things let you embed coppa in a host application or implement its protocol natively. First,
+its licensing: coppa's code is MIT OR Apache-2.0, every dependency must pass the licence
+allowlist in `deny.toml`, and every contribution follows the
+[clean-room and licensing policy](DECISIONS/2026-11-09-clean-room-and-licensing-policy.md).
+Second, the [versioned wire specification](SPEC.md) (wire-format version 1, with a revision
+table) defines the waveform, FEC and protocol well enough to build an interoperable
+implementation without reading the Rust source.
 
 Every table below was checked against coppad 0.3.0 at commit `b9fdb8d` (see
 [How this was verified](#how-this-was-verified)).
@@ -64,8 +74,8 @@ Then send a few commands. The `sleep`s give coppad time to answer each one:
 $ { echo VERSION; sleep 1; echo "MYCALL N1CALL"; sleep 1; echo "LISTEN ON"; sleep 1;
     echo FOOBAR; sleep 1; echo "CONNECT N1CALL N0CALL"; sleep 35; } \
     | nc -q 1 127.0.0.1 8300 | tr '\r' '\n'
-VERSION Coppa 0.3.0
-VERSION Coppa 0.3.0
+VERSION Coppa 0.13.0
+VERSION Coppa 0.13.0
 OK
 OK
 WRONG
@@ -102,7 +112,7 @@ either data port. The [two-station example](#a-two-station-session) shows what b
 
 **Framing.** Send one command per line, ended by `\r`, `\n` or `\r\n`. Empty lines are ignored.
 coppad ends every line it sends with a bare `\r`, as VARA does. On connect coppad speaks first,
-with `VERSION Coppa 0.3.0`. A line longer than 4096 bytes, or one that is not valid UTF-8,
+with `VERSION Coppa 0.13.0`. A line longer than 4096 bytes, or one that is not valid UTF-8,
 closes the connection.
 
 **Replies and pushed lines.** Each command gets exactly one reply, sent only to the client that
@@ -116,8 +126,11 @@ on a fixed delay.
 
 | You send | coppad replies | Effect |
 |---|---|---|
-| `VERSION` | `VERSION Coppa 0.3.0` | none |
-| `MYCALL <call>` | `OK`; `WRONG` if the callsign is missing or invalid | sets the daemon's one callsign; only the first callsign is read |
+| `VERSION` | `VERSION Coppa 0.13.0` | none |
+| `VERSIONINFO` (coppa extension) | `VERSIONINFO crate_version=0.13.0 air_protocol_version=1 host_api_version=1`; `WRONG` with any argument | none; see [Version discovery](#version-discovery) |
+| `MYCALL <call> [<call> ...]` | `OK` for one to five valid callsigns, otherwise `WRONG` | replaces the daemon-wide list; first identifies transmissions, all answer inbound calls; CONNECTED names the dialled call |
+| `RETRIES <n>` or `RETRIES=<n>` | `OK` for 0-20, otherwise `WRONG` | per-client count of additional connect requests on later dials; resets on client disconnect |
+| `BUSY` | `BUSY ON` or `BUSY OFF` | reliable reply with the current channel state |
 | `LISTEN ON` / `LISTEN OFF` | `OK`; `WRONG` for any other argument | answer inbound calls, or stop; coppad starts with listening off |
 | `CONNECT <me> <target> [via ...]` | `OK`, then `CONNECTED <caller> <callee> <bw>` or `DISCONNECTED` | dials `<target>`; `<me>` and `via` are ignored, the daemon's own callsign is used; one argument gets `WRONG` |
 | `DISCONNECT` | `OK`, then `DISCONNECTED` once queued data is acknowledged | ends the session; with no session, `OK` and nothing else |
@@ -139,6 +152,41 @@ on a fixed delay.
   `CANCELPENDING` before `DISCONNECTED`.
 - `DISCONNECT` sends what the host already queued, waits for each frame's ACK, and only then
   ends the session ([OPERATING.md](OPERATING.md#ending-a-session-disconnect)).
+
+### Version discovery
+
+coppad and `coppa-ffi` report four version numbers, each with its own meaning (COP-178):
+
+| Field | Meaning | Changes when |
+|---|---|---|
+| `crate_version` | the coppa release, a semver string such as `0.12.0` | every release |
+| `air_protocol_version` | the on-air protocol ([SPEC.md §0.3](SPEC.md)); stations interoperate only when it matches | an incompatible change to a frozen frame field, FEC parameter or session message |
+| `host_api_version` | the host-facing contract on this page: TCP commands, WebSocket messages and the C FFI's semantics | an incompatible change to an existing command, field or message |
+| C ABI (`coppa_abi_version()`) | the C binary interface ([ABI decision](DECISIONS/2026-11-03-c-abi-versioning.md)) | major: an exported function, struct layout or constant changes; minor: an addition |
+
+Host-API version 1 permits additive changes: new commands, new response fields, new message
+types. A client must ignore key/value pairs and JSON fields it does not know. An incompatible
+change to an existing command, field or message increments `host_api_version`.
+
+On the command port the greeting and `VERSION` keep their old shape; `VERSIONINFO` is an opt-in
+query with no arguments. Each line below ends with a bare `\r`:
+
+```text
+server greeting: VERSION Coppa 0.13.0\r
+client: VERSION\r
+server: VERSION Coppa 0.13.0\r
+client: VERSIONINFO\r
+server: VERSIONINFO crate_version=0.13.0 air_protocol_version=1 host_api_version=1\r
+client: VERSIONINFO extra\r
+server: WRONG\r
+```
+
+Each query gets exactly one reply, with no `OK` after it and no unsolicited version line.
+`crate_version` is a semver string; the protocol fields are unsigned decimal integers. A coppad
+older than 0.12.0 answers `WRONG` to `VERSIONINFO`: treat that as "detailed version discovery
+unavailable", not as a version. The WebSocket `hello` carries the same three fields (see
+[Handshake](#handshake)), and the C FFI has `coppa_version()`, `coppa_air_protocol_version()`,
+`coppa_host_api_version()` and `coppa_abi_version()`; the two middle ones need C ABI 1.1.
 
 ### Lines coppad pushes
 
@@ -174,8 +222,7 @@ Nobody has run coppa against real VARA. For a command that document does not cov
 `CWID`, `CLEANTXBUFFER`), the table above says what coppa does and claims nothing about VARA.
 
 - **The waveform.** Only the TCP interface is VARA-style. A VARA station cannot hear coppa.
-- **`MYCALL`.** VARA documents up to five callsigns (`MYCALL Call1 ... Call5`). coppa reads the
-  first and ignores the rest, and the callsign is daemon-wide, not per client.
+- **`MYCALL`.** VARA documents up to five callsigns (`MYCALL Call1 ... Call5`). coppa answers all listed callsigns. The list is daemon-wide, not per client.
 - **`CONNECT Source Destination`.** coppa ignores `Source` and dials from the daemon's callsign.
 - **`BW500|BW2300|BW2750` and `COMPRESSION OFF|TEXT|FILES`.** Both get `OK`, as in VARA, but
   change nothing. `[engine] profile` chooses the waveform, so match it on both stations.
@@ -279,8 +326,15 @@ JavaScript can only use the query form). The path is not checked.
 After `101` the first frame is:
 
 ```json
-{"type":"hello","version":1,"server":"coppa 0.3.0"}
+{"type":"hello","version":1,"server":"coppa 0.12.0","crate_version":"0.12.0","air_protocol_version":1,"host_api_version":1}
 ```
+
+`crate_version` (string), `air_protocol_version` and `host_api_version` (unsigned integers) are
+the separate versions described in [Version discovery](#version-discovery). `version` is the
+legacy alias of `host_api_version`, and `server` is human-readable text, not for parsing. The
+`hello` is sent only after a successful handshake: a refused upgrade (`401`, `403`) gets no
+`hello`, and there is no unauthenticated discovery route. A coppad older than 0.12.0 sends only
+`version` and `server`; a missing field means unknown, not zero. Ignore fields you do not know.
 
 ### Requests
 
@@ -421,6 +475,8 @@ frame, including an escape sequence split across reads, and forwards it only aft
   `coppa-ffi` (a cdylib and staticlib with streaming decode). The header is
   [crates/coppa-ffi/coppa.h](../crates/coppa-ffi/coppa.h); the
   [getting-started tutorial](tutorials/getting-started.md) has a C example.
+  `coppa_air_protocol_version()` and `coppa_host_api_version()` (C ABI 1.1) return the same
+  numbers as `VERSIONINFO` and the WebSocket `hello`, without a handle.
 
 ## Security
 
@@ -525,3 +581,11 @@ out after five seconds; a client whose writes stay stalled is disconnected. Broa
 records with a log; it never grows a queue. Partial requests survive interleaved RX.
 Winlink Express packet and Outpost BBS connected sessions are unsupported. Real
 UI-View interoperability and monitor formatting remain unverified with those clients.
+
+COP-172: `LISTEN OFF` cancels an inbound PENDING attempt with CANCELPENDING.
+RETRIES repeats requests at max twice request airtime plus two turnarounds,
+or five seconds. Repeats stop at 300 s; timeout follows the last request.
+See [BPQ.md](BPQ.md) for scanning gateways and measured limits.
+
+Unknown-command log deduplication remembers at most 64 words per client,
+then suppresses further unknown-word logs. Every command still gets WRONG.

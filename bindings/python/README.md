@@ -24,7 +24,8 @@ search path. Set `COPPA_LIB` to the library's full path to choose one.
 ```python
 import coppa
 
-print(coppa.version(), coppa.abi_version())   # '0.5.0' (1, 0)
+print(coppa.version(), coppa.abi_version())   # '0.12.0' (1, 1)
+print(coppa.air_protocol_version(), coppa.host_api_version())  # 1 1
 
 link = coppa.Link("N0AAA")                    # profile=None, speed_level=0, turnaround_ms=0
 link.connect("N0BBB", now_ms=0)
@@ -66,8 +67,14 @@ the listener prints the bytes it received.
   `close()` only after every other thread is done with the link.
 - **Profiles.** Both ends must use the same profile (OFDM band and compression).
 - **ABI.** Loading checks `coppa_abi_version()`. The binding needs ABI 1.x
-  with minor 0 or newer. A library built before COP-139 has no
-  `coppa_abi_version` and is refused as too old.
+  with minor 1 or newer (COP-178 added `coppa_air_protocol_version` and
+  `coppa_host_api_version`); an ABI 1.0 library is refused with a readable
+  error before either symbol is looked up. A library built before COP-139 has
+  no `coppa_abi_version` and is refused as too old.
+- **Versions.** `version()` is the crate semver, `air_protocol_version()` the
+  on-air protocol (docs/SPEC.md §0.3), `host_api_version()` the host-API
+  contract (docs/HOST-API.md "Version discovery"), and `abi_version()` the C
+  ABI. They change independently.
 
 ## Tests
 

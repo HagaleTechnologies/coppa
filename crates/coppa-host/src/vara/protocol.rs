@@ -3,8 +3,8 @@
 /// Commands received from a VARA client on the command port.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VaraCommand {
-    /// Set the station callsign: `MYCALL <callsign>`
-    MyCall(String),
+    /// Set one to five callsigns. The first identifies transmissions; the rest answer inbound calls.
+    MyCall(Vec<String>),
     /// Connect to a remote station: `CONNECT <source> <dest> [via <digi>]`
     Connect { source: String, destination: String },
     /// Disconnect the current session.
@@ -24,12 +24,20 @@ pub enum VaraCommand {
     Abort,
     /// Get the software version.
     Version,
+    /// Get the separate crate, air-protocol and host-API versions (coppa
+    /// extension, not a VARA command, COP-178): `VERSIONINFO` with no
+    /// arguments. With any argument it parses as `Unknown`.
+    VersionInfo,
     /// Closing Morse ID on or off: CWID ON|OFF. Any other argument parses as
     /// `Unknown`.
     CwId(bool),
     /// Rig frequency or mode (coppa extension, not a VARA command): FREQ \[hz\]
     /// or MODE [USB|LSB|PKTUSB|PKTLSB]. Any other shape parses as `Unknown`.
     Rig(RigCommand),
+    /// Set this host's connect retry count, from zero to twenty.
+    Retries(u32),
+    /// Query the current channel busy state.
+    BusyQuery,
     /// Unknown command.
     Unknown(String),
 }
@@ -94,6 +102,17 @@ pub enum VaraResponse {
     Wrong,
     /// VARA version string.
     Version(String),
+    /// Reply to `VERSIONINFO` (coppa extension, COP-178):
+    /// `VERSIONINFO crate_version=<semver> air_protocol_version=<n>
+    /// host_api_version=<n>`. Clients must ignore keys they do not know.
+    VersionInfo {
+        /// The crate semver, e.g. `0.12.0`.
+        crate_version: String,
+        /// The air-protocol version (`docs/SPEC.md` §0.3).
+        air_protocol_version: u32,
+        /// The host-API version (`docs/HOST-API.md`).
+        host_api_version: u32,
+    },
     /// A remote station's connect request was accepted and the handshake
     /// is under way (pushed by a listening station, not a reply to an
     /// outbound `CONNECT`). Followed by `CONNECTED` or `CANCELPENDING`.
@@ -112,6 +131,8 @@ pub enum VaraResponse {
     Buffer(usize),
     /// Busy state.
     Busy(bool),
+    /// Non-disposable reply to a BUSY query.
+    BusyState(bool),
     /// Signal-to-noise ratio.
     Snr(i32),
     /// Keepalive, sent every 60 seconds.
@@ -126,13 +147,35 @@ impl VaraCommand {
     /// Parse a VARA command string.
     pub fn parse(input: &str) -> Self {
         let trimmed = input.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if let Some(rest) = upper.strip_prefix("RETRIES") {
+            if rest.starts_with('=') || rest.starts_with(char::is_whitespace) {
+                let value = rest.trim().strip_prefix('=').unwrap_or(rest.trim()).trim();
+                if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+                    if let Ok(n) = value.parse() {
+                        return VaraCommand::Retries(n);
+                    }
+                }
+            }
+            return VaraCommand::Unknown(trimmed.into());
+        }
         let parts: Vec<&str> = trimmed.splitn(4, ' ').collect();
 
         match parts.first().map(|s| s.to_uppercase()).as_deref() {
-            Some("MYCALL") => match trimmed.split_whitespace().nth(1) {
-                Some(call) => VaraCommand::MyCall(call.to_string()),
-                None => VaraCommand::Unknown(trimmed.to_string()),
-            },
+            Some("MYCALL") => {
+                let mut calls = Vec::new();
+                for call in trimmed.split_whitespace().skip(1) {
+                    if !calls.iter().any(|c| c == call) {
+                        calls.push(call.to_string());
+                    }
+                }
+                if calls.is_empty() {
+                    VaraCommand::Unknown(trimmed.into())
+                } else {
+                    VaraCommand::MyCall(calls)
+                }
+            }
+            Some("BUSY") if trimmed.eq_ignore_ascii_case("BUSY") => VaraCommand::BusyQuery,
             Some("CONNECT") => {
                 if let (Some(&src), Some(&dst)) = (parts.get(1), parts.get(2)) {
                     VaraCommand::Connect {
@@ -168,6 +211,9 @@ impl VaraCommand {
             Some("BW2750") => VaraCommand::Bandwidth(2750),
             Some("ABORT") => VaraCommand::Abort,
             Some("VERSION") => VaraCommand::Version,
+            Some("VERSIONINFO") if trimmed.split_whitespace().nth(1).is_none() => {
+                VaraCommand::VersionInfo
+            }
             Some("CWID") => {
                 let args: Vec<&str> = trimmed.split_whitespace().skip(1).collect();
                 match args.as_slice() {
@@ -214,6 +260,15 @@ impl VaraResponse {
             VaraResponse::Ok => "OK\r".to_string(),
             VaraResponse::Wrong => "WRONG\r".to_string(),
             VaraResponse::Version(v) => format!("VERSION {}\r", v),
+            VaraResponse::VersionInfo {
+                crate_version,
+                air_protocol_version,
+                host_api_version,
+            } => format!(
+                "VERSIONINFO crate_version={crate_version} \
+                 air_protocol_version={air_protocol_version} \
+                 host_api_version={host_api_version}\r"
+            ),
             VaraResponse::Pending => "PENDING\r".to_string(),
             VaraResponse::CancelPending => "CANCELPENDING\r".to_string(),
             VaraResponse::Connected(src, dst, bw) => {
@@ -222,7 +277,9 @@ impl VaraResponse {
             VaraResponse::Disconnected => "DISCONNECTED\r".to_string(),
             VaraResponse::Ptt(on) => format!("PTT {}\r", if *on { "ON" } else { "OFF" }),
             VaraResponse::Buffer(n) => format!("BUFFER {}\r", n),
-            VaraResponse::Busy(b) => format!("BUSY {}\r", if *b { "ON" } else { "OFF" }),
+            VaraResponse::Busy(b) | VaraResponse::BusyState(b) => {
+                format!("BUSY {}\r", if *b { "ON" } else { "OFF" })
+            }
             VaraResponse::Snr(snr) => format!("SNR {}\r", snr),
             VaraResponse::IAmAlive => "IAMALIVE\r".to_string(),
             VaraResponse::Freq(hz) => format!("FREQ {}\r", hz),
@@ -234,6 +291,17 @@ impl VaraResponse {
     /// `VERSION` command.
     pub fn coppa_version() -> Self {
         VaraResponse::Version(concat!("Coppa ", env!("CARGO_PKG_VERSION")).to_string())
+    }
+
+    /// The reply to `VERSIONINFO` (COP-178): this build's crate semver, the
+    /// air-protocol version and the host-API version, each from its shared
+    /// constant.
+    pub fn coppa_version_info() -> Self {
+        VaraResponse::VersionInfo {
+            crate_version: env!("CARGO_PKG_VERSION").to_string(),
+            air_protocol_version: u32::from(coppa_engine::AIR_PROTOCOL_VERSION),
+            host_api_version: coppa_engine::HOST_API_VERSION,
+        }
     }
 
     /// True for the telemetry lines a client may miss: `BUSY` and `SNR`. The
@@ -253,7 +321,7 @@ mod tests {
     fn test_parse_mycall() {
         assert_eq!(
             VaraCommand::parse("MYCALL VK2ABC"),
-            VaraCommand::MyCall("VK2ABC".to_string())
+            VaraCommand::MyCall(vec!["VK2ABC".to_string()])
         );
     }
 
@@ -296,6 +364,58 @@ mod tests {
     #[test]
     fn test_parse_version() {
         assert_eq!(VaraCommand::parse("VERSION"), VaraCommand::Version);
+    }
+
+    /// COP-178: `VERSIONINFO` takes no arguments, is case-insensitive and
+    /// tolerates surrounding whitespace; any argument makes it `Unknown`
+    /// (answered `WRONG`).
+    #[test]
+    fn cop178_parse_versioninfo() {
+        for line in [
+            "VERSIONINFO",
+            "versioninfo",
+            "VersionInfo",
+            "  VERSIONINFO \r\n",
+        ] {
+            assert_eq!(
+                VaraCommand::parse(line),
+                VaraCommand::VersionInfo,
+                "{line:?}"
+            );
+        }
+        for line in ["VERSIONINFO extra", "VERSIONINFO 1", "VERSIONINFO  a b"] {
+            assert!(
+                matches!(VaraCommand::parse(line), VaraCommand::Unknown(_)),
+                "{line:?} must not parse as VERSIONINFO"
+            );
+        }
+        assert_eq!(VaraCommand::parse("VERSION"), VaraCommand::Version);
+    }
+
+    #[test]
+    fn cop178_format_versioninfo() {
+        assert_eq!(
+            VaraResponse::VersionInfo {
+                crate_version: "0.12.0".to_string(),
+                air_protocol_version: 1,
+                host_api_version: 1,
+            }
+            .format(),
+            "VERSIONINFO crate_version=0.12.0 air_protocol_version=1 host_api_version=1\r"
+        );
+        assert_eq!(
+            VaraResponse::coppa_version_info().format(),
+            format!(
+                "VERSIONINFO crate_version={} air_protocol_version=1 host_api_version=1\r",
+                env!("CARGO_PKG_VERSION")
+            ),
+            "air protocol v1 / host API v1"
+        );
+        // The legacy VERSION line is unchanged.
+        assert_eq!(
+            VaraResponse::coppa_version().format(),
+            format!("VERSION Coppa {}\r", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
@@ -354,14 +474,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_mycall_takes_the_first_callsign() {
+    fn cop172_parse_mycall_list() {
         assert_eq!(
             VaraCommand::parse("MYCALL  W5AU"),
-            VaraCommand::MyCall("W5AU".into())
+            VaraCommand::MyCall(vec!["W5AU".into()])
         );
         assert_eq!(
             VaraCommand::parse("MYCALL G8BPQ G8BPQ-1 G8BPQ-2"),
-            VaraCommand::MyCall("G8BPQ".into())
+            VaraCommand::MyCall(vec!["G8BPQ".into(), "G8BPQ-1".into(), "G8BPQ-2".into()])
         );
         assert!(matches!(
             VaraCommand::parse("MYCALL"),
@@ -464,7 +584,57 @@ mod tests {
     fn test_case_insensitive() {
         assert_eq!(
             VaraCommand::parse("mycall VK2ABC"),
-            VaraCommand::MyCall("VK2ABC".to_string())
+            VaraCommand::MyCall(vec!["VK2ABC".to_string()])
         );
+    }
+}
+
+#[cfg(test)]
+mod cop172_tests {
+    use super::*;
+    #[test]
+    fn cop172_parse_retries_in_both_spellings() {
+        for (line, n) in [
+            ("RETRIES 20", 20),
+            ("retries 0", 0),
+            ("RETRIES=20", 20),
+            ("RETRIES = 5", 5),
+            ("RETRIES= 7", 7),
+            ("RETRIES 99", 99),
+        ] {
+            assert_eq!(VaraCommand::parse(line), VaraCommand::Retries(n));
+        }
+        for line in [
+            "RETRIES",
+            "RETRIES x",
+            "RETRIES -1",
+            "RETRIES 1.5",
+            "RETRIES 2 3",
+            "RETRIESX 2",
+            "RETRIES 99999999999",
+        ] {
+            assert!(
+                matches!(VaraCommand::parse(line), VaraCommand::Unknown(_)),
+                "{line}"
+            );
+        }
+    }
+    #[test]
+    fn cop172_parse_busy_query() {
+        assert_eq!(VaraCommand::parse("BUSY"), VaraCommand::BusyQuery);
+        for line in [
+            "BUSY ON",
+            "BUSY OFF",
+            "BUSY?",
+            "BUSYWAIT 10",
+            "CALLTIMEOUT 600",
+            "PENDING",
+            "CANCELPENDING",
+        ] {
+            assert!(matches!(VaraCommand::parse(line), VaraCommand::Unknown(_)));
+        }
+        assert_eq!(VaraResponse::BusyState(true).format(), "BUSY ON\r");
+        assert!(!VaraResponse::BusyState(true).is_disposable());
+        assert!(VaraResponse::Busy(true).is_disposable());
     }
 }

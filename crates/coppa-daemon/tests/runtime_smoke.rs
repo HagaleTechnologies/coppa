@@ -14,7 +14,7 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 mod support;
-use support::{connect, free_ports, wait_until, Daemon, FakeRigctld};
+use support::{connect, wait_until, Daemon, FakeRigctld};
 
 const READY_DEADLINE: Duration = Duration::from_secs(60);
 const KEY_DEADLINE: Duration = Duration::from_secs(30);
@@ -50,6 +50,9 @@ fn reply(stream: &mut TcpStream, command: &str, prefix: &str) -> String {
     );
 }
 
+/// COP-163: the tests pass `(0, 0)` and connect to `Daemon::vara_ports`, so
+/// coppad binds both VARA ports itself. Picking free ports first and handing
+/// them over races any other process that binds in between.
 fn vara_config(ports: (u16, u16), radio: &str) -> String {
     format!(
         "[radio]\n\
@@ -68,13 +71,12 @@ fn vara_config(ports: (u16, u16), radio: &str) -> String {
 
 #[test]
 fn coppad_starts_answers_the_vara_command_port_and_stops() {
-    let ports = free_ports();
     let mut daemon = Daemon::start(
         "smoke",
-        &vara_config(ports, "ptt_method = \"none\""),
+        &vara_config((0, 0), "ptt_method = \"none\""),
         READY_DEADLINE,
     );
-    let mut stream = connect(ports.0);
+    let mut stream = connect(daemon.vara_ports().0);
     assert!(reply(&mut stream, "VERSION", "VERSION ").starts_with("VERSION Coppa "));
     assert_eq!(reply(&mut stream, "MYCALL N1CALL", "OK"), "OK");
     daemon.kill();
@@ -87,7 +89,6 @@ fn coppad_starts_answers_the_vara_command_port_and_stops() {
 #[test]
 fn a_killed_coppad_has_its_rigctld_ptt_released_by_the_guardian() {
     let fake = FakeRigctld::start();
-    let ports = free_ports();
     let radio = format!(
         "ptt_method = \"rigctld\"\n\
          rigctld_address = \"{}\"\n\
@@ -97,12 +98,12 @@ fn a_killed_coppad_has_its_rigctld_ptt_released_by_the_guardian() {
     );
     let mut daemon = Daemon::start(
         "smoke-guardian",
-        &vara_config(ports, &radio),
+        &vara_config((0, 0), &radio),
         READY_DEADLINE,
     );
     assert!(daemon.guardian_pid().is_some(), "{}", daemon.output());
 
-    let mut stream = connect(ports.0);
+    let mut stream = connect(daemon.vara_ports().0);
     stream.write_all(b"TUNE 20\r").expect("send TUNE");
     assert!(
         wait_until(KEY_DEADLINE, || fake
@@ -121,6 +122,44 @@ fn a_killed_coppad_has_its_rigctld_ptt_released_by_the_guardian() {
         daemon.output()
     );
     assert_eq!(fake.ptt(), 0, "rigctld log {:?}", fake.log());
+}
+
+/// COP-163: two daemons started on VARA ports 0 at once each bind four
+/// distinct ports of their own, and `Daemon::vara_ports` finds them. While
+/// both run, each command port answers `VERSION` and each data port accepts a
+/// connection, so a test never has to hand coppad a port it picked earlier.
+#[test]
+fn two_coppads_on_port_zero_bind_and_report_distinct_vara_ports() {
+    let config = vara_config((0, 0), "ptt_method = \"none\"");
+    let first = Daemon::start("smoke-zero-a", &config, READY_DEADLINE);
+    let second = Daemon::start("smoke-zero-b", &config, READY_DEADLINE);
+    let (first_cmd, first_data) = first.vara_ports();
+    let (second_cmd, second_data) = second.vara_ports();
+
+    let mut ports = vec![first_cmd, first_data, second_cmd, second_data];
+    ports.sort_unstable();
+    ports.dedup();
+    assert_eq!(
+        ports.len(),
+        4,
+        "ports {first_cmd}/{first_data} and {second_cmd}/{second_data} overlap\n{}\n{}",
+        first.output(),
+        second.output()
+    );
+
+    for (daemon, cmd, data) in [
+        (&first, first_cmd, first_data),
+        (&second, second_cmd, second_data),
+    ] {
+        let mut stream = connect(cmd);
+        let version = reply(&mut stream, "VERSION", "VERSION ");
+        assert!(
+            version.starts_with("VERSION Coppa "),
+            "{version:?}\n{}",
+            daemon.output()
+        );
+        let _data = connect(data);
+    }
 }
 
 /// H-064: the `serial-ptt` build fails startup cleanly on a port that does
