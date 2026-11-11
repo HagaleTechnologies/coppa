@@ -583,8 +583,9 @@ Winlink Express packet and Outpost BBS connected sessions are unsupported. Real
 UI-View interoperability and monitor formatting remain unverified with those clients.
 
 COP-172: `LISTEN OFF` cancels an inbound PENDING attempt with CANCELPENDING.
-RETRIES repeats requests at max twice request airtime plus two turnarounds,
-or five seconds. Repeats stop at 300 s; timeout follows the last request.
+RETRIES waits for the actual outgoing audio, including any station ID, plus
+a level-1 HF long-CP ACK and station ID, and two turnarounds with PTT delays.
+The interval is at least five seconds and is recalculated after each repeat. Repeats stop at 300 s; timeout follows the last request.
 See [BPQ.md](BPQ.md) for scanning gateways and measured limits.
 
 Unknown-command log deduplication remembers at most 64 words per client,

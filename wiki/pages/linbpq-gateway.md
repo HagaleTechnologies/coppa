@@ -23,7 +23,9 @@ MYCALL lists matter because the BBS application call can differ from the
 node call. coppa answers up to five callsigns and reports the dialled one
 in CONNECTED. The first remains the identity used for outbound calls.
 RETRIES accepts spaces or an equals sign, up to 20, per command client.
-Pat's default remains one request per dial.
+Pat's default remains one request per dial. Retry deadlines cover the actual
+keyed audio and an ID-bearing response. They are recalculated after each
+repeat because an identification timer can become due during the dial.
 
 PENDING parks the scanner. Keep a dwell of at least 7 s to cover the
 inbound timeout; LISTEN OFF ends an unfinished attempt if the scanner

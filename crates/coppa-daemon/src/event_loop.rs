@@ -3547,6 +3547,25 @@ impl EventLoop {
         }
     }
 
+    /// Budget the audio actually keyed, plus a peer's ACK and possible ID.
+    /// Both response frames are single-codeword; HF long-CP level 1 bounds
+    /// their airtime even when the local request uses a faster profile.
+    fn connect_retry_interval(&self, sent: usize) -> Duration {
+        let response_frame = coppa_protocol::modem::frame_airtime_s(
+            1,
+            &coppa_codec::ofdm::CoppaProfile::hf_standard(),
+        )
+        .expect("level 1 HF has a valid airtime");
+        let radio = &self.config.radio;
+        Duration::from_secs_f64(
+            sent as f64 / self.engine.config().sample_rate as f64 + 2.0 * response_frame,
+        )
+        .saturating_add(Duration::from_millis(
+            2 * (radio.turnaround_ms + radio.ptt_pre_delay_ms + radio.ptt_tail_delay_ms),
+        ))
+        .max(Duration::from_secs(5))
+    }
+
     async fn repeat_pending_dial(&mut self) {
         let Some(mut dial) = self.pending_dial.take() else {
             return;
@@ -3585,6 +3604,7 @@ impl EventLoop {
                     tracing::info!(attempt = dial.total-dial.left+2, of = dial.total+1,
                                    %destination, "Connect request repeated");
                     dial.left -= 1;
+                    dial.interval = self.connect_retry_interval(sent);
                     dial.next_at = keyed + dial.interval;
                 }
                 Err(e) => {
@@ -4820,9 +4840,7 @@ impl EventLoop {
                                                 .map(|t| t.into_std())
                                                 .unwrap_or_else(clock_now);
                                             if retries > 0 && sent > 0 {
-                                                let interval = coppa_protocol::session::connect_req_retry_interval(
-                                                    Duration::from_secs_f64(samples.len() as f64 / self.engine.config().sample_rate as f64),
-                                                    Duration::from_millis(self.config.radio.turnaround_ms));
+                                                let interval = self.connect_retry_interval(sent);
                                                 self.pending_dial = Some(PendingDial {
                                                     session_id: id,
                                                     request: pdu_bytes.clone(),
@@ -8572,6 +8590,73 @@ mod tests {
         }
         assert_eq!(words.len(), MAX_LOGGED_UNKNOWN_COMMANDS);
         assert!(!note_unrecognised(&mut words, "ANOTHER UNKNOWN WORD"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cop172_retry_deadline_covers_station_ids_on_both_legs() {
+        fn read_keyed(audio: &mut coppa_audio::AudioRingConsumer) -> Vec<f32> {
+            let mut samples = vec![0.0; 1_000_000];
+            let read = audio.read(&mut samples);
+            assert!(read > 0, "handshake must actually key audio");
+            samples.truncate(read);
+            samples
+        }
+        for (caller_id_due, peer_id_due) in [(true, false), (false, true), (true, true)] {
+            let (mut a, mut a_audio, _) = cop172_station("N1CALL");
+            let (mut b, mut b_audio, _) = cop172_station("N0GW");
+            if !caller_id_due {
+                mark_identified(&mut a);
+            }
+            if !peer_id_due {
+                mark_identified(&mut b);
+            }
+            cop172_command(&mut a, 1, "RETRIES 2").await;
+            cop172_command(&mut b, 1, "LISTEN ON").await;
+            a.handle_host_event(HostEvent::ConnectRequest {
+                client_id: 1,
+                source: "N1CALL".into(),
+                destination: "N0GW".into(),
+            })
+            .await;
+            let request = read_keyed(&mut a_audio);
+            b.decode_and_dispatch_audio(&with_lead_and_trail(&request))
+                .await;
+            let ack = read_keyed(&mut b_audio);
+            let exchange = Duration::from_secs_f64(
+                (request.len() + ack.len()) as f64 / a.engine.config().sample_rate as f64,
+            ) + Duration::from_millis(2 * a.config.radio.turnaround_ms);
+            let dial = a.pending_dial.as_ref().unwrap();
+            assert!(
+                dial.interval >= exchange,
+                "retry {:?} interrupts exchange {exchange:?}, caller ID={caller_id_due}, peer ID={peer_id_due}",
+                dial.interval,
+            );
+            let until_repeat = dial.next_at.saturating_duration_since(clock_now());
+            // Drop the ACK, then let an ID become due on the repeat too.
+            a.handle_ptt_change(false).await;
+            a.last_id_time = None;
+            tokio::time::advance(until_repeat).await;
+            a.repeat_pending_dial().await;
+            let repeated = read_keyed(&mut a_audio);
+            let exchange = Duration::from_secs_f64(
+                (repeated.len() + ack.len()) as f64 / a.engine.config().sample_rate as f64,
+            ) + Duration::from_millis(2 * a.config.radio.turnaround_ms);
+            assert!(
+                a.pending_dial.as_ref().unwrap().interval >= exchange,
+                "repeat must cover a newly due ID"
+            );
+            a.handle_ptt_change(false).await;
+            tokio::time::advance(exchange - Duration::from_millis(1)).await;
+            a.repeat_pending_dial().await;
+            assert_eq!(a_audio.available(), 0, "no retry over the peer's ACK");
+            a.decode_and_dispatch_audio(&with_lead_and_trail(&ack))
+                .await;
+            assert!(a
+                .session_mgr
+                .active_sessions()
+                .iter()
+                .any(|&id| { a.session_mgr.get(id).unwrap().is_established() }));
+        }
     }
 
     #[tokio::test(start_paused = true)]
