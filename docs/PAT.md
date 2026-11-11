@@ -277,3 +277,5 @@ VARA command sequence against two in-process stations on every push. The
 [COP-76 run record](testing/pat-session.md#cop-76-run-record-2026-11-02) is the latest: at
 `b9fdb8d` Pat v1.0.0 delivered every message byte for byte, but two of three harness runs
 logged an audio input overflow, which the harness counts as `FAIL`; the third reported `PASS`.
+
+For calls to a LinBPQ gateway, see [BPQ.md](BPQ.md).

@@ -194,3 +194,5 @@ dual licensed as above, without any additional terms or conditions.
 
 Send a small file to multiple OFDM stations with the
 [broadcast file commands](docs/BROADCAST.md), using a configured KISS service.
+
+[LinBPQ/BPQ32 gateway setup](docs/BPQ.md) uses the VARA-style TCP ports.

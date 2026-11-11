@@ -378,3 +378,22 @@ update.
   commit, including the ABI 1.1 accessors `coppa_air_protocol_version` and
   `coppa_host_api_version`, is compared only as an addition: a later change
   to one of them is not caught. Tagging the 0.12.0 release closes this.
+
+## LinBPQ/BPQ32 gateway (COP-172)
+
+The lab uses LinBPQ 6.0.26.1 i386 Linux as a B2F BBS peer, with no RMS
+account, CMS or RMS-user forwarding queue. BPQ32, RF, a rig, Raspberry Pi
+and the root apt installation route were not run. Use a dwell of at least
+7 s so five intervals cover the 35 s handshake timeout; LISTEN OFF cancels
+a shorter scanner hold. A gateway dying mid-session leaves Pat waiting
+for dead-link detection (prior black-box measurements: DISCONNECT at 174 s,
+exit 1 at 263 s). RETRIES covers VARA-style dials only; Pat sends one
+request by default. LinBPQ needs a tmpfs working directory where the host
+filesystem allocates inode numbers above 2**32. See [BPQ.md](BPQ.md).
+
+An idle session with no outstanding application data can keep sending
+KEEPALIVE after its peer dies. The COP-172 black-box restart probe stayed
+up for the full 400 s harness limit when the gateway was killed before
+the BBS banner. The restart experiment now interrupts an outstanding
+B2F write to exercise the existing data-retry dead-link bound. Idle-peer
+liveness is a separate follow-up, not a finite-bound claim.

@@ -30,7 +30,7 @@ use coppa_protocol::transport::{TransportPdu, TransportType, TRANSPORT_HEADER_SI
 use coppa_radio::band::{self, FrequencyConfig, FrequencyEvidence, GateRefusal};
 use coppa_radio::{NullPtt, PttBackend, PttControl, PttState};
 use rand::RngExt;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -61,6 +61,38 @@ use coppa_protocol::outer_code::{
 /// clock is the std clock, so production timing is unchanged.
 fn clock_now() -> Instant {
     tokio::time::Instant::now().into_std()
+}
+
+#[derive(Default)]
+struct VaraClientState {
+    connect_retries: u8,
+    unrecognised: HashSet<String>,
+}
+
+const MAX_LOGGED_UNKNOWN_COMMANDS: usize = 64;
+
+fn note_unrecognised(words: &mut HashSet<String>, line: &str) -> bool {
+    // The line limit bounds one word, not a connection's lifetime traffic.
+    // Keep log deduplication bounded even if a client drains every WRONG.
+    if words.len() >= MAX_LOGGED_UNKNOWN_COMMANDS {
+        return false;
+    }
+    words.insert(
+        line.split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase(),
+    )
+}
+
+struct PendingDial {
+    session_id: u8,
+    request: Vec<u8>,
+    left: u8,
+    total: u8,
+    next_at: Instant,
+    interval: Duration,
+    give_up_at: Instant,
 }
 
 /// Map of connected VARA command-port clients' response senders
@@ -467,11 +499,21 @@ fn vara_reply(command: &VaraCommand, cwid: CwIdPolicy) -> Option<VaraResponse> {
     Some(match command {
         VaraCommand::Version => VaraResponse::coppa_version(),
         VaraCommand::VersionInfo => VaraResponse::coppa_version_info(),
-        VaraCommand::MyCall(call) if Callsign::new(call).is_ok() => VaraResponse::Ok,
+        VaraCommand::MyCall(calls)
+            if (1..=5).contains(&calls.len()) && calls.iter().all(|c| Callsign::new(c).is_ok()) =>
+        {
+            VaraResponse::Ok
+        }
         VaraCommand::MyCall(_) | VaraCommand::Unknown(_) => VaraResponse::Wrong,
         VaraCommand::CwId(on) if cwid_request_allowed(cwid, *on) => VaraResponse::Ok,
         VaraCommand::CwId(_) => VaraResponse::Wrong,
-        VaraCommand::Rig(_) => return None,
+        VaraCommand::Retries(n)
+            if *n <= coppa_protocol::session::MAX_HOST_CONNECT_RETRIES as u32 =>
+        {
+            VaraResponse::Ok
+        }
+        VaraCommand::Retries(_) => VaraResponse::Wrong,
+        VaraCommand::Rig(_) | VaraCommand::BusyQuery => return None,
         // COMPRESSION and BW* are accepted but not implemented.
         VaraCommand::Listen(_)
         | VaraCommand::Tune(_)
@@ -1035,6 +1077,9 @@ pub struct EventLoop {
     /// transmission -- see `transmit_samples`. Nothing ever sets it back to
     /// `None`, so a payload accepted for TX keeps its callsign.
     local_callsign: Option<Callsign>,
+    extra_callsigns: Vec<Callsign>,
+    vara_clients: HashMap<u32, VaraClientState>,
+    pending_dial: Option<PendingDial>,
     /// Bounded broadcast datagrams waiting for the transmitter.
     kiss_datagrams: VecDeque<Vec<u8>>,
     /// Fan-out exclusively to KISS clients, separate from host DataOut.
@@ -1290,6 +1335,9 @@ impl EventLoop {
             rx_level_meter,
             session_mgr: SessionManager::new(),
             local_callsign,
+            extra_callsigns: Vec::new(),
+            vara_clients: HashMap::new(),
+            pending_dial: None,
             vara_keepalive_period: VARA_KEEPALIVE_PERIOD,
             listening: false,
             cw_id_on,
@@ -3490,6 +3538,64 @@ impl EventLoop {
             .map(|s| s.remote.clone())
     }
 
+    async fn set_local_callsigns(&mut self, calls: Vec<Callsign>) {
+        self.local_callsign = calls.first().cloned();
+        self.extra_callsigns = calls.into_iter().skip(1).collect();
+        #[cfg(feature = "websocket")]
+        if let Some(ref status) = self.ws_status {
+            status.lock().await.mycall = self.local_callsign.as_ref().map(ToString::to_string);
+        }
+    }
+
+    async fn repeat_pending_dial(&mut self) {
+        let Some(mut dial) = self.pending_dial.take() else {
+            return;
+        };
+        let now = clock_now();
+        if dial.left == 0
+            || now >= dial.give_up_at
+            || !self
+                .session_mgr
+                .get(dial.session_id)
+                .is_some_and(|s| s.state == SessionState::Connecting)
+        {
+            return;
+        }
+        if now >= dial.next_at && !self.is_transmitting {
+            match self.engine.encode_bytes(&dial.request) {
+                Ok(samples) => {
+                    let destination = self
+                        .session_mgr
+                        .get(dial.session_id)
+                        .map(|s| s.remote.to_string())
+                        .unwrap_or_default();
+
+                    let sent = self.transmit_samples_keyed(&samples).await;
+                    if sent == 0 {
+                        self.pending_dial = Some(dial);
+                        return;
+                    }
+                    let keyed = self
+                        .tx_keyed_since
+                        .map(|t| t.into_std())
+                        .unwrap_or_else(clock_now);
+                    if let Some(session) = self.session_mgr.get_mut(dial.session_id) {
+                        session.touch(keyed);
+                    }
+                    tracing::info!(attempt = dial.total-dial.left+2, of = dial.total+1,
+                                   %destination, "Connect request repeated");
+                    dial.left -= 1;
+                    dial.next_at = keyed + dial.interval;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to encode repeat CONNECT_REQ");
+                    return;
+                }
+            }
+        }
+        self.pending_dial = Some(dial);
+    }
+
     /// COP-38 (D7) + COP-68: the connected-session retransmit pass. Runs on
     /// `run()`'s 500 ms retransmit tick whatever `arq_enabled` says (D1). A
     /// frame is rebuilt from its segment data, byte-identical to the
@@ -4236,6 +4342,7 @@ impl EventLoop {
                     self.check_arq_retransmits().await;
                     // COP-38 (D1): connected-session data retransmits
                     // whatever `arq_enabled` says.
+                    self.repeat_pending_dial().await;
                     self.check_session_retransmits().await;
                     self.retry_held_tx_drain().await;
                     // COP-43: covers a PTT release that ran no drain (e.g.
@@ -4364,6 +4471,7 @@ impl EventLoop {
             }
             HostEvent::Disconnected { client_id } => {
                 tracing::info!(client_id, "Client disconnected");
+                self.vara_clients.remove(&client_id);
                 #[cfg(feature = "ardop")]
                 self.ardop_clients.remove(&client_id);
             }
@@ -4454,6 +4562,7 @@ impl EventLoop {
                 // lines). COP-84: a rig command's reply is what the rig says.
                 let reply = match &command {
                     VaraCommand::Rig(rig) => self.answer_rig_command(rig),
+                    VaraCommand::BusyQuery => VaraResponse::BusyState(self.busy_gate.current()),
                     // `vara_reply` is `None` only for `Rig`.
                     other => vara_reply(other, self.config.station_id.cwid)
                         .unwrap_or(VaraResponse::Wrong),
@@ -4465,25 +4574,53 @@ impl EventLoop {
                         if on {
                             tracing::info!("Listening for incoming connections");
                         } else {
-                            tracing::info!("Stopped listening for incoming connections");
+                            let pending: Vec<_> = self
+                                .session_mgr
+                                .active_sessions()
+                                .into_iter()
+                                .filter(|&id| self.is_accepting(id))
+                                .collect();
+                            for id in pending {
+                                self.discard_session_tx(id).await;
+                                self.session_mgr.remove(id);
+                                self.notify_session(client_id, SessionNotice::PendingCancelled)
+                                    .await;
+                            }
+                            tracing::info!("LISTEN OFF ended any pending inbound attempt");
                         }
                     }
                     VaraCommand::Tune(seconds) => self.start_tune(seconds, None).await,
-                    VaraCommand::MyCall(call) => match Callsign::new(&call) {
-                        Ok(callsign) => {
-                            tracing::info!(callsign = %callsign, "Local callsign set by MYCALL");
-                            #[cfg(feature = "websocket")]
-                            if let Some(ref status) = self.ws_status {
-                                status.lock().await.mycall = Some(callsign.to_string());
-                            }
-                            self.local_callsign = Some(callsign);
+                    VaraCommand::MyCall(calls) => {
+                        if matches!(
+                            vara_reply(
+                                &VaraCommand::MyCall(calls.clone()),
+                                self.config.station_id.cwid
+                            ),
+                            Some(VaraResponse::Ok)
+                        ) {
+                            let parsed: Vec<_> =
+                                calls.iter().filter_map(|c| Callsign::new(c).ok()).collect();
+                            self.set_local_callsigns(parsed).await;
                         }
-                        // Already answered WRONG by `vara_reply`; keep the
-                        // callsign in force.
-                        Err(e) => {
-                            tracing::warn!(callsign = %call, error = %e, "MYCALL rejected")
+                    }
+                    VaraCommand::Retries(n) => {
+                        if n <= coppa_protocol::session::MAX_HOST_CONNECT_RETRIES as u32 {
+                            self.vara_clients
+                                .entry(client_id)
+                                .or_default()
+                                .connect_retries = n as u8;
+                        } else {
+                            tracing::info!("RETRIES takes a whole number from 0 to 20");
                         }
-                    },
+                    }
+                    VaraCommand::Unknown(line) => {
+                        if note_unrecognised(
+                            &mut self.vara_clients.entry(client_id).or_default().unrecognised,
+                            &line,
+                        ) {
+                            tracing::info!(command = %line, "VARA command not recognised; answered WRONG");
+                        }
+                    }
                     VaraCommand::Abort => self.abort_session(client_id).await,
                     VaraCommand::CwId(on) => {
                         let applied = self.apply_host_cwid(on, &format!("VARA client {client_id}"));
@@ -4648,6 +4785,7 @@ impl EventLoop {
                 if ardop_dial {
                     self.ardop_clients.entry(client_id).or_default().refused = false;
                 }
+                self.pending_dial = None;
                 let caps = local_link_caps(&self.config);
                 let now = clock_now();
                 match self.session_mgr.create(local, remote.clone(), 0, caps, now) {
@@ -4668,7 +4806,34 @@ impl EventLoop {
                                     }
                                     let pdu_bytes = req_pdu.to_bytes();
                                     match self.engine.encode_bytes(&pdu_bytes) {
-                                        Ok(samples) => self.transmit_samples(&samples).await,
+                                        Ok(samples) => {
+                                            let retries = if ardop_dial {
+                                                0
+                                            } else {
+                                                self.vara_clients
+                                                    .get(&client_id)
+                                                    .map_or(0, |s| s.connect_retries)
+                                            };
+                                            let sent = self.transmit_samples_keyed(&samples).await;
+                                            let keyed = self
+                                                .tx_keyed_since
+                                                .map(|t| t.into_std())
+                                                .unwrap_or_else(clock_now);
+                                            if retries > 0 && sent > 0 {
+                                                let interval = coppa_protocol::session::connect_req_retry_interval(
+                                                    Duration::from_secs_f64(samples.len() as f64 / self.engine.config().sample_rate as f64),
+                                                    Duration::from_millis(self.config.radio.turnaround_ms));
+                                                self.pending_dial = Some(PendingDial {
+                                                    session_id: id,
+                                                    request: pdu_bytes.clone(),
+                                                    left: retries,
+                                                    total: retries,
+                                                    next_at: keyed + interval,
+                                                    interval,
+                                                    give_up_at: keyed + Duration::from_secs(300),
+                                                });
+                                            }
+                                        }
                                         Err(e) => {
                                             tracing::warn!(error = %e, "Failed to encode CONNECT_REQ")
                                         }
@@ -4898,7 +5063,7 @@ impl EventLoop {
             ArdopCommand::MyCall(call) => match Callsign::new(&call) {
                 Ok(callsign) => {
                     tracing::info!(callsign = %callsign, "Local callsign set by MYCALL");
-                    self.local_callsign = Some(callsign);
+                    self.set_local_callsigns(vec![callsign]).await;
                     self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
                         .await;
                 }
@@ -7271,28 +7436,28 @@ impl EventLoop {
         }
     }
 
+    fn answered_callsign(&self, dest: &Callsign) -> Option<Callsign> {
+        let first = self.local_callsign.as_ref()?;
+        if dest.as_str().is_empty() {
+            Some(first.clone())
+        } else if dest == first || self.extra_callsigns.contains(dest) {
+            Some(dest.clone())
+        } else {
+            None
+        }
+    }
+
     async fn handle_incoming_connect(&mut self, pdu: MacPdu) {
         if !self.listening {
             tracing::debug!("CONNECT_REQ received but not listening; ignoring");
             return;
         }
 
-        let local = match self.local_callsign {
-            Some(ref cs) => cs.clone(),
-            None => {
-                tracing::debug!("CONNECT_REQ received but no local callsign configured");
-                return;
-            }
-        };
-
-        // Check that this is addressed to us
-        if !pdu.dest.as_str().is_empty() && pdu.dest != local {
-            tracing::debug!(
-                dest = %pdu.dest, local = %local,
-                "CONNECT_REQ not addressed to us"
-            );
+        let Some(local) = self.answered_callsign(&pdu.dest) else {
+            tracing::debug!(dest = %pdu.dest, local = ?self.local_callsign,
+                            extra = ?self.extra_callsigns, "CONNECT_REQ not addressed to a configured callsign");
             return;
-        }
+        };
 
         // COP-44: a repeat CONNECT_REQ from a caller whose handshake is
         // still half-open (it did not hear our CONNECT_ACK) replaces that
@@ -7870,6 +8035,7 @@ impl EventLoop {
             // An invalid value warns (as at startup) and disables TX; so
             // does a cleared one, which warns here.
             self.local_callsign = configured_callsign(&plan.effective.engine.callsign);
+            self.extra_callsigns.clear();
             if plan.effective.engine.callsign.is_empty() {
                 tracing::warn!(
                     "[engine] callsign cleared by configuration reload; transmission disabled \
@@ -8227,6 +8393,355 @@ mod tests {
         gate.hold_samples().div_ceil(1024) + 2
     }
 
+    fn cop172_noise(amplitude: f32, counter: &mut u32) -> Vec<f32> {
+        (0..1024)
+            .map(|_| {
+                *counter = counter.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                amplitude * ((*counter >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn cop172_busy_query_reports_the_channel_now() {
+        let (mut a, _audio, mut replies) = cop172_station("N0GW");
+        cop172_command(&mut a, 1, "BUSY").await;
+        assert_eq!(replies.try_recv().unwrap(), VaraResponse::BusyState(false));
+        let mut counter = 42u32;
+        for _ in 0..10 {
+            a.busy_gate.observe(&cop172_noise(0.01, &mut counter));
+        }
+        for _ in 0..busy_burst_blocks(&a.busy_gate) {
+            a.busy_gate.observe(&cop172_noise(0.5, &mut counter));
+        }
+        assert!(a.busy_gate.current());
+        cop172_command(&mut a, 1, "BUSY").await;
+        assert_eq!(replies.try_recv().unwrap(), VaraResponse::BusyState(true));
+    }
+
+    #[tokio::test]
+    async fn cop172_reload_that_changes_the_callsign_clears_the_list() {
+        let (mut a, _audio, _) = cop172_station("N0GW");
+        cop172_command(&mut a, 1, "MYCALL N0GW N0GW-1").await;
+        let mut file = a.config.clone();
+        a.apply_reload(file.clone());
+        assert_eq!(a.extra_callsigns.len(), 1);
+        file.engine.callsign = "N2CALL".into();
+        a.apply_reload(file);
+        assert!(a.extra_callsigns.is_empty());
+        assert_eq!(a.local_callsign.unwrap().as_str(), "N2CALL");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cop172_unlisted_call_is_still_ignored() {
+        let (mut a, mut audio, _) = cop172_station("N1CALL");
+        let (mut b, b_audio, mut replies) = cop172_station("N0GW");
+        cop172_command(&mut b, 1, "MYCALL N0GW N0GW-1").await;
+        cop172_command(&mut b, 1, "LISTEN ON").await;
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "N1CALL".into(),
+            destination: "N0GW-2".into(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut audio, "request"))
+            .await;
+        assert_eq!(b_audio.available(), 0);
+        assert!(b.session_mgr.active_sessions().is_empty());
+        assert!(!std::iter::from_fn(|| replies.try_recv().ok())
+            .any(|r| matches!(r, VaraResponse::Pending)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cop172_listen_off_leaves_an_established_session_and_a_dial_alone() {
+        let (mut a, _b, mut audio, _) = connected_pair(0).await;
+        let id = a.session_mgr.active_sessions()[0];
+        assert!(a.session_mgr.get(id).unwrap().is_established());
+        cop172_command(&mut a, 1, "LISTEN OFF").await;
+        assert!(a.session_mgr.get(id).unwrap().is_established());
+        cop172_command(&mut a, 1, "ABORT").await;
+        audio.drain();
+        cop172_command(&mut a, 1, "RETRIES 3").await;
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "N1CALL".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        cop172_command(&mut a, 1, "LISTEN OFF").await;
+        assert!(
+            a.session_mgr
+                .get(a.pending_dial.as_ref().unwrap().session_id)
+                .unwrap()
+                .state
+                == SessionState::Connecting
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn cop172_a_new_dial_does_not_inherit_an_old_repeat() {
+        let (mut a, mut audio, _) = cop172_station("N1CALL");
+        cop172_command(&mut a, 1, "RETRIES 3").await;
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "N1CALL".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        audio.drain();
+        cop172_command(&mut a, 1, "ABORT").await;
+        cop172_command(&mut a, 1, "RETRIES 0").await;
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "N1CALL".into(),
+            destination: "N0GW".into(),
+        })
+        .await;
+        audio.drain();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        a.repeat_pending_dial().await;
+        assert!(a.pending_dial.is_none());
+        assert_eq!(audio.available(), 0);
+    }
+    async fn cop172_command(station: &mut EventLoop, client_id: u32, command: &str) {
+        station
+            .handle_host_event(HostEvent::VaraCommand {
+                client_id,
+                command: command.into(),
+            })
+            .await;
+    }
+
+    fn cop172_station(
+        call: &str,
+    ) -> (
+        EventLoop,
+        coppa_audio::AudioRingConsumer,
+        mpsc::Receiver<VaraResponse>,
+    ) {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = call.into();
+        config.radio.ptt_pre_delay_ms = 0;
+        config.radio.ptt_tail_delay_ms = 0;
+        let mut station = EventLoop::new(config).unwrap();
+        let (producer, consumer) = coppa_audio::audio_ring(1_000_000);
+        station.set_audio_out(producer);
+        let (tx, rx) = mpsc::channel(1024);
+        station.set_vara_responses(Arc::new(Mutex::new(HashMap::from([(1, tx)]))));
+        (station, consumer, rx)
+    }
+
+    #[test]
+    fn cop172_retries_reply_and_range() {
+        for line in [
+            "RETRIES 0",
+            "RETRIES 20",
+            "RETRIES=20",
+            "retries = 5",
+            "MYCALL N0GW N0GW-1",
+        ] {
+            assert_eq!(
+                vara_reply(&VaraCommand::parse(line), CwIdPolicy::Host),
+                Some(VaraResponse::Ok)
+            );
+        }
+        for line in [
+            "RETRIES 21",
+            "RETRIES 99",
+            "RETRIES",
+            "RETRIES x",
+            "MYCALL A1A B2B C3C D4D E5E F6F",
+            "MYCALL N0GW N0GW-1!",
+            "BUSY ON",
+        ] {
+            assert_eq!(
+                vara_reply(&VaraCommand::parse(line), CwIdPolicy::Host),
+                Some(VaraResponse::Wrong)
+            );
+        }
+        assert_eq!(vara_reply(&VaraCommand::BusyQuery, CwIdPolicy::Host), None);
+    }
+
+    #[test]
+    fn cop172_unknown_lines_log_once_per_word() {
+        let mut words = HashSet::new();
+        assert!(note_unrecognised(&mut words, "CALLTIMEOUT 600"));
+        assert!(!note_unrecognised(&mut words, "calltimeout 300"));
+        assert!(note_unrecognised(&mut words, "PUBLIC ON"));
+        for n in 0..MAX_LOGGED_UNKNOWN_COMMANDS + 100 {
+            note_unrecognised(&mut words, &format!("UNKNOWN{n}"));
+        }
+        assert_eq!(words.len(), MAX_LOGGED_UNKNOWN_COMMANDS);
+        assert!(!note_unrecognised(&mut words, "ANOTHER UNKNOWN WORD"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cop172_retries_repeat_the_connect_request() {
+        for retries in [0, 2, 20] {
+            let (mut a, mut audio, mut replies) = cop172_station("N1CALL");
+            cop172_command(&mut a, 1, &format!("RETRIES {retries}")).await;
+            a.handle_host_event(HostEvent::ConnectRequest {
+                client_id: 1,
+                source: "N1CALL".into(),
+                destination: "W1AW".into(),
+            })
+            .await;
+            take_leg(&mut audio, "initial request");
+            a.handle_ptt_change(false).await;
+            let interval = a
+                .pending_dial
+                .as_ref()
+                .map(|d| d.interval)
+                .unwrap_or(Duration::from_secs(7));
+            let started = clock_now();
+            let keepalive =
+                spawn_vara_keepalive(a.vara_responses.clone().unwrap(), VARA_KEEPALIVE_PERIOD);
+            tokio::task::yield_now().await;
+            cop172_command(&mut a, 1, "RETRIES 0").await;
+            for _ in 0..retries {
+                let next = a.pending_dial.as_ref().unwrap().next_at;
+                let until = next.saturating_duration_since(clock_now());
+                if until > Duration::from_millis(1) {
+                    tokio::time::advance(until - Duration::from_millis(1)).await;
+                    a.repeat_pending_dial().await;
+                    assert_eq!(audio.available(), 0, "no early repeat");
+                    tokio::time::advance(Duration::from_millis(1)).await;
+                }
+                a.repeat_pending_dial().await;
+                take_leg(&mut audio, "repeat request");
+                a.handle_ptt_change(false).await;
+                for command in ["BW2300", "LISTEN OFF", "LISTEN ON", "VERSION"] {
+                    let before = replies.len();
+                    cop172_command(&mut a, 1, command).await;
+                    assert!(replies.len() > before, "{command} gets an immediate reply");
+                }
+            }
+            tokio::time::advance(Duration::from_secs(36)).await;
+            a.repeat_pending_dial().await;
+            a.reap_timed_out_sessions().await;
+            assert!(a.session_mgr.active_sessions().is_empty());
+            let elapsed = clock_now().duration_since(started);
+            assert!(elapsed < Duration::from_secs(416));
+            assert!(elapsed <= interval * retries + Duration::from_secs(36));
+            tokio::task::yield_now().await;
+            let lines: Vec<_> = std::iter::from_fn(|| replies.try_recv().ok()).collect();
+            keepalive.abort();
+            if retries == 20 {
+                assert!(
+                    lines
+                        .iter()
+                        .filter(|r| **r == VaraResponse::IAmAlive)
+                        .count()
+                        >= 2
+                );
+            }
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|r| **r == VaraResponse::Disconnected)
+                    .count(),
+                1
+            );
+            assert!(audio.read(&mut [0.0; 1]) == 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cop172_retries_are_per_client_and_abort_stops_repeats() {
+        let (mut a, mut audio, _) = cop172_station("N1CALL");
+        cop172_command(&mut a, 2, "RETRIES 3").await;
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "N1CALL".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        take_leg(&mut audio, "request");
+        assert!(a.pending_dial.is_none());
+        cop172_command(&mut a, 1, "ABORT").await;
+        cop172_command(&mut a, 1, "RETRIES 3").await;
+        a.handle_host_event(HostEvent::Disconnected { client_id: 1 })
+            .await;
+        assert!(!a.vara_clients.contains_key(&1));
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 2,
+            source: "N1CALL".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        take_leg(&mut audio, "request");
+        assert!(a.pending_dial.is_some());
+        cop172_command(&mut a, 2, "ABORT").await;
+        // ABORT may key a teardown frame; drain it before checking repeats.
+        let mut buf = vec![0.0; 1_000_000];
+        audio.read(&mut buf);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        a.repeat_pending_dial().await;
+        assert!(a.pending_dial.is_none());
+        assert_eq!(audio.read(&mut buf), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cop172_repeats_stop_at_the_cap() {
+        let (mut a, mut audio, _) = cop172_station("N1CALL");
+        cop172_command(&mut a, 1, "RETRIES 20").await;
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "N1CALL".into(),
+            destination: "W1AW".into(),
+        })
+        .await;
+        take_leg(&mut audio, "request");
+        tokio::time::advance(Duration::from_secs(301)).await;
+        a.repeat_pending_dial().await;
+        assert!(a.pending_dial.is_none());
+        assert_eq!(audio.read(&mut [0.0; 1]), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cop172_mycall_list_and_listen_off_cancel_pending() {
+        let (mut a, mut a_audio, mut a_rx) = cop172_station("N1CALL");
+        let (mut b, mut b_audio, mut b_rx) = cop172_station("N0GW");
+        cop172_command(&mut b, 1, "MYCALL N0GW N0GW-1").await;
+        cop172_command(&mut b, 1, "MYCALL N0GW BAD!").await;
+        assert_eq!(b.extra_callsigns, vec![Callsign::new("N0GW-1").unwrap()]);
+        cop172_command(&mut b, 1, "LISTEN ON").await;
+        cop172_command(&mut a, 1, "RETRIES 2").await;
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "N1CALL".into(),
+            destination: "N0GW-1".into(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_audio, "request"))
+            .await;
+        assert_eq!(
+            b.session_mgr
+                .get(b.session_mgr.active_sessions()[0])
+                .unwrap()
+                .local
+                .to_string(),
+            "N0GW-1"
+        );
+        a.decode_and_dispatch_audio(&take_leg(&mut b_audio, "ack"))
+            .await;
+        let cfm = take_leg(&mut a_audio, "confirmation");
+        cop172_command(&mut b, 1, "LISTEN OFF").await;
+        let lines: Vec<_> = std::iter::from_fn(|| b_rx.try_recv().ok()).collect();
+        assert!(lines.contains(&VaraResponse::Pending));
+        assert_eq!(
+            &lines[lines.len() - 2..],
+            &[VaraResponse::Ok, VaraResponse::CancelPending]
+        );
+        b.decode_and_dispatch_audio(&cfm).await;
+        assert!(b.session_mgr.active_sessions().is_empty());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        a.repeat_pending_dial().await;
+        assert!(a.pending_dial.is_none());
+        assert!(std::iter::from_fn(|| a_rx.try_recv().ok())
+            .any(|r| matches!(r,VaraResponse::Connected(_,ref dest,_) if dest=="N0GW-1")));
+        cop172_command(&mut b, 1, "MYCALL N0GW").await;
+        assert!(b.extra_callsigns.is_empty());
+    }
     #[test]
     fn rate_loop_caps_peer_recommendations_at_the_engine_band_limit() {
         for (profile, maximum) in [("HF_STANDARD", 8), ("VHF_FAST", 9)] {
