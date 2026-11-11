@@ -2147,7 +2147,8 @@ for speed levels, profiles or the CP mode.
 
 **Responder admission.** The reference responder answers a `ConnectReq`
 only when it is listening, has a local callsign, and the request's `dest`
-is either empty or its own callsign (`handle_incoming_connect`,
+is either empty or any of up to five host-configured MYCALL callsigns
+(`handle_incoming_connect`,
 `event_loop.rs:6286`). The empty `dest` is accepted, but a handshake that
 uses it does not complete with the reference initiator: the `ConnectAck`
 comes back with the responder's real callsign in `src`, which does not
@@ -2726,3 +2727,8 @@ Source: `crates/coppa-protocol/src/app_stream.rs`, `app.rs`, `session.rs`;
 daemon integration in `crates/coppa-daemon/src/event_loop.rs`
 (`deliver_session_segment`, `drain_session_link`, `handle_chat_send`) and
 `session_outer.rs`.
+
+Informative reference behaviour (COP-172): inbound sessions use the dialled
+MYCALL as their local callsign. A host may set RETRIES n, from 0 to 20, to
+send 1+n ConnectReq frames separated by max twice request airtime plus two
+turnarounds, or five seconds. Repeats stop at 300 s. This changes no wire field.

@@ -74,8 +74,8 @@ Then send a few commands. The `sleep`s give coppad time to answer each one:
 $ { echo VERSION; sleep 1; echo "MYCALL N1CALL"; sleep 1; echo "LISTEN ON"; sleep 1;
     echo FOOBAR; sleep 1; echo "CONNECT N1CALL N0CALL"; sleep 35; } \
     | nc -q 1 127.0.0.1 8300 | tr '\r' '\n'
-VERSION Coppa 0.3.0
-VERSION Coppa 0.3.0
+VERSION Coppa 0.13.0
+VERSION Coppa 0.13.0
 OK
 OK
 WRONG
@@ -112,7 +112,7 @@ either data port. The [two-station example](#a-two-station-session) shows what b
 
 **Framing.** Send one command per line, ended by `\r`, `\n` or `\r\n`. Empty lines are ignored.
 coppad ends every line it sends with a bare `\r`, as VARA does. On connect coppad speaks first,
-with `VERSION Coppa 0.3.0`. A line longer than 4096 bytes, or one that is not valid UTF-8,
+with `VERSION Coppa 0.13.0`. A line longer than 4096 bytes, or one that is not valid UTF-8,
 closes the connection.
 
 **Replies and pushed lines.** Each command gets exactly one reply, sent only to the client that
@@ -126,9 +126,11 @@ on a fixed delay.
 
 | You send | coppad replies | Effect |
 |---|---|---|
-| `VERSION` | `VERSION Coppa 0.3.0` | none |
-| `VERSIONINFO` (coppa extension) | `VERSIONINFO crate_version=0.12.0 air_protocol_version=1 host_api_version=1`; `WRONG` with any argument | none; see [Version discovery](#version-discovery) |
-| `MYCALL <call>` | `OK`; `WRONG` if the callsign is missing or invalid | sets the daemon's one callsign; only the first callsign is read |
+| `VERSION` | `VERSION Coppa 0.13.0` | none |
+| `VERSIONINFO` (coppa extension) | `VERSIONINFO crate_version=0.13.0 air_protocol_version=1 host_api_version=1`; `WRONG` with any argument | none; see [Version discovery](#version-discovery) |
+| `MYCALL <call> [<call> ...]` | `OK` for one to five valid callsigns, otherwise `WRONG` | replaces the daemon-wide list; first identifies transmissions, all answer inbound calls; CONNECTED names the dialled call |
+| `RETRIES <n>` or `RETRIES=<n>` | `OK` for 0-20, otherwise `WRONG` | per-client count of additional connect requests on later dials; resets on client disconnect |
+| `BUSY` | `BUSY ON` or `BUSY OFF` | reliable reply with the current channel state |
 | `LISTEN ON` / `LISTEN OFF` | `OK`; `WRONG` for any other argument | answer inbound calls, or stop; coppad starts with listening off |
 | `CONNECT <me> <target> [via ...]` | `OK`, then `CONNECTED <caller> <callee> <bw>` or `DISCONNECTED` | dials `<target>`; `<me>` and `via` are ignored, the daemon's own callsign is used; one argument gets `WRONG` |
 | `DISCONNECT` | `OK`, then `DISCONNECTED` once queued data is acknowledged | ends the session; with no session, `OK` and nothing else |
@@ -170,11 +172,11 @@ On the command port the greeting and `VERSION` keep their old shape; `VERSIONINF
 query with no arguments. Each line below ends with a bare `\r`:
 
 ```text
-server greeting: VERSION Coppa 0.12.0\r
+server greeting: VERSION Coppa 0.13.0\r
 client: VERSION\r
-server: VERSION Coppa 0.12.0\r
+server: VERSION Coppa 0.13.0\r
 client: VERSIONINFO\r
-server: VERSIONINFO crate_version=0.12.0 air_protocol_version=1 host_api_version=1\r
+server: VERSIONINFO crate_version=0.13.0 air_protocol_version=1 host_api_version=1\r
 client: VERSIONINFO extra\r
 server: WRONG\r
 ```
@@ -220,8 +222,7 @@ Nobody has run coppa against real VARA. For a command that document does not cov
 `CWID`, `CLEANTXBUFFER`), the table above says what coppa does and claims nothing about VARA.
 
 - **The waveform.** Only the TCP interface is VARA-style. A VARA station cannot hear coppa.
-- **`MYCALL`.** VARA documents up to five callsigns (`MYCALL Call1 ... Call5`). coppa reads the
-  first and ignores the rest, and the callsign is daemon-wide, not per client.
+- **`MYCALL`.** VARA documents up to five callsigns (`MYCALL Call1 ... Call5`). coppa answers all listed callsigns. The list is daemon-wide, not per client.
 - **`CONNECT Source Destination`.** coppa ignores `Source` and dials from the daemon's callsign.
 - **`BW500|BW2300|BW2750` and `COMPRESSION OFF|TEXT|FILES`.** Both get `OK`, as in VARA, but
   change nothing. `[engine] profile` chooses the waveform, so match it on both stations.
@@ -580,3 +581,11 @@ out after five seconds; a client whose writes stay stalled is disconnected. Broa
 records with a log; it never grows a queue. Partial requests survive interleaved RX.
 Winlink Express packet and Outpost BBS connected sessions are unsupported. Real
 UI-View interoperability and monitor formatting remain unverified with those clients.
+
+COP-172: `LISTEN OFF` cancels an inbound PENDING attempt with CANCELPENDING.
+RETRIES repeats requests at max twice request airtime plus two turnarounds,
+or five seconds. Repeats stop at 300 s; timeout follows the last request.
+See [BPQ.md](BPQ.md) for scanning gateways and measured limits.
+
+Unknown-command log deduplication remembers at most 64 words per client,
+then suppresses further unknown-word logs. Every command still gets WRONG.

@@ -1433,3 +1433,30 @@ mod app_messages_tests {
         }
     }
 }
+
+/// Maximum number of additional connect requests a TCP host may request.
+pub const MAX_HOST_CONNECT_RETRIES: u8 = 20;
+
+/// Leave time for both handshake frames and turnarounds, with a five-second floor.
+pub fn connect_req_retry_interval(request_airtime: Duration, turnaround: Duration) -> Duration {
+    request_airtime
+        .saturating_mul(2)
+        .saturating_add(turnaround.saturating_mul(2))
+        .max(Duration::from_secs(5))
+}
+
+#[cfg(test)]
+mod cop172_tests {
+    use super::*;
+    #[test]
+    fn cop172_connect_req_retry_interval() {
+        assert_eq!(
+            connect_req_retry_interval(Duration::from_millis(2730), Duration::from_millis(500)),
+            Duration::from_millis(6460)
+        );
+        assert_eq!(
+            connect_req_retry_interval(Duration::from_secs(1), Duration::ZERO),
+            Duration::from_secs(5)
+        );
+    }
+}

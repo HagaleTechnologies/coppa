@@ -779,8 +779,10 @@ impl Link {
                 );
                 let retry_interval = coppa_protocol::modem::frame_airtime_s(level, &profile)
                     .map(|airtime| {
-                        Duration::from_secs_f64(2.0 * airtime)
-                            .saturating_add(self.config.turnaround.saturating_mul(2))
+                        coppa_protocol::session::connect_req_retry_interval(
+                            Duration::from_secs_f64(airtime),
+                            self.config.turnaround,
+                        )
                     })
                     .unwrap_or_default()
                     .max(self.config.initial_rto);

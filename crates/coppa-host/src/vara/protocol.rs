@@ -3,8 +3,8 @@
 /// Commands received from a VARA client on the command port.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VaraCommand {
-    /// Set the station callsign: `MYCALL <callsign>`
-    MyCall(String),
+    /// Set one to five callsigns. The first identifies transmissions; the rest answer inbound calls.
+    MyCall(Vec<String>),
     /// Connect to a remote station: `CONNECT <source> <dest> [via <digi>]`
     Connect { source: String, destination: String },
     /// Disconnect the current session.
@@ -34,6 +34,10 @@ pub enum VaraCommand {
     /// Rig frequency or mode (coppa extension, not a VARA command): FREQ \[hz\]
     /// or MODE [USB|LSB|PKTUSB|PKTLSB]. Any other shape parses as `Unknown`.
     Rig(RigCommand),
+    /// Set this host's connect retry count, from zero to twenty.
+    Retries(u32),
+    /// Query the current channel busy state.
+    BusyQuery,
     /// Unknown command.
     Unknown(String),
 }
@@ -127,6 +131,8 @@ pub enum VaraResponse {
     Buffer(usize),
     /// Busy state.
     Busy(bool),
+    /// Non-disposable reply to a BUSY query.
+    BusyState(bool),
     /// Signal-to-noise ratio.
     Snr(i32),
     /// Keepalive, sent every 60 seconds.
@@ -141,13 +147,35 @@ impl VaraCommand {
     /// Parse a VARA command string.
     pub fn parse(input: &str) -> Self {
         let trimmed = input.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if let Some(rest) = upper.strip_prefix("RETRIES") {
+            if rest.starts_with('=') || rest.starts_with(char::is_whitespace) {
+                let value = rest.trim().strip_prefix('=').unwrap_or(rest.trim()).trim();
+                if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+                    if let Ok(n) = value.parse() {
+                        return VaraCommand::Retries(n);
+                    }
+                }
+            }
+            return VaraCommand::Unknown(trimmed.into());
+        }
         let parts: Vec<&str> = trimmed.splitn(4, ' ').collect();
 
         match parts.first().map(|s| s.to_uppercase()).as_deref() {
-            Some("MYCALL") => match trimmed.split_whitespace().nth(1) {
-                Some(call) => VaraCommand::MyCall(call.to_string()),
-                None => VaraCommand::Unknown(trimmed.to_string()),
-            },
+            Some("MYCALL") => {
+                let mut calls = Vec::new();
+                for call in trimmed.split_whitespace().skip(1) {
+                    if !calls.iter().any(|c| c == call) {
+                        calls.push(call.to_string());
+                    }
+                }
+                if calls.is_empty() {
+                    VaraCommand::Unknown(trimmed.into())
+                } else {
+                    VaraCommand::MyCall(calls)
+                }
+            }
+            Some("BUSY") if trimmed.eq_ignore_ascii_case("BUSY") => VaraCommand::BusyQuery,
             Some("CONNECT") => {
                 if let (Some(&src), Some(&dst)) = (parts.get(1), parts.get(2)) {
                     VaraCommand::Connect {
@@ -249,7 +277,9 @@ impl VaraResponse {
             VaraResponse::Disconnected => "DISCONNECTED\r".to_string(),
             VaraResponse::Ptt(on) => format!("PTT {}\r", if *on { "ON" } else { "OFF" }),
             VaraResponse::Buffer(n) => format!("BUFFER {}\r", n),
-            VaraResponse::Busy(b) => format!("BUSY {}\r", if *b { "ON" } else { "OFF" }),
+            VaraResponse::Busy(b) | VaraResponse::BusyState(b) => {
+                format!("BUSY {}\r", if *b { "ON" } else { "OFF" })
+            }
             VaraResponse::Snr(snr) => format!("SNR {}\r", snr),
             VaraResponse::IAmAlive => "IAMALIVE\r".to_string(),
             VaraResponse::Freq(hz) => format!("FREQ {}\r", hz),
@@ -291,7 +321,7 @@ mod tests {
     fn test_parse_mycall() {
         assert_eq!(
             VaraCommand::parse("MYCALL VK2ABC"),
-            VaraCommand::MyCall("VK2ABC".to_string())
+            VaraCommand::MyCall(vec!["VK2ABC".to_string()])
         );
     }
 
@@ -444,14 +474,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_mycall_takes_the_first_callsign() {
+    fn cop172_parse_mycall_list() {
         assert_eq!(
             VaraCommand::parse("MYCALL  W5AU"),
-            VaraCommand::MyCall("W5AU".into())
+            VaraCommand::MyCall(vec!["W5AU".into()])
         );
         assert_eq!(
             VaraCommand::parse("MYCALL G8BPQ G8BPQ-1 G8BPQ-2"),
-            VaraCommand::MyCall("G8BPQ".into())
+            VaraCommand::MyCall(vec!["G8BPQ".into(), "G8BPQ-1".into(), "G8BPQ-2".into()])
         );
         assert!(matches!(
             VaraCommand::parse("MYCALL"),
@@ -554,7 +584,57 @@ mod tests {
     fn test_case_insensitive() {
         assert_eq!(
             VaraCommand::parse("mycall VK2ABC"),
-            VaraCommand::MyCall("VK2ABC".to_string())
+            VaraCommand::MyCall(vec!["VK2ABC".to_string()])
         );
+    }
+}
+
+#[cfg(test)]
+mod cop172_tests {
+    use super::*;
+    #[test]
+    fn cop172_parse_retries_in_both_spellings() {
+        for (line, n) in [
+            ("RETRIES 20", 20),
+            ("retries 0", 0),
+            ("RETRIES=20", 20),
+            ("RETRIES = 5", 5),
+            ("RETRIES= 7", 7),
+            ("RETRIES 99", 99),
+        ] {
+            assert_eq!(VaraCommand::parse(line), VaraCommand::Retries(n));
+        }
+        for line in [
+            "RETRIES",
+            "RETRIES x",
+            "RETRIES -1",
+            "RETRIES 1.5",
+            "RETRIES 2 3",
+            "RETRIESX 2",
+            "RETRIES 99999999999",
+        ] {
+            assert!(
+                matches!(VaraCommand::parse(line), VaraCommand::Unknown(_)),
+                "{line}"
+            );
+        }
+    }
+    #[test]
+    fn cop172_parse_busy_query() {
+        assert_eq!(VaraCommand::parse("BUSY"), VaraCommand::BusyQuery);
+        for line in [
+            "BUSY ON",
+            "BUSY OFF",
+            "BUSY?",
+            "BUSYWAIT 10",
+            "CALLTIMEOUT 600",
+            "PENDING",
+            "CANCELPENDING",
+        ] {
+            assert!(matches!(VaraCommand::parse(line), VaraCommand::Unknown(_)));
+        }
+        assert_eq!(VaraResponse::BusyState(true).format(), "BUSY ON\r");
+        assert!(!VaraResponse::BusyState(true).is_disposable());
+        assert!(VaraResponse::Busy(true).is_disposable());
     }
 }
