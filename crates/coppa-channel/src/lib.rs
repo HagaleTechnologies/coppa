@@ -15,6 +15,7 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 pub mod impairments;
+pub mod persistent;
 pub mod watterson;
 
 use coppa_dsp::fft::FftProcessor;

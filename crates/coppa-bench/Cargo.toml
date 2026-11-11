@@ -208,3 +208,7 @@ path = "diagnostics/impairment_transfer.rs"
 [[example]]
 name = "fx25_wav"
 path = "diagnostics/fx25_wav.rs"
+
+[[example]]
+name = "floor_mode"
+path = "diagnostics/floor_mode.rs"
