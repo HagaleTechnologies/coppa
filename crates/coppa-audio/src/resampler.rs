@@ -5,7 +5,8 @@
 //! a target rate like 8kHz), resampling transparently in both directions.
 
 use anyhow::{anyhow, Result};
-use rubato::{FftFixedIn, FftFixedOut, VecResampler};
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Fft, FixedSync, Resampler, WindowFunction};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
@@ -13,7 +14,7 @@ use std::collections::VecDeque;
 /// resamples down to the target (engine) rate.
 pub struct ResamplingSource<S> {
     inner: S,
-    resampler: FftFixedOut<f32>,
+    resampler: Fft<f32>,
     hw_rate: u32,
     target_rate: u32,
     /// Buffer for reading hardware-rate samples
@@ -29,12 +30,14 @@ impl<S: crate::AudioSource> ResamplingSource<S> {
             return Err(anyhow!("audio sample rate must be positive"));
         }
         let chunk_size = 1024;
-        let resampler = FftFixedOut::<f32>::new(
+        let resampler = Fft::<f32>::new_custom(
             hw_rate as usize,
             target_rate as usize,
             chunk_size,
             1, // sub_chunks
             1, // channels
+            WindowFunction::BlackmanHarris2,
+            FixedSync::Output,
         )
         .map_err(|e| anyhow::anyhow!("Failed to create resampler: {}", e))?;
 
@@ -84,14 +87,15 @@ impl<S: crate::AudioSource> crate::AudioSource for ResamplingSource<S> {
 
         // Take exactly what the resampler needs
         let input_chunk: Vec<f32> = self.hw_buf.drain(..input_frames_needed).collect();
-        let input_vec = vec![input_chunk];
-
-        let output = self
-            .resampler
-            .process(&input_vec, None)
+        let input = InterleavedSlice::new(&input_chunk, 1, input_frames_needed)
             .map_err(|e| anyhow::anyhow!("Resample error: {}", e))?;
 
-        let resampled = &output[0];
+        let resampled = self
+            .resampler
+            .process(&input, None)
+            .map_err(|e| anyhow::anyhow!("Resample error: {}", e))?
+            .take_data();
+        let resampled = &resampled[..];
         let n = buf.len().min(resampled.len());
         buf[..n].copy_from_slice(&resampled[..n]);
 
@@ -119,7 +123,7 @@ impl<S: crate::AudioSource> crate::AudioSource for ResamplingSource<S> {
 /// resamples up to the hardware rate, and writes to the inner sink.
 pub struct ResamplingSink<S> {
     inner: S,
-    resampler: FftFixedIn<f32>,
+    resampler: Fft<f32>,
     hw_rate: u32,
     target_rate: u32,
     input_buf: Vec<f32>,
@@ -144,12 +148,14 @@ impl<S: crate::AudioSink> ResamplingSink<S> {
         }
         let chunk_size = 1024;
 
-        let resampler = FftFixedIn::<f32>::new(
+        let resampler = Fft::<f32>::new_custom(
             target_rate as usize,
             hw_rate as usize,
             chunk_size,
             1, // sub_chunks
             1, // channels
+            WindowFunction::BlackmanHarris2,
+            FixedSync::Input,
         )
         .map_err(|e| anyhow::anyhow!("Failed to create resampler: {}", e))?;
         let delay_hw = resampler.output_delay() as u64;
@@ -192,11 +198,13 @@ impl<S: crate::AudioSink> ResamplingSink<S> {
     fn convert_chunk(&mut self) -> Result<()> {
         debug_assert!(self.pending.is_empty());
         self.input_buf.resize(self.chunk_size, 0.0);
-        let output = self
-            .resampler
-            .process(std::slice::from_ref(&self.input_buf), None)
+        let input = InterleavedSlice::new(&self.input_buf, 1, self.chunk_size)
             .map_err(|e| anyhow!("Resample error: {e}"))?;
-        self.pending = output[0].clone();
+        self.pending = self
+            .resampler
+            .process(&input, None)
+            .map_err(|e| anyhow!("Resample error: {e}"))?
+            .take_data();
         self.generated_hw += self.pending.len() as u64;
         let mapped = self.map_engine(self.generated_hw);
         if !self.pending.is_empty() {
@@ -272,7 +280,7 @@ impl<S: crate::AudioSink> ResamplingSink<S> {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
-        rubato::Resampler::reset(&mut self.resampler);
+        self.resampler.reset();
         self.segment_start_hw = self.generated_hw;
         self.segment_start_engine = self.accepted_engine;
         self.segment_real = 0;
@@ -358,7 +366,7 @@ impl<S: crate::AudioSink> crate::AudioSink for ResamplingSink<S> {
         self.segment_start_hw = 0;
         self.segment_start_engine = 0;
         self.segment_real = 0;
-        rubato::Resampler::reset(&mut self.resampler);
+        self.resampler.reset();
         self.ledger.get_mut().clear();
         self.progress_base_engine.set(0);
         Ok(())
@@ -397,7 +405,7 @@ impl<S: crate::AudioSink> crate::AudioSink for ResamplingSink<S> {
         self.segment_start_engine = played_engine;
         self.segment_real = 0;
         self.progress_base_engine.set(played_engine);
-        rubato::Resampler::reset(&mut self.resampler);
+        self.resampler.reset();
         self.ledger.get_mut().clear();
         Ok(Some(dropped))
     }
