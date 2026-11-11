@@ -656,6 +656,184 @@ mod tests {
     }
 
     #[test]
+    fn resampler_shape_pinned_to_rubato_0_16_2() {
+        // Characterization of the resampler's per-rate shape, captured on
+        // rubato 0.16.2 (chunk 1024, 1 sub-chunk, 1 channel). The port to
+        // rubato 4 must reproduce every value: Fft::new_custom with
+        // sub_chunks = 1 does, while rubato's recommended Fft::new defaults
+        // sub_chunks to chunk/256 and changes the delays without failing
+        // any other test.
+
+        // Source (hardware rate -> 48000): (output_delay, first input_frames_next).
+        let source_shapes: &[(u32, usize, usize)] = &[
+            (8000, 513, 171),
+            (11025, 640, 294),
+            (16000, 513, 342),
+            (22050, 640, 588),
+            (32000, 513, 684),
+            (44100, 560, 1029),
+            (88200, 520, 1911),
+            (96000, 512, 2048),
+            (176400, 520, 3822),
+            (192000, 512, 4096),
+        ];
+        for &(hw_rate, delay, first_input) in source_shapes {
+            let source = ChunkedSource {
+                rate: hw_rate,
+                chunks: VecDeque::from([vec![0.4; hw_rate as usize]]),
+            };
+            let mut src = ResamplingSource::new(source, 48000).unwrap();
+            assert_eq!(
+                src.resampler.output_delay(),
+                delay,
+                "source output_delay at {hw_rate} -> 48000"
+            );
+            assert_eq!(
+                src.resampler.input_frames_next(),
+                first_input,
+                "source first input chunk at {hw_rate} -> 48000"
+            );
+            // Output-chunk invariant: every read yields exactly 1024
+            // target-rate samples.
+            let mut out = vec![0.0f32; 2048];
+            assert_eq!(
+                src.read(&mut out).unwrap(),
+                1024,
+                "source first read at {hw_rate} -> 48000"
+            );
+            assert_eq!(
+                src.read(&mut out).unwrap(),
+                1024,
+                "source second read at {hw_rate} -> 48000"
+            );
+        }
+
+        // Legacy engine rate 8000 (the roundtrip test's shape).
+        let source = ChunkedSource {
+            rate: 48000,
+            chunks: VecDeque::from([vec![0.4; 48000]]),
+        };
+        let mut src = ResamplingSource::new(source, 8000).unwrap();
+        assert_eq!(
+            src.resampler.output_delay(),
+            512,
+            "source output_delay 48000 -> 8000"
+        );
+        assert_eq!(
+            src.resampler.input_frames_next(),
+            6144,
+            "source first input chunk 48000 -> 8000"
+        );
+        let mut out = vec![0.0f32; 2048];
+        assert_eq!(
+            src.read(&mut out).unwrap(),
+            1024,
+            "source read 48000 -> 8000"
+        );
+
+        // Sink (48000 -> hardware rate): (delay_hw, first conversion's output
+        // length in hardware samples). The first conversion of a full
+        // 1024-sample chunk can be shorter than the delay, or empty while
+        // the FFT block fills.
+        let sink_shapes: &[(u32, u64, usize)] = &[
+            (8000, 85, 0),
+            (11025, 147, 0),
+            (16000, 171, 0),
+            (22050, 294, 0),
+            (32000, 342, 0),
+            (44100, 514, 0),
+            (88200, 955, 0),
+            (96000, 1024, 2048),
+            (176400, 1911, 0),
+            (192000, 2048, 4096),
+        ];
+        for &(hw_rate, delay_hw, first_output) in sink_shapes {
+            let mut sink = ResamplingSink::new(
+                CappedSink {
+                    rate: hw_rate,
+                    cap: 0,
+                    played: Vec::new(),
+                },
+                48000,
+            )
+            .unwrap();
+            assert_eq!(
+                sink.delay_hw, delay_hw,
+                "sink delay_hw at 48000 -> {hw_rate}"
+            );
+            assert_eq!(
+                sink.resampler.input_frames_next(),
+                1024,
+                "sink consumes fixed 1024-frame chunks at 48000 -> {hw_rate}"
+            );
+            // First conversion of one full engine-rate chunk; the capped
+            // inner sink keeps the converted block in `pending`.
+            sink.input_buf = vec![0.3; 1024];
+            sink.convert_chunk().unwrap();
+            assert_eq!(
+                sink.pending.len(),
+                first_output,
+                "sink first output length at 48000 -> {hw_rate}"
+            );
+        }
+
+        // Legacy engine rate 8000 sink (8000 -> 48000).
+        let mut sink = ResamplingSink::new(
+            CappedSink {
+                rate: 48000,
+                cap: 0,
+                played: Vec::new(),
+            },
+            8000,
+        )
+        .unwrap();
+        assert_eq!(sink.delay_hw, 3072, "sink delay_hw 8000 -> 48000");
+        sink.input_buf = vec![0.3; 1024];
+        sink.convert_chunk().unwrap();
+        assert_eq!(
+            sink.pending.len(),
+            6144,
+            "sink first output length 8000 -> 48000"
+        );
+    }
+
+    #[test]
+    fn resampler_total_output_length_pinned() {
+        // Whole-stream output length: three seconds of a 440 Hz tone at the
+        // hardware rate, read in 1024-sample blocks until EOF. The totals,
+        // tail-drop of the final partial input chunk included, were captured
+        // on rubato 0.16.2 and must not move on rubato 4.
+        let cases: &[(u32, u32, usize)] = &[
+            (44100, 48000, 143_360),
+            (8000, 48000, 143_360),
+            (48000, 8000, 23_552),
+        ];
+        for &(hw_rate, target_rate, expected) in cases {
+            let input: Vec<f32> = (0..hw_rate as usize * 3)
+                .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / hw_rate as f32).sin())
+                .collect();
+            let source = ChunkedSource {
+                rate: hw_rate,
+                chunks: VecDeque::from([input]),
+            };
+            let mut src = ResamplingSource::new(source, target_rate).unwrap();
+            let mut total = 0usize;
+            let mut out = vec![0.0f32; 1024];
+            loop {
+                let n = src.read(&mut out).unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            assert_eq!(
+                total, expected,
+                "total output samples {hw_rate} -> {target_rate}"
+            );
+        }
+    }
+
+    #[test]
     fn test_resampling_roundtrip_48k_to_8k() {
         let engine_rate = 8000u32;
         let hw_rate = 48000u32;
