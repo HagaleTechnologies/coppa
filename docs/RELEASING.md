@@ -27,8 +27,8 @@ jobs: `verify`, `notices`, `linux` (x86-64, aarch64 and armv7), `windows`,
 - is not `v0.MINOR.PATCH` ("release tags look like v0.MINOR.PATCH; coppa
   stays pre-1.0");
 - does not equal the `version` in both `[workspace.package]` and the root
-  `[package]` of `Cargo.toml` ("tag v0.11.1 does not match Cargo.toml version
-  0.11.0");
+  `[package]` of `Cargo.toml` ("tag v0.13.1 does not match Cargo.toml version
+  0.13.0");
 - points at a commit that is not on `origin/main` (if `origin/main` is missing
   the check exits 2, "cannot judge", and the run fails);
 - already has a published release.
@@ -40,8 +40,9 @@ at most a draft, which only maintainers can see.
 
 ## Release checklist
 
-1. **Decide the version.** The first release is `v0.11.0`. Each release after
-   it bumps the minor version (0.11.0, then 0.12.0, then 0.13.0). If main's
+1. **Decide the version.** The first release is `v0.13.0`, the minor version
+   main already carries and no tag has ever released. Each release after it
+   bumps the minor version (0.13.0, then 0.14.0, then 0.15.0). If main's
    `Cargo.toml` already carries a minor version that was never released (the
    semver gate in
    [2026-11-02-public-rust-api-semver-gate.md](DECISIONS/2026-11-02-public-rust-api-semver-gate.md)
@@ -51,7 +52,7 @@ at most a draft, which only maintainers can see.
 2. **Update the version in the install docs** in the same PR: README
    "Install" and section 2 of
    [docs/tutorials/raspberry-pi-install.md](tutorials/raspberry-pi-install.md).
-   Both name the version as `0.11.0` in their commands and asset names.
+   Both name the version as `0.13.0` in their commands and asset names.
 3. **Rehearse on main** and wait for it to pass:
 
    ```bash
@@ -64,14 +65,14 @@ at most a draft, which only maintainers can see.
    ```bash
    git fetch origin
    git show origin/main:Cargo.toml | grep -m1 '^version'   # must print the version you are releasing
-   git tag -a v0.11.0 -m "coppa 0.11.0" origin/main
-   git push origin v0.11.0
+   git tag -a v0.13.0 -m "coppa 0.13.0" origin/main
+   git push origin v0.13.0
    ```
 
 5. **Verify the published release** on a clean machine:
 
    ```bash
-   v=0.11.0
+   v=0.13.0
    gh release download "v$v" --repo HagaleTechnologies/coppa \
        --pattern "coppa-$v-x86_64-unknown-linux-gnu.tar.gz" \
        --pattern "coppa-$v-aarch64-unknown-linux-gnu.tar.gz" --pattern SHA256SUMS
@@ -88,11 +89,11 @@ at most a draft, which only maintainers can see.
 
 - **The tag run failed before `publish`.** No release exists. Fix the problem
   on main through a normal PR, then move the tag to the new commit:
-  `git push origin :refs/tags/v0.11.0`, re-create the annotated tag on the new
+  `git push origin :refs/tags/v0.13.0`, re-create the annotated tag on the new
   `origin/main` and push it again. Do this only while no release exists for
   the tag.
 - **`publish` failed and left a draft.** Delete the draft
-  (`gh release delete v0.11.0 --yes`, which keeps the tag), then re-run the
+  (`gh release delete v0.13.0 --yes`, which keeps the tag), then re-run the
   failed jobs of the same run from the Actions page. The build artifacts are
   kept for the run, and `publish` re-checks the tag before it uploads.
 - **A published release is wrong.** Do not replace its assets: people may

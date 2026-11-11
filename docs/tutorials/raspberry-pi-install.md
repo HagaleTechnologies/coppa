@@ -68,7 +68,7 @@ Zero W). On those, use option B.
 Download, check and unpack (shown for a 64-bit OS):
 
 ```bash
-v=0.11.0; t=aarch64-unknown-linux-gnu
+v=0.13.0; t=aarch64-unknown-linux-gnu
 curl -fLO https://github.com/HagaleTechnologies/coppa/releases/download/v$v/coppa-$v-$t.tar.gz
 curl -fLO https://github.com/HagaleTechnologies/coppa/releases/download/v$v/SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
@@ -76,7 +76,7 @@ tar -xzf coppa-$v-$t.tar.gz
 cd coppa-$v-$t
 ```
 
-`sha256sum` should print `coppa-0.11.0-aarch64-unknown-linux-gnu.tar.gz: OK`.
+`sha256sum` should print `coppa-0.13.0-aarch64-unknown-linux-gnu.tar.gz: OK`.
 The unpacked directory holds `coppa`, `coppad`, `coppad.toml.example` and the
 `contrib/` service files, so the rest of this guide runs from inside it.
 

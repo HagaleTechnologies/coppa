@@ -33,7 +33,7 @@ runtime `libudev.so.1` dependency; ci.yml's `check` job fails if
 `cargo binstall --git` reads the version from main's `Cargo.toml`, not from the
 latest release. Once main is ahead of the last tag, a bare
 `cargo binstall --git ... coppa-cli` asks for an asset that does not exist and
-gets a 404. Always name the version (`coppa-cli@0.11.0`), and give one crate
+gets a 404. Always name the version (`coppa-cli@0.13.0`), and give one crate
 per command. The binstall metadata on main also applies to every older version
 a user pins, so the asset names and archive layout cannot change without
 breaking past releases.

@@ -87,7 +87,6 @@ class VersionAndTag(unittest.TestCase):
         r = run("version")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), expected)
-        self.assertEqual(expected, "0.11.0")
 
     def test_version_rejects_disagreeing_manifests(self) -> None:
         m = write_manifest(self.tmp / "Cargo.toml", "0.11.0", "0.12.0")

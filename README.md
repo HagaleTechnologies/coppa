@@ -61,11 +61,11 @@ validation yet (COP-20). Each archive holds both binaries, the licences,
 
 | Platform | File |
 |---|---|
-| Linux x86-64, glibc 2.31 or later | `coppa-0.11.0-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64, e.g. Raspberry Pi 3/4/5 on a 64-bit OS | `coppa-0.11.0-aarch64-unknown-linux-gnu.tar.gz` |
-| Linux armv7, e.g. Raspberry Pi 2/3/4 on a 32-bit OS | `coppa-0.11.0-armv7-unknown-linux-gnueabihf.tar.gz` |
-| Windows 10 or later, x86-64 | `coppa-0.11.0-x86_64-pc-windows-msvc.zip` |
-| macOS 11 or later, Apple silicon and Intel | `coppa-0.11.0-universal-apple-darwin.tar.gz` |
+| Linux x86-64, glibc 2.31 or later | `coppa-0.13.0-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64, e.g. Raspberry Pi 3/4/5 on a 64-bit OS | `coppa-0.13.0-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux armv7, e.g. Raspberry Pi 2/3/4 on a 32-bit OS | `coppa-0.13.0-armv7-unknown-linux-gnueabihf.tar.gz` |
+| Windows 10 or later, x86-64 | `coppa-0.13.0-x86_64-pc-windows-msvc.zip` |
+| macOS 11 or later, Apple silicon and Intel | `coppa-0.13.0-universal-apple-darwin.tar.gz` |
 
 `coppad` is built with `cpal-backend`, `websocket`, `serial-ptt`, `gpio-ptt`,
 `kiss-tnc`, `ardop` and `mdns`; `coppa` with `cpal-backend` and `kiss-tnc`.
@@ -77,7 +77,7 @@ Linux (pick `t` for your machine; on a Raspberry Pi, see the
 [Pi guide](docs/tutorials/raspberry-pi-install.md)):
 
 ```bash
-v=0.11.0; t=x86_64-unknown-linux-gnu
+v=0.13.0; t=x86_64-unknown-linux-gnu
 curl -fLO https://github.com/HagaleTechnologies/coppa/releases/download/v$v/coppa-$v-$t.tar.gz
 curl -fLO https://github.com/HagaleTechnologies/coppa/releases/download/v$v/SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
@@ -99,8 +99,8 @@ With [cargo-binstall](https://github.com/cargo-bins/cargo-binstall). The
 crates are not on crates.io, so name the version, one crate per command:
 
 ```bash
-cargo binstall --git https://github.com/HagaleTechnologies/coppa coppa-cli@0.11.0
-cargo binstall --git https://github.com/HagaleTechnologies/coppa coppa-daemon@0.11.0
+cargo binstall --git https://github.com/HagaleTechnologies/coppa coppa-cli@0.13.0
+cargo binstall --git https://github.com/HagaleTechnologies/coppa coppa-daemon@0.13.0
 ```
 
 Each release's assets can be checked with `gh attestation verify <file> --repo
