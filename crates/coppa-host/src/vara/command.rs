@@ -579,3 +579,27 @@ mod tests {
         assert!(!read_command(&mut reader, &mut line).await.unwrap());
     }
 }
+
+#[cfg(test)]
+mod cop172_tests {
+    use super::*;
+    #[test]
+    fn cop172_busy_reply_survives_telemetry_pressure() {
+        let (tx, mut rx) = response_channel();
+        for _ in 0..TELEMETRY_QUEUE_DEPTH {
+            assert_eq!(queue_response(&tx, VaraResponse::Ok), Queued::Sent);
+        }
+        assert_eq!(
+            queue_response(&tx, VaraResponse::Busy(true)),
+            Queued::Dropped
+        );
+        assert_eq!(
+            queue_response(&tx, VaraResponse::BusyState(true)),
+            Queued::Sent
+        );
+        for _ in 0..TELEMETRY_QUEUE_DEPTH {
+            assert_eq!(rx.try_recv().unwrap(), VaraResponse::Ok);
+        }
+        assert_eq!(rx.try_recv().unwrap(), VaraResponse::BusyState(true));
+    }
+}

@@ -513,6 +513,28 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:88ea203b70d7ac0a35b7561d61ceebbfdfcc632899700d5a30f9d495c4c7b06d",
+      "id": "linbpq-gateway",
+      "kind": "gotcha",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/linbpq-gateway.md",
+      "sources": [
+        "crates/coppa-daemon/src/event_loop.rs",
+        "crates/coppa-host/src/vara/protocol.rs",
+        "docs/BPQ.md",
+        "tools/bpq-loop/run.sh"
+      ],
+      "status": "current",
+      "title": "What will bite you when LinBPQ drives coppa as a VARA-style TNC?",
+      "verified_commit": "28d4c9a",
+      "verified_date": "2026-11-11",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:8fc6a50b80a14c5af822cbd0abc7f759b460044997d49b01e0fe563ec0c3599c",
       "id": "mdns-discovery",
       "kind": "gotcha",
