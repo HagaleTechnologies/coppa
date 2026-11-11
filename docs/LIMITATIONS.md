@@ -397,3 +397,10 @@ up for the full 400 s harness limit when the gateway was killed before
 the BBS banner. The restart experiment now interrupts an outstanding
 B2F write to exercise the existing data-retry dead-link bound. Idle-peer
 liveness is a separate follow-up, not a finite-bound claim.
+
+Closing a VARA command connection does not end the dial that client
+started. The dial lasts until the handshake reaper ends it, 30 to 35 s
+after its last request, and in the COP-172 lab a new dial on that coppad
+in that window was refused with `another session is active`. A host that
+drops its connection mid-dial should send `ABORT` first; the BPQ lab's
+stall scenario does (`docs/testing/bpq-session.md`).

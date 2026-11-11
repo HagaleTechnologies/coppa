@@ -63,3 +63,44 @@ class Checks(unittest.TestCase):
                  mock.patch.object(bpq_loop,"experiment",side_effect=experiment), \
                  contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(bpq_loop.main(),0)
+
+
+class StalledCallerCleanup(unittest.TestCase):
+    """The stall scenario must not hand the next scenario a live dial."""
+
+    @staticmethod
+    def run_against(before, on_abort, timeout):
+        import asyncio
+        import bpq_loop
+        received = []
+        async def scenario():
+            async def tnc(reader, writer):
+                writer.write(before)
+                received.append(await reader.readuntil(b"\r"))
+                writer.write(on_abort)
+                await writer.drain()
+                with contextlib.suppress(ConnectionError):
+                    await reader.read()
+                writer.close()
+            server = await asyncio.start_server(tnc, "127.0.0.1", 0)
+            try:
+                r, w = await asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1])
+                try:
+                    await bpq_loop.end_caller_dial(r, w, timeout)
+                finally:
+                    w.close(); await w.wait_closed()
+            finally:
+                server.close(); await server.wait_closed()
+        asyncio.run(scenario())
+        return received
+
+    def test_live_dial_is_aborted_and_its_disconnect_awaited(self):
+        received = self.run_against(b"OK\rPTT OFF\r", b"OK\rDISCONNECTED\r", 5)
+        self.assertEqual(received, [b"ABORT\r"])
+
+    def test_dial_the_reaper_already_ended_is_accepted(self):
+        self.assertEqual(self.run_against(b"DISCONNECTED\r", b"OK\r", 5), [b"ABORT\r"])
+
+    def test_no_disconnect_fails_instead_of_continuing(self):
+        with self.assertRaises(TimeoutError):
+            self.run_against(b"OK\r", b"OK\r", .5)

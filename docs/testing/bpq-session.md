@@ -141,6 +141,39 @@ PASS
 bpq-loop: kept /tmp/bpq-loop.yffkthuk
 ```
 
+## Stalled caller cleanup before restart
+
+A later validation run of `tools/bpq-loop/run.sh --keep` exited 1 at the
+restart scenario. The stall scenario had resumed the caller and closed its
+command socket, but closing a host socket does not end a dial. Pat's
+restart dial reached the caller about 0.5 s before the old dial's handshake
+reaper ended it, so coppa refused it with `Connect request refused: another
+session is active` and the CONNECTED wait timed out. The standalone
+`--scenario restart` run passed.
+
+The stall scenario now sends `ABORT` on the caller's command socket and
+waits up to 40 s for `DISCONNECTED` before closing the socket. A dial the
+reaper ended first has already pushed its `DISCONNECTED`, so either path
+leaves the caller with no live dial. Offline tests in
+`tools/bpq-loop/test_bpq_loop.py` cover both paths and the failure case.
+
+The rerun below exited 0. In this run the caller's dial was 34 s old when
+it resumed, so its reaper ended it at once and the wait consumed that
+`DISCONNECTED`. The ABORT path was not exercised live. The daemon test
+`abort_cuts_the_keyed_frame_and_pushes_disconnected_at_once` shows that
+coppa answers ABORT during a dial with `OK`, `PTT OFF` and `DISCONNECTED`.
+
+```text
+bpq-loop: LinBPQ sha256 6b5be6ffc5c0c1304d3e4175958ce2c78967ac4e8463474ce29744dc8aee748d
+bpq-loop: G8BPQ AX25 Packet Switch System Version 6.0.26.1 October 2026
+bpq-loop: scratch /tmp/bpq-loop.ysirt7ue, ports A=59573/59574 B=45713/45714 rigctld=39117
+session pat_exit=0 connected="CONNECTED N1CALL N0GW-1 2400" stored=yes listed=yes bbs_log=yes scan_hops_during_session=0 max_reply_ms=395.0 
+stall cancelpending=yes scan_resumed=yes max_reply_ms=395.0
+restart pat_exit=0 connected="CONNECTED N1CALL N0GW-1 2400" stored=yes listed=yes bbs_log=yes scan_hops_during_session=0 max_reply_ms=439.9 first_exit=1 startup_block_resent=yes second_exit=0
+PASS
+bpq-loop: kept /tmp/bpq-loop.ysirt7ue
+```
+
 ## Fresh clone, fresh HOME and empty cache
 
 The runner owns the final commit and push, so this test cloned HEAD and

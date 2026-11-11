@@ -78,6 +78,25 @@ def scan_hops(events, start, end):
     return sum(e["kind"] == "rig" and e["line"].startswith("F ") and start <= e["t"] <= end for e in events)
 
 
+async def end_caller_dial(reader, writer, timeout=40):
+    """Return once the caller on this command socket has no live dial.
+
+    Closing the socket does not end a dial; coppa's handshake reaper does,
+    30 to 35 s after the last activity. ABORT ends a live dial at once and
+    coppa answers DISCONNECTED. A dial the reaper already ended sent its
+    DISCONNECTED earlier on this socket, still unread here.
+    """
+    writer.write(b"ABORT\r")
+    await writer.drain()
+    async def disconnected():
+        while (await reader.readuntil(b"\r")).strip() != b"DISCONNECTED":
+            pass
+    try:
+        await asyncio.wait_for(disconnected(), timeout)
+    except asyncio.TimeoutError:
+        raise TimeoutError(f"caller sent no DISCONNECTED within {timeout} s of ABORT") from None
+
+
 def ports(n):
     holders = []
     try:
@@ -280,6 +299,9 @@ callsign = "{call}"
             caller.send_signal(signal.SIGSTOP)
             await until(lambda:any(e["line"]=="CANCELPENDING" and e["t"]>begin for e in events()),50)
             caller.send_signal(signal.SIGCONT)
+            # The resumed caller's dial would otherwise stay live until its
+            # reaper, and refuse the next scenario's dial as a second session.
+            await end_caller_dial(r,w)
             w.close(); await w.wait_closed()
             cancelled=next(e["t"] for e in events() if e["line"]=="CANCELPENDING" and e["t"]>begin)
             await until(lambda:any(e["kind"]=="rig" and e["line"].startswith("F ") and e["t"]>cancelled for e in events()),20)
