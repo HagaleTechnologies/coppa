@@ -222,6 +222,7 @@ fn calibrate(
 /// corrupted) RV0 samples again, then up to 3 retransmissions on the paired
 /// draws `(trial, 1..=3)`. Returns which retransmission first rescued the
 /// frame (1, 2 or 3), or None.
+#[allow(clippy::too_many_arguments)]
 fn run_arm(
     tx: &CoppaTransceiver,
     level: u8,

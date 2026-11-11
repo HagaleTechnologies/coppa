@@ -244,7 +244,7 @@ mod tests {
         // every other order knocked out of the tie, the earlier-listed
         // [1, 3, 2] wins.
         let mut r1c = [5usize; 6];
-        let mut r2c = [8usize; 6];
+        let r2c = [8usize; 6];
         for out in [0usize, 2, 3, 4] {
             r1c[out] = 4;
         }
