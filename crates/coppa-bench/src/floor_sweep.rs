@@ -29,6 +29,7 @@
 use coppa_channel::persistent::{SnrProfile, VirtualCable};
 use coppa_channel::watterson::WattersonPreset;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
+use coppa_protocol::modem::streaming::StreamingReceiver;
 use coppa_protocol::modem::transceiver::{CoppaTransceiver, ReceiveError};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -62,6 +63,31 @@ pub const POOR_CROSSING_BAR_DB: f64 = -2.0;
 pub const LEAD_IN_S: f64 = 0.35;
 /// Seconds of channel noise after each frame (covers the channel latency).
 pub const TAIL_S: f64 = 0.25;
+
+/// Chunk size the streaming receive path is fed through: 100 ms at 48 kHz.
+/// Continuous acquisition is exercised by pushing the whole capture
+/// (lead-in, frame, tail) through in these fixed arbitrary-size chunks.
+pub const STREAM_CHUNK_SAMPLES: usize = 4_800;
+
+/// Which production receive path an attempt is measured through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RxPath {
+    /// Whole-capture [`CoppaTransceiver::receive`], no oracle timing.
+    Batch,
+    /// [`StreamingReceiver::push_samples`] over continuous fixed-size chunks.
+    Streaming,
+}
+
+impl RxPath {
+    /// CSV name.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Batch => "batch",
+            Self::Streaming => "streaming",
+        }
+    }
+}
 
 /// The CSV header for one sweep row.
 pub const CSV_HEADER: &str = "waveform,rx_path,channel,snr_db,trials,frame_errors,sync_failed,\
@@ -443,20 +469,22 @@ impl SweepChannel {
     }
 }
 
-/// Run one batch-receive attempt of `tx` through a fresh persistent channel:
-/// noise lead-in, the frame, a noise tail, then the production receiver over
-/// the whole capture (no oracle timing or header). Returns the outcome and the
-/// frame's airtime in samples.
+/// Run one receive attempt of `tx` through a fresh persistent channel: noise
+/// lead-in, the frame, a noise tail, then the selected production receive path
+/// over the whole capture (no oracle timing or header). Returns the outcome and
+/// the frame's airtime in samples.
 ///
 /// # Errors
 ///
 /// A payload over 65535 bytes or one `tx` refuses to transmit is a harness
 /// configuration error, returned rather than counted as a channel failure.
+#[allow(clippy::too_many_arguments)]
 pub fn run_attempt(
     tx: &CoppaTransceiver,
     level: u8,
     payload_bytes: usize,
     channel: SweepChannel,
+    rx_path: RxPath,
     snr_db: f32,
     seed: u64,
 ) -> anyhow::Result<(AttemptOutcome, usize)> {
@@ -493,36 +521,90 @@ pub fn run_attempt(
     );
     // Unknown alignment: the lead-in length varies per attempt.
     let jitter_s = f64::from(rng.random::<u16>()) / f64::from(u16::MAX) * 0.05;
-    let mut rx = cable.idle(LEAD_IN_S + jitter_s).at_b;
-    rx.extend(
+    let mut capture = cable.idle(LEAD_IN_S + jitter_s).at_b;
+    capture.extend(
         cable
             .transmit(coppa_channel::persistent::Direction::AToB, &clean)
             .at_b,
     );
-    rx.extend(cable.idle(TAIL_S).at_b);
-    let result = tx.receive(&rx);
-    tx.harq_evict(header.seq_num);
+    capture.extend(cable.idle(TAIL_S).at_b);
     // Like the legacy sweep, a decoded payload counts as delivered when its
     // first `payload.len()` bytes are the ones sent; a short one is wrong.
-    let outcome = match &result {
-        Ok((_, got, _)) => {
-            AttemptOutcome::from_receive(Ok(&got[..got.len().min(payload.len())]), &payload)
+    let outcome = match rx_path {
+        RxPath::Batch => {
+            let result = tx.receive(&capture);
+            tx.harq_evict(header.seq_num);
+            match &result {
+                Ok((_, got, _)) => {
+                    AttemptOutcome::from_receive(Ok(&got[..got.len().min(payload.len())]), &payload)
+                }
+                Err(e) => AttemptOutcome::from_receive(Err(e), &payload),
+            }
         }
-        Err(e) => AttemptOutcome::from_receive(Err(e), &payload),
+        RxPath::Streaming => {
+            // A fresh receiver per attempt: the streaming path is measured on
+            // its own, carrying no state across attempts.
+            let mut stream = StreamingReceiver::new(tx.profile().clone(), 1);
+            let mut decoded = Vec::new();
+            for chunk in capture.chunks(STREAM_CHUNK_SAMPLES) {
+                decoded.extend(stream.push_samples(chunk));
+            }
+            let delivered_payloads: Vec<&[u8]> = decoded
+                .iter()
+                .map(|f| &f.payload[..f.payload.len().min(payload.len())])
+                .collect();
+            classify_streaming(
+                &delivered_payloads,
+                stream.header_only_decodes() > 0,
+                &payload,
+            )
+        }
     };
     Ok((outcome, clean.len()))
 }
 
-/// Run a batch-receive sweep over `grid` and return one tally per point.
+/// Classify a streaming attempt from every payload its receiver delivered.
+/// The streaming path emits only fully CRC-validated frames, so a delivered
+/// frame that differs from the sent one is a wrong payload; conservatively,
+/// one wrong delivery marks the attempt wrong even when the correct frame
+/// also decoded. The path reports no per-candidate errors, but its
+/// `header_only_decodes` counter tells a trusted header decode from no
+/// detection at all, which is exactly the line [`SyncCause`] draws: no
+/// trusted header is `SyncFailed`, a trusted header whose payload then failed
+/// is [`AttemptOutcome::PayloadFailed`].
+fn classify_streaming(decoded: &[&[u8]], any_trusted_header: bool, sent: &[u8]) -> AttemptOutcome {
+    let mut delivered = false;
+    let mut wrong = false;
+    for got in decoded {
+        if *got == sent {
+            delivered = true;
+        } else {
+            wrong = true;
+        }
+    }
+    if wrong {
+        AttemptOutcome::WrongPayload
+    } else if delivered {
+        AttemptOutcome::Delivered
+    } else if any_trusted_header {
+        AttemptOutcome::PayloadFailed
+    } else {
+        AttemptOutcome::SyncFailed(SyncCause::NoDetection)
+    }
+}
+
+/// Run a sweep of one receive path over `grid` and return one tally per point.
 ///
 /// # Errors
 ///
 /// Propagates [`run_attempt`]'s configuration errors.
+#[allow(clippy::too_many_arguments)]
 pub fn run_sweep(
     tx: &CoppaTransceiver,
     level: u8,
     payload_bytes: usize,
     channel: SweepChannel,
+    rx_path: RxPath,
     grid: &[i32],
     trials: usize,
     seed_base: u64,
@@ -534,7 +616,7 @@ pub fn run_sweep(
             for trial in 0..trials {
                 let seed = attempt_seed(seed_base, pi, trials, trial);
                 let (outcome, airtime) =
-                    run_attempt(tx, level, payload_bytes, channel, snr as f32, seed)?;
+                    run_attempt(tx, level, payload_bytes, channel, rx_path, snr as f32, seed)?;
                 tally.record(outcome, airtime, payload_bytes);
             }
             Ok(tally)
@@ -692,8 +774,39 @@ mod tests {
     #[test]
     fn harness_errors_are_returned_not_counted() {
         let tx = CoppaTransceiver::new(coppa_codec::ofdm::CoppaProfile::hf_narrow(), 1);
-        assert!(run_attempt(&tx, 1, 70_000, SweepChannel::Awgn, 30.0, 1).is_err());
-        assert!(run_attempt(&tx, 1, 4_000, SweepChannel::Awgn, 30.0, 1).is_err());
+        assert!(run_attempt(&tx, 1, 70_000, SweepChannel::Awgn, RxPath::Batch, 30.0, 1).is_err());
+        assert!(run_attempt(&tx, 1, 4_000, SweepChannel::Awgn, RxPath::Batch, 30.0, 1).is_err());
+    }
+
+    #[test]
+    fn streaming_classification_keeps_sync_conservative() {
+        let sent = [1u8, 2, 3];
+        assert_eq!(
+            classify_streaming(&[&sent], true, &sent),
+            AttemptOutcome::Delivered
+        );
+        assert_eq!(
+            classify_streaming(&[&[1, 2, 4]], true, &sent),
+            AttemptOutcome::WrongPayload
+        );
+        assert_eq!(
+            classify_streaming(&[&[1, 2]], true, &sent),
+            AttemptOutcome::WrongPayload
+        );
+        // One wrong delivery alongside the correct frame still counts wrong:
+        // the receiver handed the application bad bytes.
+        assert_eq!(
+            classify_streaming(&[&sent, &[1, 2, 4]], true, &sent),
+            AttemptOutcome::WrongPayload
+        );
+        assert_eq!(
+            classify_streaming(&[], true, &sent),
+            AttemptOutcome::PayloadFailed
+        );
+        assert_eq!(
+            classify_streaming(&[], false, &sent),
+            AttemptOutcome::SyncFailed(SyncCause::NoDetection)
+        );
     }
 
     #[test]
@@ -739,9 +852,52 @@ mod tests {
     #[test]
     fn production_receiver_decodes_a_clean_attempt_through_the_cable() {
         let tx = CoppaTransceiver::new(coppa_codec::ofdm::CoppaProfile::hf_narrow(), 1);
-        let (outcome, airtime) =
-            run_attempt(&tx, 1, 16, SweepChannel::Awgn, 30.0, DEV_SEED_BASE).unwrap();
+        let (outcome, airtime) = run_attempt(
+            &tx,
+            1,
+            16,
+            SweepChannel::Awgn,
+            RxPath::Batch,
+            30.0,
+            DEV_SEED_BASE,
+        )
+        .unwrap();
         assert_eq!(outcome, AttemptOutcome::Delivered);
         assert!(airtime > 0);
+    }
+
+    #[test]
+    fn production_streaming_path_decodes_a_clean_attempt_through_the_cable() {
+        let tx = CoppaTransceiver::new(coppa_codec::ofdm::CoppaProfile::hf_narrow(), 1);
+        let (outcome, airtime) = run_attempt(
+            &tx,
+            1,
+            16,
+            SweepChannel::Awgn,
+            RxPath::Streaming,
+            30.0,
+            DEV_SEED_BASE,
+        )
+        .unwrap();
+        assert_eq!(outcome, AttemptOutcome::Delivered);
+        assert!(airtime > 0);
+    }
+
+    #[test]
+    fn both_rx_paths_agree_on_a_clean_poor_attempt() {
+        let tx = CoppaTransceiver::new(coppa_codec::ofdm::CoppaProfile::hf_narrow(), 1);
+        for rx_path in [RxPath::Batch, RxPath::Streaming] {
+            let (outcome, _) = run_attempt(
+                &tx,
+                1,
+                16,
+                SweepChannel::Poor,
+                rx_path,
+                30.0,
+                DEV_SEED_BASE + 7,
+            )
+            .unwrap();
+            assert_eq!(outcome, AttemptOutcome::Delivered, "{rx_path:?}");
+        }
     }
 }

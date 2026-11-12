@@ -414,6 +414,12 @@ stall scenario does (`docs/testing/bpq-session.md`).
   decisions by jointly decoding legal length/CRC combinations. Paired Poor
   development runs reduce frame errors from 24/90 to 20/90, but header failures
   still dominate above the crossing. The candidate remains unselected.
+- The `floor_mode sweep` diagnostic accepts `--rx batch|streaming|both` and
+  measures the production batch (`CoppaTransceiver::receive`) and streaming
+  (`StreamingReceiver`) receive paths over the same grid, seeds and channel
+  realizations. The measured waveform is still only the `ofdm:1` baseline: the
+  production floor those sweeps must select is unbuilt, `connect` and `ramp`
+  remain unimplemented, and no final-seed sweep has been recorded.
 - The capture adapter bounds retained history but decodes only when asked.
   It is not a continuous streaming detector. The 300-second noise tests,
   BPSK challenger, CFO acquisition and production integration remain open.

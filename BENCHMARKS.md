@@ -5702,3 +5702,11 @@ The before CSV uses the same command on the imported COP-169 receiver.
 These are batch simulations at zero CFO without SSB filtering. They do not
 establish streaming acquisition, connect/ramp success, a production air version,
 or the locked 200-trial final-seed acceptance bars.
+
+The acceptance sweep interface itself now covers both production receive
+paths: `floor_mode sweep --rx batch|streaming|both` sweeps the production
+batch and `StreamingReceiver` paths over the same grid, seeds and channel
+realizations, with one CSV row set and metadata verdict block per path. The
+development CSVs above remain batch-only measurements of the experimental
+candidate; no final-seed `--rx both` sweep has been recorded, and the
+production floor waveform those sweeps must select does not exist yet.

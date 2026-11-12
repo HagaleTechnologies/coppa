@@ -30,3 +30,8 @@ to count failed headers in SyncFailed.
 The Capture adapter bounds history but requires an explicit batch decode. Its
 chunk-partition test does not prove continuous acquisition. The experimental
 header value 2 does not allocate a production air version.
+
+`floor_mode sweep --rx batch|streaming|both` measures the production batch and
+streaming receive paths on the same seeds, but only for the `ofdm:1` baseline
+until a floor waveform is selected. `connect` and `ramp` need the production
+floor session and do not exist yet.
