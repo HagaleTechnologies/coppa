@@ -111,11 +111,6 @@ cargo run -p coppa-bench --release --example <name>
 cargo test -p coppa-bench --lib waterfall_bracket
 ```
 
-## Log index
-
-<<<<<<< HEAD
-Every section title of the pre-COP-146 file, in its original order. Grouped logs retain each section unchanged.
-=======
 ## COP-169: floor-mode measurement contract and the `ofdm:1` baseline
 
 Measured 2026-11-11 on x86_64 Linux, release build, with the new
@@ -209,8 +204,9 @@ integration remain unbuilt. The ticket's three scenarios remain unmet.
 This candidate was written using repository primitives and the ticket's
 parameters. No external modem source was read or copied.
 
-## COP-129: golden vectors for levels 3, 4, 7 and 9, multi-codeword frames and retransmission
->>>>>>> f28564c475ccc00e6c4ea047a3a598ec94c23329
+## Log index
+
+Every section title of the pre-COP-146 file, in its original order. Grouped logs retain each section unchanged.
 
 | Old section title | Date | File |
 |---|---|---|
