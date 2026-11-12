@@ -5,7 +5,8 @@
 //! a target rate like 8kHz), resampling transparently in both directions.
 
 use anyhow::{anyhow, Result};
-use rubato::{FftFixedIn, FftFixedOut, VecResampler};
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Fft, FixedSync, Resampler, WindowFunction};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
@@ -13,7 +14,7 @@ use std::collections::VecDeque;
 /// resamples down to the target (engine) rate.
 pub struct ResamplingSource<S> {
     inner: S,
-    resampler: FftFixedOut<f32>,
+    resampler: Fft<f32>,
     hw_rate: u32,
     target_rate: u32,
     /// Buffer for reading hardware-rate samples
@@ -29,12 +30,14 @@ impl<S: crate::AudioSource> ResamplingSource<S> {
             return Err(anyhow!("audio sample rate must be positive"));
         }
         let chunk_size = 1024;
-        let resampler = FftFixedOut::<f32>::new(
+        let resampler = Fft::<f32>::new_custom(
             hw_rate as usize,
             target_rate as usize,
             chunk_size,
             1, // sub_chunks
             1, // channels
+            WindowFunction::BlackmanHarris2,
+            FixedSync::Output,
         )
         .map_err(|e| anyhow::anyhow!("Failed to create resampler: {}", e))?;
 
@@ -84,14 +87,15 @@ impl<S: crate::AudioSource> crate::AudioSource for ResamplingSource<S> {
 
         // Take exactly what the resampler needs
         let input_chunk: Vec<f32> = self.hw_buf.drain(..input_frames_needed).collect();
-        let input_vec = vec![input_chunk];
-
-        let output = self
-            .resampler
-            .process(&input_vec, None)
+        let input = InterleavedSlice::new(&input_chunk, 1, input_frames_needed)
             .map_err(|e| anyhow::anyhow!("Resample error: {}", e))?;
 
-        let resampled = &output[0];
+        let resampled = self
+            .resampler
+            .process(&input, None)
+            .map_err(|e| anyhow::anyhow!("Resample error: {}", e))?
+            .take_data();
+        let resampled = &resampled[..];
         let n = buf.len().min(resampled.len());
         buf[..n].copy_from_slice(&resampled[..n]);
 
@@ -119,7 +123,7 @@ impl<S: crate::AudioSource> crate::AudioSource for ResamplingSource<S> {
 /// resamples up to the hardware rate, and writes to the inner sink.
 pub struct ResamplingSink<S> {
     inner: S,
-    resampler: FftFixedIn<f32>,
+    resampler: Fft<f32>,
     hw_rate: u32,
     target_rate: u32,
     input_buf: Vec<f32>,
@@ -144,12 +148,14 @@ impl<S: crate::AudioSink> ResamplingSink<S> {
         }
         let chunk_size = 1024;
 
-        let resampler = FftFixedIn::<f32>::new(
+        let resampler = Fft::<f32>::new_custom(
             target_rate as usize,
             hw_rate as usize,
             chunk_size,
             1, // sub_chunks
             1, // channels
+            WindowFunction::BlackmanHarris2,
+            FixedSync::Input,
         )
         .map_err(|e| anyhow::anyhow!("Failed to create resampler: {}", e))?;
         let delay_hw = resampler.output_delay() as u64;
@@ -192,11 +198,13 @@ impl<S: crate::AudioSink> ResamplingSink<S> {
     fn convert_chunk(&mut self) -> Result<()> {
         debug_assert!(self.pending.is_empty());
         self.input_buf.resize(self.chunk_size, 0.0);
-        let output = self
-            .resampler
-            .process(std::slice::from_ref(&self.input_buf), None)
+        let input = InterleavedSlice::new(&self.input_buf, 1, self.chunk_size)
             .map_err(|e| anyhow!("Resample error: {e}"))?;
-        self.pending = output[0].clone();
+        self.pending = self
+            .resampler
+            .process(&input, None)
+            .map_err(|e| anyhow!("Resample error: {e}"))?
+            .take_data();
         self.generated_hw += self.pending.len() as u64;
         let mapped = self.map_engine(self.generated_hw);
         if !self.pending.is_empty() {
@@ -272,7 +280,7 @@ impl<S: crate::AudioSink> ResamplingSink<S> {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
-        rubato::Resampler::reset(&mut self.resampler);
+        self.resampler.reset();
         self.segment_start_hw = self.generated_hw;
         self.segment_start_engine = self.accepted_engine;
         self.segment_real = 0;
@@ -358,7 +366,7 @@ impl<S: crate::AudioSink> crate::AudioSink for ResamplingSink<S> {
         self.segment_start_hw = 0;
         self.segment_start_engine = 0;
         self.segment_real = 0;
-        rubato::Resampler::reset(&mut self.resampler);
+        self.resampler.reset();
         self.ledger.get_mut().clear();
         self.progress_base_engine.set(0);
         Ok(())
@@ -397,7 +405,7 @@ impl<S: crate::AudioSink> crate::AudioSink for ResamplingSink<S> {
         self.segment_start_engine = played_engine;
         self.segment_real = 0;
         self.progress_base_engine.set(played_engine);
-        rubato::Resampler::reset(&mut self.resampler);
+        self.resampler.reset();
         self.ledger.get_mut().clear();
         Ok(Some(dropped))
     }
@@ -653,6 +661,184 @@ mod tests {
         let mut rs = ResamplingSink::new(sink, 8000).unwrap();
         rs.start().unwrap();
         assert_eq!(rs.sample_rate(), 8000);
+    }
+
+    #[test]
+    fn resampler_shape_pinned_to_rubato_0_16_2() {
+        // Characterization of the resampler's per-rate shape, captured on
+        // rubato 0.16.2 (chunk 1024, 1 sub-chunk, 1 channel). The port to
+        // rubato 4 must reproduce every value: Fft::new_custom with
+        // sub_chunks = 1 does, while rubato's recommended Fft::new defaults
+        // sub_chunks to chunk/256 and changes the delays without failing
+        // any other test.
+
+        // Source (hardware rate -> 48000): (output_delay, first input_frames_next).
+        let source_shapes: &[(u32, usize, usize)] = &[
+            (8000, 513, 171),
+            (11025, 640, 294),
+            (16000, 513, 342),
+            (22050, 640, 588),
+            (32000, 513, 684),
+            (44100, 560, 1029),
+            (88200, 520, 1911),
+            (96000, 512, 2048),
+            (176400, 520, 3822),
+            (192000, 512, 4096),
+        ];
+        for &(hw_rate, delay, first_input) in source_shapes {
+            let source = ChunkedSource {
+                rate: hw_rate,
+                chunks: VecDeque::from([vec![0.4; hw_rate as usize]]),
+            };
+            let mut src = ResamplingSource::new(source, 48000).unwrap();
+            assert_eq!(
+                src.resampler.output_delay(),
+                delay,
+                "source output_delay at {hw_rate} -> 48000"
+            );
+            assert_eq!(
+                src.resampler.input_frames_next(),
+                first_input,
+                "source first input chunk at {hw_rate} -> 48000"
+            );
+            // Output-chunk invariant: every read yields exactly 1024
+            // target-rate samples.
+            let mut out = vec![0.0f32; 2048];
+            assert_eq!(
+                src.read(&mut out).unwrap(),
+                1024,
+                "source first read at {hw_rate} -> 48000"
+            );
+            assert_eq!(
+                src.read(&mut out).unwrap(),
+                1024,
+                "source second read at {hw_rate} -> 48000"
+            );
+        }
+
+        // Legacy engine rate 8000 (the roundtrip test's shape).
+        let source = ChunkedSource {
+            rate: 48000,
+            chunks: VecDeque::from([vec![0.4; 48000]]),
+        };
+        let mut src = ResamplingSource::new(source, 8000).unwrap();
+        assert_eq!(
+            src.resampler.output_delay(),
+            512,
+            "source output_delay 48000 -> 8000"
+        );
+        assert_eq!(
+            src.resampler.input_frames_next(),
+            6144,
+            "source first input chunk 48000 -> 8000"
+        );
+        let mut out = vec![0.0f32; 2048];
+        assert_eq!(
+            src.read(&mut out).unwrap(),
+            1024,
+            "source read 48000 -> 8000"
+        );
+
+        // Sink (48000 -> hardware rate): (delay_hw, first conversion's output
+        // length in hardware samples). The first conversion of a full
+        // 1024-sample chunk can be shorter than the delay, or empty while
+        // the FFT block fills.
+        let sink_shapes: &[(u32, u64, usize)] = &[
+            (8000, 85, 0),
+            (11025, 147, 0),
+            (16000, 171, 0),
+            (22050, 294, 0),
+            (32000, 342, 0),
+            (44100, 514, 0),
+            (88200, 955, 0),
+            (96000, 1024, 2048),
+            (176400, 1911, 0),
+            (192000, 2048, 4096),
+        ];
+        for &(hw_rate, delay_hw, first_output) in sink_shapes {
+            let mut sink = ResamplingSink::new(
+                CappedSink {
+                    rate: hw_rate,
+                    cap: 0,
+                    played: Vec::new(),
+                },
+                48000,
+            )
+            .unwrap();
+            assert_eq!(
+                sink.delay_hw, delay_hw,
+                "sink delay_hw at 48000 -> {hw_rate}"
+            );
+            assert_eq!(
+                sink.resampler.input_frames_next(),
+                1024,
+                "sink consumes fixed 1024-frame chunks at 48000 -> {hw_rate}"
+            );
+            // First conversion of one full engine-rate chunk; the capped
+            // inner sink keeps the converted block in `pending`.
+            sink.input_buf = vec![0.3; 1024];
+            sink.convert_chunk().unwrap();
+            assert_eq!(
+                sink.pending.len(),
+                first_output,
+                "sink first output length at 48000 -> {hw_rate}"
+            );
+        }
+
+        // Legacy engine rate 8000 sink (8000 -> 48000).
+        let mut sink = ResamplingSink::new(
+            CappedSink {
+                rate: 48000,
+                cap: 0,
+                played: Vec::new(),
+            },
+            8000,
+        )
+        .unwrap();
+        assert_eq!(sink.delay_hw, 3072, "sink delay_hw 8000 -> 48000");
+        sink.input_buf = vec![0.3; 1024];
+        sink.convert_chunk().unwrap();
+        assert_eq!(
+            sink.pending.len(),
+            6144,
+            "sink first output length 8000 -> 48000"
+        );
+    }
+
+    #[test]
+    fn resampler_total_output_length_pinned() {
+        // Whole-stream output length: three seconds of a 440 Hz tone at the
+        // hardware rate, read in 1024-sample blocks until EOF. The totals,
+        // tail-drop of the final partial input chunk included, were captured
+        // on rubato 0.16.2 and must not move on rubato 4.
+        let cases: &[(u32, u32, usize)] = &[
+            (44100, 48000, 143_360),
+            (8000, 48000, 143_360),
+            (48000, 8000, 23_552),
+        ];
+        for &(hw_rate, target_rate, expected) in cases {
+            let input: Vec<f32> = (0..hw_rate as usize * 3)
+                .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / hw_rate as f32).sin())
+                .collect();
+            let source = ChunkedSource {
+                rate: hw_rate,
+                chunks: VecDeque::from([input]),
+            };
+            let mut src = ResamplingSource::new(source, target_rate).unwrap();
+            let mut total = 0usize;
+            let mut out = vec![0.0f32; 1024];
+            loop {
+                let n = src.read(&mut out).unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            assert_eq!(
+                total, expected,
+                "total output samples {hw_rate} -> {target_rate}"
+            );
+        }
     }
 
     #[test]

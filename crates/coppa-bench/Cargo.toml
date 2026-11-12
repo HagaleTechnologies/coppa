@@ -210,5 +210,14 @@ name = "fx25_wav"
 path = "diagnostics/fx25_wav.rs"
 
 [[example]]
+<<<<<<< HEAD
 name = "session_harq"
 path = "diagnostics/session_harq.rs"
+=======
+name = "floor_mode"
+path = "diagnostics/floor_mode.rs"
+
+[[example]]
+name = "floor_candidate"
+path = "diagnostics/floor_candidate.rs"
+>>>>>>> f28564c475ccc00e6c4ea047a3a598ec94c23329

@@ -19,10 +19,12 @@ links:
 Coppa operates at a fixed 48 kHz sample rate across all profiles and speed
 levels. The waveform occupies a 300–2700 Hz SSB audio passband (carrier offset
 of 6 FFT bins). All profile constants (carrier count, cyclic prefix length,
-symbol duration, pilot layout) assume 48 kHz. No crate in the workspace
-resamples; audio at another rate must be converted before it reaches Coppa,
-and `coppad` rejects any `[audio] sample_rate` other than the profile's rate
-at startup (`DaemonConfig::check_sample_rate`).
+symbol duration, pilot layout) assume 48 kHz. On the daemon's live audio path,
+`coppa-audio`'s `ResamplingSource` and `ResamplingSink` resample between the
+sound card's hardware rate and the engine's 48 kHz (`rubato` 4), and `coppad`
+accepts any positive `[audio] sample_rate` as a preferred hardware rate
+(`DaemonConfig::check_sample_rate` rejects only zero); file-based
+`coppa rx --input` still requires audio at the engine's rate.
 
 ## Pointers
 
