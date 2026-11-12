@@ -592,15 +592,9 @@
         "CLAUDE.md"
       ],
       "status": "current",
-<<<<<<< HEAD
-      "title": "Coppa — what is this and where do things live?",
-      "verified_commit": "56361d6",
-      "verified_date": "2026-10-28",
-=======
       "title": "Coppa \u2014 what is this and where do things live?",
       "verified_commit": "d04f6f3",
       "verified_date": "2026-11-11",
->>>>>>> cdc4ae5f852634dda4f289744a8050ffc8d61179
       "visibility": "public"
     },
     {
