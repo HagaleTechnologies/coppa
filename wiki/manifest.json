@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-06T09:21:18Z",
-  "head_commit": "14d87c5",
+  "generated_at": "2026-11-11T21:20:42Z",
+  "head_commit": "f0a716d",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -531,6 +531,29 @@
       "status": "current",
       "title": "What will bite you when LinBPQ drives coppa as a VARA-style TNC?",
       "verified_commit": "28d4c9a",
+      "verified_date": "2026-11-11",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:356463d64bc2cb8ba9980fe071802aa996c10c2a91a4dc2e95d679f63a48ac4c",
+      "id": "low-rate-floor",
+      "kind": "gotcha",
+      "links": [
+        "coppa-protocol",
+        "band-conventions"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/low-rate-floor.md",
+      "sources": [
+        "BENCHMARKS.md",
+        "docs/LIMITATIONS.md",
+        "crates/coppa-bench/src/floor_candidate.rs",
+        "crates/coppa-bench/diagnostics/floor_candidate.rs"
+      ],
+      "status": "current",
+      "title": "What has COP-169 measured about a low-rate floor?",
+      "verified_commit": "aa4bf43",
       "verified_date": "2026-11-11",
       "visibility": "public"
     },
