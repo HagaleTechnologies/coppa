@@ -71,6 +71,62 @@ mod tests {
     }
 
     #[test]
+    fn header_length_erasure_recovers_from_crc_redundancy() {
+        let c = Candidate::new();
+        let sent = b"header fade regression!";
+        let mut audio = c.encode(sent).unwrap();
+        // Erase the length's low nibble in all repetitions. The remaining
+        // length and CRC tones still distinguish the legal header codewords.
+        for rep in 0..4 {
+            let start = (SYNC.len() + rep * 8 + 3) * SYMBOL_SAMPLES;
+            audio[start..start + SYMBOL_SAMPLES].fill(0.0);
+        }
+        assert_eq!(c.receive(&audio).unwrap(), sent);
+    }
+
+    #[test]
+    fn joint_header_decodes_every_capacity_and_rejects_missing_evidence() {
+        for len in 0..=MAX_PAYLOAD {
+            let header = make_header(len);
+            let mut energy = vec![[0.0; 16]; HEADER_SYMBOLS];
+            for rep in 0..4 {
+                for (byte, value) in header.iter().enumerate() {
+                    energy[rep * 8 + byte * 2][usize::from(value >> 4)] = 1.0;
+                    energy[rep * 8 + byte * 2 + 1][usize::from(value & 15)] = 1.0;
+                }
+            }
+            assert_eq!(decode_header(&energy, 0, 1), Some(header));
+            // The known version alone must not manufacture a trusted length.
+            for rep in 0..4 {
+                energy[rep * 8 + 2..rep * 8 + 8].fill([1.0; 16]);
+            }
+            assert_eq!(decode_header(&energy, 0, 1), None);
+        }
+        assert_eq!(decode_header(&[[0.0; 16]; HEADER_SYMBOLS], 0, 1), None);
+    }
+
+    #[test]
+    fn payload_crc_binds_length_even_when_padding_is_zero() {
+        let c = Candidate::new();
+        let mut audio = c.encode(b"test").unwrap();
+        let forged = make_header(5);
+        for rep in 0..4 {
+            for (byte, value) in forged.iter().enumerate() {
+                for (nibble, tone) in [value >> 4, value & 15].into_iter().enumerate() {
+                    let start = (SYNC.len() + rep * 8 + byte * 2 + nibble) * SYMBOL_SAMPLES;
+                    for (sample, tone) in audio[start..start + SYMBOL_SAMPLES]
+                        .iter_mut()
+                        .zip(&c.oscillators[usize::from(tone)])
+                    {
+                        *sample = tone.re;
+                    }
+                }
+            }
+        }
+        assert_eq!(c.receive(&audio), Err(CandidateError::Payload));
+    }
+
+    #[test]
     fn rejects_payload_corruption_and_nonfinite_audio() {
         let c = Candidate::new();
         let mut audio = c.encode(b"crc regression").unwrap();
@@ -228,7 +284,7 @@ impl Candidate {
         }
         let mut bytes = [0u8; MAX_PAYLOAD + 4];
         bytes[..payload.len()].copy_from_slice(payload);
-        let checksum = CRC32.checksum(&bytes[..MAX_PAYLOAD]).to_be_bytes();
+        let checksum = CRC32.checksum(payload).to_be_bytes();
         bytes[MAX_PAYLOAD..].copy_from_slice(&checksum);
         let mut info = vec![0; NrLdpc::INFO_LEN];
         for (i, b) in bytes.iter().enumerate() {
@@ -336,28 +392,9 @@ impl Candidate {
             if base + (HEADER_SYMBOLS - 1) * stride >= energy.len() {
                 continue;
             }
-            let mut header = [0u8; 4];
-            for nibble in 0..8 {
-                let mut combined = [0.0; 16];
-                for rep in 0..4 {
-                    for (dst, e) in combined
-                        .iter_mut()
-                        .zip(energy[base + (rep * 8 + nibble) * stride])
-                    {
-                        *dst += e;
-                    }
-                }
-                let tone = combined
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.total_cmp(b.1))
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                header[nibble / 2] |= (tone as u8) << (if nibble % 2 == 0 { 4 } else { 0 });
-            }
-            if !valid_header(&header) {
+            let Some(header) = decode_header(&energy, base, stride) else {
                 continue;
-            }
+            };
             error = CandidateError::Payload;
             let base = base + HEADER_SYMBOLS * stride;
             if base + (E / 4 - 1) * stride >= energy.len() {
@@ -392,7 +429,11 @@ impl Candidate {
                 .chunks_exact(8)
                 .map(|bits| bits.iter().fold(0, |acc, b| (acc << 1) | b))
                 .collect();
-            if CRC32.checksum(&bytes[..MAX_PAYLOAD]).to_be_bytes() != bytes[MAX_PAYLOAD..] {
+            if CRC32
+                .checksum(&bytes[..usize::from(header[1])])
+                .to_be_bytes()
+                != bytes[MAX_PAYLOAD..]
+            {
                 continue;
             }
             if bytes[usize::from(header[1])..MAX_PAYLOAD]
@@ -416,4 +457,58 @@ fn valid_header(header: &[u8; 4]) -> bool {
     header[0] == 2
         && usize::from(header[1]) <= MAX_PAYLOAD
         && CRC16.checksum(&header[..2]).to_be_bytes() == header[2..]
+}
+
+// Decode the repeated header as a short code over its legal length/CRC
+// combinations. Independent hard nibble decisions throw away CRC redundancy
+// before checking it, so one faded nibble can discard an otherwise good frame.
+// The version is still checked independently; this candidate does not negotiate
+// an air version. Payload FEC, CRC32 and zero padding remain mandatory.
+fn decode_header(energy: &[[f32; 16]], base: usize, stride: usize) -> Option<[u8; 4]> {
+    let mut combined = [[0.0f32; 16]; 8];
+    for (nibble, row) in combined.iter_mut().enumerate() {
+        for rep in 0..4 {
+            let observation = energy[base + (rep * 8 + nibble) * stride];
+            let total = observation.iter().sum::<f32>().max(1e-20);
+            for (dst, e) in row.iter_mut().zip(observation) {
+                *dst += e / total;
+            }
+        }
+    }
+    for (nibble, expected) in [0usize, 2].into_iter().enumerate() {
+        let row = combined[nibble];
+        if row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?.0 != expected {
+            return None;
+        }
+    }
+    let mut best = None;
+    let mut best_score = 0.0f32;
+    let mut runner_up = 0.0f32;
+    for len in 0..=MAX_PAYLOAD {
+        let header = make_header(len);
+        let score = header
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(byte, value)| {
+                combined[byte * 2][usize::from(value >> 4)]
+                    + combined[byte * 2 + 1][usize::from(value & 15)]
+            })
+            .sum::<f32>()
+            / 24.0;
+        if score > best_score {
+            runner_up = best_score;
+            best_score = score;
+            best = Some(header);
+        } else {
+            runner_up = runner_up.max(score);
+        }
+    }
+    // Require positive header evidence, rather than turning noise or a tie
+    // into a valid header merely because every enumerated codeword has a CRC.
+    if best_score > 0.16 && best_score > runner_up {
+        best.filter(valid_header)
+    } else {
+        None
+    }
 }
