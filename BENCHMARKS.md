@@ -5743,8 +5743,6 @@ recommendations and transmitted samples match the paired baseline, so no second
 candidate run is claimed after withdrawal. Further receiver redesign needs a new
 evidence-backed plan; no thresholds or controller parameters were relaxed here.
 
-<<<<<<< HEAD
-
 ## COP-168 PHY HARQ schedule
 
 This is a simulated PHY comparison, not an on-air throughput result. COP-184
@@ -5839,7 +5837,7 @@ plan, used different seeds and operating points. This larger paired diagnostic
 replaces that probe for the shipped schedule. The level-3 AWGN 3 dB regression
 guard uses 40 deterministic trials and passes in release mode with the shipped
 RV3 first retry. It is release-only because the debug run exceeded 150 s.
-=======
+
 ## COP-187 experimental header repair
 
 This is a development measurement of the COP-169 16-FSK candidate, not a
@@ -5935,4 +5933,3 @@ CFO tolerance, continuous acquisition, production v2 framing or session recovery
 Unit tests separately cover clean SSB filtering with its FIR tail flushed and
 one seeded -6 dB AWGN capture at 0 and +/-150 Hz. They do not establish a filtered
 FER curve or a noisy SSB compatibility envelope.
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
