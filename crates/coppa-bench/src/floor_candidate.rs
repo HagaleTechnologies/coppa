@@ -71,6 +71,62 @@ mod tests {
     }
 
     #[test]
+    fn header_length_erasure_recovers_from_crc_redundancy() {
+        let c = Candidate::new();
+        let sent = b"header fade regression!";
+        let mut audio = c.encode(sent).unwrap();
+        // Erase the length's low nibble in all repetitions. The remaining
+        // length and CRC tones still distinguish the legal header codewords.
+        for rep in 0..4 {
+            let start = (SYNC.len() + rep * 8 + 3) * SYMBOL_SAMPLES;
+            audio[start..start + SYMBOL_SAMPLES].fill(0.0);
+        }
+        assert_eq!(c.receive(&audio).unwrap(), sent);
+    }
+
+    #[test]
+    fn joint_header_decodes_every_capacity_and_rejects_missing_evidence() {
+        for len in 0..=MAX_PAYLOAD {
+            let header = make_header(len);
+            let mut energy = vec![[0.0; 16]; HEADER_SYMBOLS];
+            for rep in 0..4 {
+                for (byte, value) in header.iter().enumerate() {
+                    energy[rep * 8 + byte * 2][usize::from(value >> 4)] = 1.0;
+                    energy[rep * 8 + byte * 2 + 1][usize::from(value & 15)] = 1.0;
+                }
+            }
+            assert_eq!(decode_header(&energy, 0, 1), Some(header));
+            // The known version alone must not manufacture a trusted length.
+            for rep in 0..4 {
+                energy[rep * 8 + 2..rep * 8 + 8].fill([1.0; 16]);
+            }
+            assert_eq!(decode_header(&energy, 0, 1), None);
+        }
+        assert_eq!(decode_header(&[[0.0; 16]; HEADER_SYMBOLS], 0, 1), None);
+    }
+
+    #[test]
+    fn payload_crc_binds_length_even_when_padding_is_zero() {
+        let c = Candidate::new();
+        let mut audio = c.encode(b"test").unwrap();
+        let forged = make_header(5);
+        for rep in 0..4 {
+            for (byte, value) in forged.iter().enumerate() {
+                for (nibble, tone) in [value >> 4, value & 15].into_iter().enumerate() {
+                    let start = (SYNC.len() + rep * 8 + byte * 2 + nibble) * SYMBOL_SAMPLES;
+                    for (sample, tone) in audio[start..start + SYMBOL_SAMPLES]
+                        .iter_mut()
+                        .zip(&c.oscillators[usize::from(tone) + CFO_BINS])
+                    {
+                        *sample = tone.re;
+                    }
+                }
+            }
+        }
+        assert_eq!(c.receive(&audio), Err(CandidateError::Payload));
+    }
+
+    #[test]
     fn rejects_payload_corruption_and_nonfinite_audio() {
         let c = Candidate::new();
         let mut audio = c.encode(b"crc regression").unwrap();
@@ -85,15 +141,42 @@ mod tests {
     }
 
     #[test]
-    fn cfo_characterization_never_delivers_wrong_bytes() {
+    fn acquires_integer_tone_cfo_without_timing_or_frequency_oracle() {
         let c = Candidate::new();
-        let payload = b"CFO characterization";
-        let audio = c.encode(payload).unwrap();
-        for cfo in [-150.0, 150.0] {
+        let payload: Vec<_> = (0..MAX_PAYLOAD as u8).collect();
+        let audio = c.encode(&payload).unwrap();
+        for cfo in [-150.0, -100.0, -50.0, 0.0, 50.0, 100.0, 150.0] {
             let shifted = coppa_channel::frequency_shift(&audio, cfo, SAMPLE_RATE as f32);
-            if let Ok(got) = c.receive(&shifted) {
-                assert_eq!(got, payload);
-            }
+            let mut capture = vec![0.0; 1907];
+            capture.extend(shifted);
+            capture.extend(vec![0.0; SYMBOL_SAMPLES]);
+            assert_eq!(c.receive(&capture), Ok(payload.clone()), "CFO {cfo}");
+        }
+    }
+
+    #[test]
+    fn cfo_acquisition_preserves_payload_checks_and_handles_ssb() {
+        let c = Candidate::new();
+        let payload = b"CFO integrity regression";
+        let audio = c.encode(payload).unwrap();
+        for cfo in [-150.0, 0.0, 150.0] {
+            let shifted = coppa_channel::frequency_shift(&audio, cfo, SAMPLE_RATE as f32);
+            // Flush the FIR delay rather than dropping the last payload symbol.
+            let mut padded = shifted.clone();
+            padded.resize(padded.len() + SYMBOL_SAMPLES, 0.0);
+            let filtered = coppa_channel::ssb_filter(&padded, SAMPLE_RATE as f32);
+            assert_eq!(c.receive(&filtered), Ok(payload.to_vec()), "SSB CFO {cfo}");
+            let noisy = coppa_channel::awgn_ref_seeded(
+                &shifted,
+                -6.0,
+                coppa_channel::mean_power(&audio),
+                SAMPLE_RATE as f32,
+                0x00C0FFEE,
+            );
+            assert_eq!(c.receive(&noisy), Ok(payload.to_vec()), "AWGN CFO {cfo}");
+            let mut corrupt = shifted;
+            corrupt[(SYNC.len() + HEADER_SYMBOLS) * SYMBOL_SAMPLES..].fill(0.0);
+            assert!(c.receive(&corrupt).is_err(), "corrupt CFO {cfo}");
         }
     }
 
@@ -133,6 +216,10 @@ pub const MAX_PAYLOAD: usize = 40;
 const K: usize = 352;
 const E: usize = 1408;
 const HOP: usize = 120;
+// Integer tone offsets cover -150..+150 Hz in 50 Hz steps. This does not
+// claim acquisition at arbitrary offsets between those hypotheses.
+const CFO_BINS: usize = 3;
+const RX_TONES: usize = 16 + 2 * CFO_BINS;
 const SYNC: [usize; 16] = [0, 9, 4, 15, 2, 13, 6, 11, 1, 14, 7, 10, 3, 12, 5, 8];
 const HEADER_SYMBOLS: usize = 32;
 /// Exact fixed airtime, including sync and four header repetitions: 8 seconds.
@@ -196,16 +283,16 @@ impl Default for Candidate {
     }
 }
 impl Candidate {
-    /// Build reusable codec and 600..1350 Hz tone templates.
+    /// Build reusable codec and 450..1500 Hz receive tone templates.
     #[must_use]
     pub fn new() -> Self {
-        let oscillators = (0..16)
+        let oscillators = (0..RX_TONES)
             .map(|tone| {
                 (0..SYMBOL_SAMPLES)
                     .map(|n| {
                         Complex32::from_polar(
                             1.0,
-                            std::f32::consts::TAU * (600 + 50 * tone) as f32 * n as f32
+                            std::f32::consts::TAU * (450 + 50 * tone) as f32 * n as f32
                                 / SAMPLE_RATE as f32,
                         )
                     })
@@ -228,7 +315,7 @@ impl Candidate {
         }
         let mut bytes = [0u8; MAX_PAYLOAD + 4];
         bytes[..payload.len()].copy_from_slice(payload);
-        let checksum = CRC32.checksum(&bytes[..MAX_PAYLOAD]).to_be_bytes();
+        let checksum = CRC32.checksum(payload).to_be_bytes();
         bytes[MAX_PAYLOAD..].copy_from_slice(&checksum);
         let mut info = vec![0; NrLdpc::INFO_LEN];
         for (i, b) in bytes.iter().enumerate() {
@@ -254,18 +341,18 @@ impl Candidate {
         }
         let mut audio = Vec::with_capacity(FRAME_SAMPLES);
         for tone in tones {
-            audio.extend(self.oscillators[tone].iter().map(|z| z.re));
+            audio.extend(self.oscillators[tone + CFO_BINS].iter().map(|z| z.re));
         }
         Ok(audio)
     }
 
-    fn energies(&self, audio: &[f32]) -> Vec<[f32; 16]> {
+    fn energies(&self, audio: &[f32]) -> Vec<[f32; RX_TONES]> {
         // Sliding matched filters evaluate all eight symbol phases. Templates
         // repeat every symbol, so subtract/add updates are exact up to rounding.
         if audio.len() < SYMBOL_SAMPLES {
             return Vec::new();
         }
-        let mut sums = [Complex32::new(0.0, 0.0); 16];
+        let mut sums = [Complex32::new(0.0, 0.0); RX_TONES];
         for (tone, sum) in sums.iter_mut().enumerate() {
             for (n, &x) in audio[..SYMBOL_SAMPLES].iter().enumerate() {
                 *sum += self.oscillators[tone][n] * x;
@@ -289,9 +376,10 @@ impl Candidate {
         out
     }
 
-    /// Search unknown sample alignment, decode at most 16 separated candidates,
+    /// Search unknown sample alignment and seven integer-tone CFO hypotheses,
+    /// decode at most 16 separated timing/frequency candidates,
     /// and deliver only a CRC-validated PDU. No timing or header oracle is used.
-    /// This initial candidate searches zero CFO only.
+    /// Fractional-tone CFO acquisition remains uncharacterized.
     /// # Errors
     /// Reports the deepest receiver stage reached; never delivers unchecked bits.
     pub fn receive(&self, audio: &[f32]) -> Result<Vec<u8>, CandidateError> {
@@ -301,34 +389,35 @@ impl Candidate {
         let energy = self.energies(audio);
         let stride = SYMBOL_SAMPLES / HOP;
         let mut candidates = Vec::new();
-        for start in 0..energy.len().saturating_sub((SYNC.len() - 1) * stride) {
-            let score: f32 = SYNC
-                .iter()
-                .enumerate()
-                .map(|(i, &tone)| {
-                    let row = energy[start + i * stride];
-                    row[tone] / row.iter().sum::<f32>().max(1e-20)
-                })
-                .sum::<f32>()
-                / SYNC.len() as f32;
-            if score > 0.16 {
-                candidates.push((start, score));
+        for offset in 0..=2 * CFO_BINS {
+            for start in 0..energy.len().saturating_sub((SYNC.len() - 1) * stride) {
+                let score: f32 = SYNC
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &tone)| {
+                        let row = &energy[start + i * stride][offset..offset + 16];
+                        row[tone] / row.iter().sum::<f32>().max(1e-20)
+                    })
+                    .sum::<f32>()
+                    / SYNC.len() as f32;
+                if score > 0.16 {
+                    candidates.push((start, offset, score));
+                }
             }
         }
-        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        candidates.sort_by(|a, b| b.2.total_cmp(&a.2));
         let mut tried = Vec::new();
         let mut error = CandidateError::Acquisition;
-        for (start, _) in candidates {
-            if tried
-                .iter()
-                .any(|&old: &usize| old.abs_diff(start) < stride)
-            {
+        for (start, offset, _) in candidates {
+            if tried.iter().any(|&(old, old_offset): &(usize, usize)| {
+                old_offset == offset && old.abs_diff(start) < stride
+            }) {
                 continue;
             }
             if tried.len() == 16 {
                 break;
             }
-            tried.push(start);
+            tried.push((start, offset));
             if error == CandidateError::Acquisition {
                 error = CandidateError::Header;
             }
@@ -336,28 +425,12 @@ impl Candidate {
             if base + (HEADER_SYMBOLS - 1) * stride >= energy.len() {
                 continue;
             }
-            let mut header = [0u8; 4];
-            for nibble in 0..8 {
-                let mut combined = [0.0; 16];
-                for rep in 0..4 {
-                    for (dst, e) in combined
-                        .iter_mut()
-                        .zip(energy[base + (rep * 8 + nibble) * stride])
-                    {
-                        *dst += e;
-                    }
-                }
-                let tone = combined
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.total_cmp(b.1))
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                header[nibble / 2] |= (tone as u8) << (if nibble % 2 == 0 { 4 } else { 0 });
-            }
-            if !valid_header(&header) {
+            let header_energy: Vec<[f32; 16]> = (0..HEADER_SYMBOLS)
+                .map(|i| std::array::from_fn(|tone| energy[base + i * stride][offset + tone]))
+                .collect();
+            let Some(header) = decode_header(&header_energy, 0, 1) else {
                 continue;
-            }
+            };
             error = CandidateError::Payload;
             let base = base + HEADER_SYMBOLS * stride;
             if base + (E / 4 - 1) * stride >= energy.len() {
@@ -365,7 +438,7 @@ impl Candidate {
             }
             let mut soft = vec![0.0; E];
             for symbol in 0..E / 4 {
-                let row = energy[base + symbol * stride];
+                let row = &energy[base + symbol * stride][offset..offset + 16];
                 let scale = row.iter().sum::<f32>().max(1e-20) / 16.0;
                 for bit in 0..4 {
                     let mut zero = 0.0f32;
@@ -392,7 +465,11 @@ impl Candidate {
                 .chunks_exact(8)
                 .map(|bits| bits.iter().fold(0, |acc, b| (acc << 1) | b))
                 .collect();
-            if CRC32.checksum(&bytes[..MAX_PAYLOAD]).to_be_bytes() != bytes[MAX_PAYLOAD..] {
+            if CRC32
+                .checksum(&bytes[..usize::from(header[1])])
+                .to_be_bytes()
+                != bytes[MAX_PAYLOAD..]
+            {
                 continue;
             }
             if bytes[usize::from(header[1])..MAX_PAYLOAD]
@@ -416,4 +493,58 @@ fn valid_header(header: &[u8; 4]) -> bool {
     header[0] == 2
         && usize::from(header[1]) <= MAX_PAYLOAD
         && CRC16.checksum(&header[..2]).to_be_bytes() == header[2..]
+}
+
+// Decode the repeated header as a short code over its legal length/CRC
+// combinations. Independent hard nibble decisions throw away CRC redundancy
+// before checking it, so one faded nibble can discard an otherwise good frame.
+// The version is still checked independently; this candidate does not negotiate
+// an air version. Payload FEC, CRC32 and zero padding remain mandatory.
+fn decode_header(energy: &[[f32; 16]], base: usize, stride: usize) -> Option<[u8; 4]> {
+    let mut combined = [[0.0f32; 16]; 8];
+    for (nibble, row) in combined.iter_mut().enumerate() {
+        for rep in 0..4 {
+            let observation = energy[base + (rep * 8 + nibble) * stride];
+            let total = observation.iter().sum::<f32>().max(1e-20);
+            for (dst, e) in row.iter_mut().zip(observation) {
+                *dst += e / total;
+            }
+        }
+    }
+    for (nibble, expected) in [0usize, 2].into_iter().enumerate() {
+        let row = combined[nibble];
+        if row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?.0 != expected {
+            return None;
+        }
+    }
+    let mut best = None;
+    let mut best_score = 0.0f32;
+    let mut runner_up = 0.0f32;
+    for len in 0..=MAX_PAYLOAD {
+        let header = make_header(len);
+        let score = header
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(byte, value)| {
+                combined[byte * 2][usize::from(value >> 4)]
+                    + combined[byte * 2 + 1][usize::from(value & 15)]
+            })
+            .sum::<f32>()
+            / 24.0;
+        if score > best_score {
+            runner_up = best_score;
+            best_score = score;
+            best = Some(header);
+        } else {
+            runner_up = runner_up.max(score);
+        }
+    }
+    // Require positive header evidence, rather than turning noise or a tie
+    // into a valid header merely because every enumerated codeword has a CRC.
+    if best_score > 0.16 && best_score > runner_up {
+        best.filter(valid_header)
+    } else {
+        None
+    }
 }
