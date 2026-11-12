@@ -77,7 +77,7 @@ fn main() -> anyhow::Result<ExitCode> {
                 coppa_channel::frequency_shift(&clean, args.cfo, SAMPLE_RATE as f32)
             };
             if args.ssb {
-                impaired = coppa_channel::ssb_filter(&impaired, SAMPLE_RATE as f32);
+                impaired = filter_ssb(impaired);
             }
             let mut cable = VirtualCable::new(
                 SAMPLE_RATE as f32,
@@ -148,4 +148,31 @@ fn main() -> anyhow::Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+// Keep the rig filter's delayed samples in the transmitted capture.
+fn filter_ssb(mut audio: Vec<f32>) -> Vec<f32> {
+    // One 960-sample symbol covers the 601-tap FIR's full 600-sample tail.
+    audio.resize(audio.len() + 960, 0.0);
+    coppa_channel::ssb_filter(&audio, SAMPLE_RATE as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssb_transmit_preserves_the_filter_tail() {
+        // An impulse at the frame boundary exposes samples that would be
+        // discarded even if payload FEC happened to hide the truncation.
+        let mut audio = vec![0.0; FRAME_SAMPLES];
+        audio[FRAME_SAMPLES - 1] = 1.0;
+        let filtered = filter_ssb(audio);
+        assert!(filtered.len() >= FRAME_SAMPLES + 600);
+        assert!(filtered[FRAME_SAMPLES..].iter().any(|x| x.abs() > 0.01));
+        let candidate = Candidate::new();
+        let payload = b"SSB sweep tail regression";
+        let filtered = filter_ssb(candidate.encode(payload).unwrap());
+        assert_eq!(candidate.receive(&filtered), Ok(payload.to_vec()));
+    }
 }

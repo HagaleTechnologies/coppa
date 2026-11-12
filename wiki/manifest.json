@@ -22,7 +22,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:5236467cf8a4d75d2289d781a27ee787b302c2ed3a0333c953301e03caf854e5",
+      "hash": "sha256:e1f9af198f5bfa8f12218958f0a458017d7dabea314eae28ba3c61ed1890cb4b",
       "id": "adr-002-fec-strategy",
       "kind": "decision-digest",
       "links": [
@@ -40,8 +40,8 @@
       ],
       "status": "current",
       "title": "Why does coppa use both convolutional and LDPC codes?",
-      "verified_commit": "59b0b63",
-      "verified_date": "2026-07-14",
+      "verified_commit": "d04f6f3",
+      "verified_date": "2026-11-11",
       "visibility": "public"
     },
     {
@@ -112,7 +112,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:7b6a5e05f5aa2c2279ff3eae30b40074533e09efef1bfc7674cd3d0602362cec",
+      "hash": "sha256:26c1e292cdc86363a650f889356e987d96a3a80a952f683b1a832231fd349041",
       "id": "adr-006-phase2-estimation",
       "kind": "decision-digest",
       "links": [
@@ -130,8 +130,8 @@
       ],
       "status": "current",
       "title": "What did Phase 2's channel-estimation work fix, break, and leave open?",
-      "verified_commit": "59b0b63",
-      "verified_date": "2026-07-14",
+      "verified_commit": "d04f6f3",
+      "verified_date": "2026-11-11",
       "visibility": "public"
     },
     {
@@ -352,7 +352,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:db8e1afcdcdccd8158b41349cc0aefc12c8746b1a6203804bef1826e30551c81",
+      "hash": "sha256:4c31453d42593b0ec08787c286d2e3866711275e4c10a7d45912f7932f524bb9",
       "id": "coppa-engine",
       "kind": "subsystem",
       "links": [
@@ -369,8 +369,8 @@
       ],
       "status": "current",
       "title": "How does coppa-engine orchestrate the modem pipeline?",
-      "verified_commit": "56361d6",
-      "verified_date": "2026-10-28",
+      "verified_commit": "d04f6f3",
+      "verified_date": "2026-11-11",
       "visibility": "public"
     },
     {
@@ -535,7 +535,11 @@
       "visibility": "public"
     },
     {
+<<<<<<< HEAD
       "hash": "sha256:5dd9fe901f5ef83757b657ed2e9d8a91dca7f2237bfa31a202fa456e7fb450fd",
+=======
+      "hash": "sha256:82db27f9cb0c1db97b1d7bb9d56b73a683331f765a09e6ea63f7ca752cafa2f9",
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
       "id": "low-rate-floor",
       "kind": "gotcha",
       "links": [
@@ -548,12 +552,22 @@
       "sources": [
         "BENCHMARKS.md",
         "docs/LIMITATIONS.md",
+<<<<<<< HEAD
         "crates/coppa-bench/src/floor_candidate.rs"
       ],
       "status": "current",
       "title": "What has the low-rate floor experiment measured?",
       "verified_commit": "9295659",
       "verified_date": "2026-11-11",
+=======
+        "crates/coppa-bench/src/floor_candidate.rs",
+        "crates/coppa-protocol/src/modem/floor.rs"
+      ],
+      "status": "current",
+      "title": "What has the low-rate floor experiment measured?",
+      "verified_commit": "19948e9f8eb8e8139fb86b9237112cc83ed6095a",
+      "verified_date": "2026-11-12",
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
       "visibility": "public"
     },
     {
@@ -578,7 +592,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:e6fe3f68dd9e109341a1b0f5002a37dc4559d321bacaae625807923fca3c5d0d",
+      "hash": "sha256:13c9ab0863a6b69d115041c381dcaf3fa186860bb96fc50f0695506c8dca6ce3",
       "id": "overview",
       "kind": "overview",
       "links": [],
@@ -592,8 +606,8 @@
       ],
       "status": "current",
       "title": "Coppa \u2014 what is this and where do things live?",
-      "verified_commit": "56361d6",
-      "verified_date": "2026-10-28",
+      "verified_commit": "d04f6f3",
+      "verified_date": "2026-11-11",
       "visibility": "public"
     },
     {

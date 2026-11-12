@@ -237,13 +237,40 @@ mod tests {
     #[test]
     fn cfo_characterization_never_delivers_wrong_bytes() {
         let c = Candidate::new();
-        let payload = b"CFO characterization";
-        let audio = c.encode(payload).unwrap();
-        for cfo in [-150.0, 150.0] {
+        let payload: Vec<_> = (0..MAX_PAYLOAD as u8).collect();
+        let audio = c.encode(&payload).unwrap();
+        for cfo in [-150.0, -100.0, -50.0, 0.0, 50.0, 100.0, 150.0] {
             let shifted = coppa_channel::frequency_shift(&audio, cfo, SAMPLE_RATE as f32);
-            if let Ok(got) = c.receive(&shifted) {
-                assert_eq!(got, payload);
-            }
+            let mut capture = vec![0.0; 1907];
+            capture.extend(shifted);
+            capture.extend(vec![0.0; SYMBOL_SAMPLES]);
+            assert_eq!(c.receive(&capture), Ok(payload.clone()), "CFO {cfo}");
+        }
+    }
+
+    #[test]
+    fn cfo_acquisition_preserves_payload_checks_and_handles_ssb() {
+        let c = Candidate::new();
+        let payload = b"CFO integrity regression";
+        let audio = c.encode(payload).unwrap();
+        for cfo in [-150.0, 0.0, 150.0] {
+            let shifted = coppa_channel::frequency_shift(&audio, cfo, SAMPLE_RATE as f32);
+            // Flush the FIR delay rather than dropping the last payload symbol.
+            let mut padded = shifted.clone();
+            padded.resize(padded.len() + SYMBOL_SAMPLES, 0.0);
+            let filtered = coppa_channel::ssb_filter(&padded, SAMPLE_RATE as f32);
+            assert_eq!(c.receive(&filtered), Ok(payload.to_vec()), "SSB CFO {cfo}");
+            let noisy = coppa_channel::awgn_ref_seeded(
+                &shifted,
+                -6.0,
+                coppa_channel::mean_power(&audio),
+                SAMPLE_RATE as f32,
+                0x00C0FFEE,
+            );
+            assert_eq!(c.receive(&noisy), Ok(payload.to_vec()), "AWGN CFO {cfo}");
+            let mut corrupt = shifted;
+            corrupt[(SYNC.len() + HEADER_SYMBOLS) * SYMBOL_SAMPLES..].fill(0.0);
+            assert!(c.receive(&corrupt).is_err(), "corrupt CFO {cfo}");
         }
     }
 

@@ -8,8 +8,8 @@ sources:
   - crates/coppa-engine/**
   - crates/coppa-protocol/src/**
 verified:
-  commit: 56361d6
-  date: 2026-10-28
+  commit: d04f6f3
+  date: 2026-11-11
 links:
   - overview
   - coppa-protocol
@@ -81,5 +81,5 @@ rather than duplicating squelch/decompression/payload contracts.
 Criterion throughput divides the common 32-byte payload by CPU processing time;
 the ideal clean-loopback frame report divides recovered payload bits by encoded
 audio airtime. These denominators differ, and neither includes session overhead.
-See [Engine processing and ideal frame goodput](../../BENCHMARKS.md#engine-processing-and-ideal-frame-goodput-cop-131)
+See [Engine processing and ideal frame goodput](../../docs/benchmarks/2026-11-04-cop-131-engine-throughput.md#engine-processing-and-ideal-frame-goodput-cop-131)
 for the workload, profile routing, units and reproducible commands.
