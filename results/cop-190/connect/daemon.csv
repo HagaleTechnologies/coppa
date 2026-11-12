@@ -1,0 +1,11 @@
+trial,seed,snr_db,connected,elapsed_s,a_state,b_state,failure_reason
+0,0x16910000,-6,false,60.0,IDLE,IDLE,timeout: A=IDLE B=IDLE established=(false / false)
+1,0x16910001,-6,false,60.0,IDLE,IDLE,timeout: A=IDLE B=IDLE established=(false / false)
+2,0x16910002,-6,false,60.0,IDLE,IDLE,timeout: A=IDLE B=IDLE established=(false / false)
+3,0x16910003,-6,false,60.0,IDLE,IDLE,timeout: A=IDLE B=IDLE established=(false / false)
+4,0x16910004,-6,false,60.0,IDLE,IDLE,timeout: A=IDLE B=IDLE established=(false / false)
+5,0x16910005,-6,false,60.0,IDLE,IDLE,timeout: A=IDLE B=IDLE established=(false / false)
+6,0x16910006,-6,false,60.0,IDLE,IDLE,timeout: A=IDLE B=IDLE established=(false / false)
+7,0x16910007,-6,false,60.0,IDLE,IDLE,timeout: A=IDLE B=IDLE established=(false / false)
+8,0x16910008,-6,false,60.0,IDLE,IDLE,timeout: A=IDLE B=IDLE established=(false / false)
+9,0x16910009,-6,false,60.0,IDLE,IDLE,timeout: A=IDLE B=IDLE established=(false / false)
