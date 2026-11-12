@@ -362,6 +362,7 @@ update.
   and the failures are `SyncFailed`. A session cannot connect at −6 dB or
   hold through a fade to −6 dB. The COP-169 bars (50% FER crossing at or
   below −8 dB AWGN and −2 dB Watterson Poor, connect within 60 s at −6 dB
+<<<<<<< HEAD
   in 9 of 10 trials, survive a 20 → −6 → 20 dB Poor ramp) are unmet. COP-190
   adds the air-protocol version 2 floor waveform to the production crates,
   but no session can send or receive it yet.
@@ -373,6 +374,33 @@ update.
   the production receiver through the new persistent channel. COP-191 adds `--waveform floor` through production batch and continuous
   receivers on one capture per attempt; omitting it preserves the `ofdm:1`
   baseline. See BENCHMARKS, "COP-191 production floor sweeps".
+=======
+  in 9 of 10 trials, survive a 20 → −6 → 20 dB Poor ramp) are unmet.
+- What exists now is the production floor's physical layer: air-protocol
+  version 2 is allocated (SPEC §0.3.3, ADR-014), the 16-FSK modulation
+  lives in `coppa-codec::floor`, the framing plus a separately detected
+  streaming receiver (`FloorFrame`, `FloorStream`) live in
+  `coppa-protocol::modem::floor` (guarded by `air_v2_conformance.rs` and
+  `floor_receive.rs`), and `CoppaCore` constructs the floor receive path
+  next to its OFDM paths (`CoppaCore::floor`, `push_floor_samples`), with
+  the v1 OFDM paths untouched. No session sends or receives on it: the
+  floor-aware Link/daemon session controller (capability negotiation,
+  connect-on-floor, OFDM fallback after two expired response windows, the
+  five-acknowledged-exchange OFDM probe) is unbuilt, the −6 dB connect bar
+  (9 of 10 within 60 s) is unmet. Production development sweeps now
+  cover batch and streaming reception on AWGN and Poor; final-seed
+  production sweeps remain unrecorded. The Poor ramp acceptance,
+  the final-seed 200-trial sweeps and the `--waveform floor`, `connect`
+  and `ramp` drivers belong to COP-191.
+- What exists for judgement is the measurement contract the floor will be
+  judged by: `coppa_bench::floor_sweep` (nine-point −12…+4 dB grid, locked
+  seed bases `0x00C0FFEE`, `0x16900000` and `0x16910000`, conservative
+  `SyncFailed` with diagnostic subcounts, Wilson intervals, the
+  interpolated 50% crossing and the sync-share clause) and the `floor_mode`
+  diagnostic, which measures the production receiver through the new
+  persistent channel. Its only waveform today is the `ofdm:1` baseline; see
+  BENCHMARKS, "COP-169".
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 - `coppa_channel::persistent` is the session channel: one continuous
   Watterson process per direction, carried across calls and turnarounds,
   with noise set from a fixed clean power and an SNR schedule (including the
@@ -380,12 +408,55 @@ update.
   and its streaming Hilbert FIR adds a fixed 511-sample (10.6 ms) latency on
   faded paths. No endpoint (Link or daemon) drives it yet.
 - The 16-FSK design now exists twice: COP-190 moved it into the production
+<<<<<<< HEAD
   crates as `coppa-codec::floor` and `coppa-protocol::modem::floor`
   (air-protocol version 2, ADR-014), while the measurement-only bench copy
   stays frozen for measurement continuity. The production floor has no
   Link or daemon caller yet. Its development Poor sweep fails the
   conservative sync-share clause. See BENCHMARKS, "COP-169
   experimental 16-FSK candidate", for raw results and scope.
+=======
+  crates, while the measurement-only bench copy (`floor_candidate.rs`)
+  retains its historical measurements. The production floor has no
+  Link or daemon caller yet. The design's development Poor sweep, measured
+  on the frozen bench copy, fails the conservative sync-share clause:
+  header sync dominates near the crossing. Production development sweeps
+  also fail sync share, at −12 dB AWGN and −8/−6 dB Poor for both paths.
+  Production 50% crossings are at or below −12 dB AWGN and −9 dB Poor.
+  These ten-trial development points do not establish final acceptance.
+  See BENCHMARKS, "COP-190 production floor development measurements".
+- COP-187 repairs the experimental candidate's independent hard header
+  decisions by jointly decoding legal length/CRC combinations. Paired Poor
+  development runs reduce frame errors from 24/90 to 20/90, but header
+  failures still dominate above the crossing.
+- The `floor_mode sweep` diagnostic accepts `--rx batch|streaming|both` and
+  measures the production batch (`CoppaTransceiver::receive`) and streaming
+  (`StreamingReceiver`) receive paths over the same grid, seeds and channel
+  realizations; `connect` and `ramp` remain unimplemented (COP-191).
+- COP-189's separate continuous experimental receiver
+  (`floor_candidate --streaming`) retains at most 480,000 samples, attempts
+  one window decode per second and tries at most 16 sync candidates per CFO
+  hypothesis, with 13 hypotheses from −150 to +150 Hz in 25 Hz steps, or at
+  most 208 per window; the production `FloorStream` carries the same joint
+  header decode and the same CFO and sync-candidate search bounds. Chunk,
+  corrupt/truncated-header, nonfinite-input and duplicate-delivery
+  regressions pass, and an explicit release test delivers nothing during
+  300 seconds each of seeded white noise, block-filtered SSB noise and
+  1 kHz tone plus noise. These checks are not a production acquisition or
+  FER claim. Batch and chunked regressions recover noiseless frames at CFO
+  −150, −75, +75 and +150 Hz without an offset oracle. This fixed grid does
+  not track intra-frame drift or guarantee reception between grid points.
+  BPSK comparison, fading tracking, session integration and final
+  acceptance measurements remain open.
+- COP-190 allocates the candidate's header version value 2 as production
+  air-protocol version 2 (SPEC §0.3.3, ADR-014), freezing the tone
+  alphabet, header layout, FEC envelope, 40-byte capacity, 8.0 s airtime
+  and receiver search bounds. Frozen v1 formats, host fields and C ABI are
+  unchanged.
+- See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for
+  raw development evidence. No final-seed sweep or production session
+  result is claimed.
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 
 ## COP-178 versioned wire contract
 
