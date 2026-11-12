@@ -535,6 +535,28 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:7b6f89b9188f7f68e1ff6189386f24543de12a8e0cd4d3687b82be70f6f1114a",
+      "id": "low-rate-floor",
+      "kind": "gotcha",
+      "links": [
+        "coppa-protocol",
+        "band-conventions"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/low-rate-floor.md",
+      "sources": [
+        "BENCHMARKS.md",
+        "docs/LIMITATIONS.md",
+        "crates/coppa-bench/src/floor_candidate.rs"
+      ],
+      "status": "current",
+      "title": "What has the low-rate floor experiment measured?",
+      "verified_commit": "9295659",
+      "verified_date": "2026-11-11",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:8fc6a50b80a14c5af822cbd0abc7f759b460044997d49b01e0fe563ec0c3599c",
       "id": "mdns-discovery",
       "kind": "gotcha",
