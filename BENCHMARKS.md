@@ -5803,3 +5803,25 @@ realizations, with one CSV row set and metadata verdict block per path. The
 development CSVs above remain batch-only measurements of the experimental
 candidate; no final-seed `--rx both` sweep has been recorded, and the
 production floor waveform those sweeps must select does not exist yet.
+
+## COP-189 continuous candidate acquisition slice
+
+`floor_candidate --streaming` exercises continuous acquisition of the existing
+experimental 16-FSK candidate. It ingests arbitrary chunks, decodes overlapping
+windows on a one-second cadence, and keeps at most 480,000 audio samples. Each
+window attempts at most 16 separated sync candidates. Decode work is independent
+of caller chunk sizes and stream duration. Tone energies and candidate lists
+remain bounded by the ten-second window; this implementation recomputes them
+for each window rather than claiming an incremental matched-filter receiver.
+Metadata records decode attempts and peak retained samples at chunk boundaries.
+A missing streaming delivery counts conservatively as SyncFailed because this
+adapter does not expose a validated failure-stage trace.
+
+The release regression
+`cargo test --release -p coppa-bench --lib continuous_acquisition_300_seconds_noise -- --ignored`
+passed with zero deliveries for 300 seconds each of seeded white noise,
+SSB-filtered one-second noise blocks and a 1 kHz tone plus noise. Each stream
+attempted 293 decodes and retained at most 480,000 samples. This is synthetic
+noise rejection evidence only. It does not select a production waveform or
+resolve the floor FER, connection or fade-ramp acceptance requirements. No
+final-seed production results are published for this slice.

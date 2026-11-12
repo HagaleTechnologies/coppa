@@ -447,9 +447,15 @@ stall scenario does (`docs/testing/bpq-session.md`).
   realizations. The measured waveform is still only the `ofdm:1` baseline: the
   production floor those sweeps must select is unbuilt, `connect` and `ramp`
   remain unimplemented, and no final-seed sweep has been recorded.
-- The capture adapter bounds retained history but decodes only when asked.
-  It is not a continuous streaming detector. The 300-second noise tests,
-  BPSK challenger, CFO acquisition and production integration remain open.
+- The capture adapter still decodes only when asked. COP-189 adds a separate
+  continuous experimental receiver, available with `floor_candidate --streaming`.
+  It retains at most 480,000 samples, attempts one window decode per second and
+  tries at most 16 sync candidates per window. Chunk, corrupt/truncated header,
+  nonfinite-input and duplicate-delivery regressions pass. An explicit release
+  test delivers nothing during 300 seconds each of seeded white noise,
+  block-filtered SSB noise and 1 kHz tone plus noise. These checks are not a
+  production acquisition or FER claim. BPSK comparison, CFO acquisition,
+  production integration and final acceptance measurements remain open.
 - The candidate's literal header value 2 is experimental, not an allocation of
   production air version 2. Frozen v1 formats, host fields and C ABI are unchanged.
 - See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for raw

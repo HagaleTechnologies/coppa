@@ -28,9 +28,20 @@ discard. A legal header hypothesis alone cannot justify delivery. Preserve the
 version check, evidence threshold, payload CRC and padding checks, and continue
 to count failed headers in SyncFailed.
 
-The Capture adapter bounds history but requires an explicit batch decode. Its
-chunk-partition test does not prove continuous acquisition. The experimental
-header value 2 does not allocate a production air version.
+The Capture adapter bounds history but requires an explicit batch decode.
+COP-189's separate `CandidateStream` decodes overlapping windows once per second
+and suppresses delivery of the same frame from successive windows. The
+`floor_candidate --streaming` diagnostic uses it. A caller must supply trailing
+audio through the next one-second decode interval. Work and retention bounds,
+and the remaining production gap, are in
+[LIMITATIONS](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-not-built-yet).
+The experimental header value 2 does not allocate a production air version.
+
+Run the long noise regression explicitly with
+`cargo test --release -p coppa-bench --lib continuous_acquisition_300_seconds_noise -- --ignored`.
+It covers seeded white noise, independently SSB-filtered one-second noise blocks
+and a 1 kHz tone plus noise. It does not establish RF false-alarm probability
+or a fading FER crossing.
 
 `floor_mode sweep --rx batch|streaming|both` measures the production batch and
 streaming receive paths on the same seeds, but only for the `ofdm:1` baseline

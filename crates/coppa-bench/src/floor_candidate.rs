@@ -7,6 +7,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn continuous_acquisition_crosses_windows_and_delivers_once() {
+        let c = Candidate::new();
+        for chunk_size in [317, 48000, CAPTURE_LIMIT + 13] {
+            let mut audio = vec![0.0; 2 * SAMPLE_RATE + 137];
+            audio.extend(c.encode(b"first").unwrap());
+            audio.extend(vec![0.0; 719]);
+            audio.extend(c.encode(b"second").unwrap());
+            audio.extend(vec![0.0; 2 * SAMPLE_RATE]);
+            let mut rx = CandidateStream::default();
+            let mut got = Vec::new();
+            for chunk in audio.chunks(chunk_size) {
+                got.extend(rx.push(chunk));
+                assert!(rx.retained_samples() <= CAPTURE_LIMIT);
+            }
+            assert_eq!(got, [b"first".to_vec(), b"second".to_vec()]);
+            assert!(rx.decode_attempts() <= (audio.len() / SAMPLE_RATE) as u64);
+        }
+    }
+
+    #[test]
+    fn continuous_acquisition_rejects_nonfinite_and_truncated_frames() {
+        let c = Candidate::new();
+        let audio = c.encode(b"incomplete").unwrap();
+        let mut rx = CandidateStream::default();
+        assert!(rx.push(&audio[..audio.len() - SYMBOL_SAMPLES]).is_empty());
+        assert!(rx.push(&[f32::NAN, f32::INFINITY]).is_empty());
+        assert_eq!(rx.retained_samples(), 0);
+        assert!(rx.push(&vec![0.0; 2 * CAPTURE_LIMIT]).is_empty());
+        assert!(rx.retained_samples() <= CAPTURE_LIMIT);
+        let mut corrupt = c.encode(b"bad header").unwrap();
+        corrupt[SYNC.len() * SYMBOL_SAMPLES..(SYNC.len() + HEADER_SYMBOLS) * SYMBOL_SAMPLES]
+            .fill(0.0);
+        assert!(rx.push(&corrupt).is_empty());
+        assert!(rx.push(&vec![0.0; SAMPLE_RATE]).is_empty());
+        let mut good = c.encode(b"recovered").unwrap();
+        good.extend(vec![0.0; SAMPLE_RATE]);
+        assert_eq!(rx.push(&good), [b"recovered".to_vec()]);
+    }
+
+    // Long scientific check, run explicitly in release mode.
+    #[test]
+    #[ignore = "300 seconds each of three noise inputs"]
+    fn continuous_acquisition_300_seconds_noise() {
+        for kind in 0..3 {
+            let mut rx = CandidateStream::default();
+            for second in 0..300 {
+                let mut noise = coppa_channel::awgn_ref_seeded(
+                    &vec![0.0; SAMPLE_RATE],
+                    -6.0,
+                    0.5,
+                    SAMPLE_RATE as f32,
+                    0x00C0FFEE + second,
+                );
+                if kind == 1 {
+                    noise = coppa_channel::ssb_filter(&noise, SAMPLE_RATE as f32);
+                } else if kind == 2 {
+                    for (n, x) in noise.iter_mut().enumerate() {
+                        *x +=
+                            (std::f32::consts::TAU * 1000.0 * n as f32 / SAMPLE_RATE as f32).cos();
+                    }
+                }
+                assert!(rx.push(&noise).is_empty(), "kind={kind}, second={second}");
+                assert!(rx.retained_samples() <= CAPTURE_LIMIT);
+                assert!(rx.decode_attempts() <= second + 1);
+            }
+            assert_eq!(rx.decode_attempts(), 293);
+        }
+    }
+
+    #[test]
     fn carries_connect_and_enforces_capacity_and_airtime() {
         use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu};
         use coppa_protocol::session::LinkCapabilities;
@@ -240,6 +310,71 @@ impl Capture {
     }
 }
 
+/// Continuous experimental receiver. Decode one overlapping window per second,
+/// independently of caller chunking. Retain at most ten seconds of audio and
+/// try at most 16 separated sync candidates per window. This intentionally
+/// reuses the batch zero-CFO decoder; it is not a selected production waveform.
+#[derive(Debug, Default)]
+pub struct CandidateStream {
+    candidate: Candidate,
+    audio: Vec<f32>,
+    pending: usize,
+    consumed: u64,
+    delivered_until: u64,
+    attempts: u64,
+}
+impl CandidateStream {
+    /// Append arbitrary audio chunks and return CRC-validated frames once each.
+    /// Nonfinite input breaks acquisition history, including partial frames.
+    pub fn push(&mut self, chunk: &[f32]) -> Vec<Vec<u8>> {
+        let mut delivered = Vec::new();
+        // Incremental ingestion also bounds memory for oversized caller chunks.
+        for &sample in chunk {
+            self.consumed += 1;
+            if !sample.is_finite() {
+                self.audio.clear();
+                self.pending = 0;
+                continue;
+            }
+            self.audio.push(sample);
+            self.pending += 1;
+            if self.pending < SAMPLE_RATE {
+                continue;
+            }
+            self.pending = 0;
+            if self.audio.len() >= FRAME_SAMPLES {
+                self.attempts += 1;
+                let origin = self.consumed - self.audio.len() as u64;
+                // Allow one symbol of timing uncertainty between adjacent frames.
+                let min_start = self
+                    .delivered_until
+                    .saturating_sub(SYMBOL_SAMPLES as u64)
+                    .saturating_sub(origin) as usize;
+                if let Ok((payload, end)) = self.candidate.receive_after(&self.audio, min_start) {
+                    self.delivered_until = origin + end as u64;
+                    delivered.push(payload);
+                }
+            }
+            // Leave space for the next one-second block without exceeding the cap.
+            let excess = self.audio.len().saturating_sub(CAPTURE_LIMIT - SAMPLE_RATE);
+            self.audio.drain(..excess);
+        }
+        delivered
+    }
+
+    /// Samples currently retained, bounded independently of stream duration.
+    #[must_use]
+    pub fn retained_samples(&self) -> usize {
+        self.audio.len()
+    }
+
+    /// Window decodes attempted, at most one per second of finite input.
+    #[must_use]
+    pub fn decode_attempts(&self) -> u64 {
+        self.attempts
+    }
+}
+
 /// Measurement-only candidate, with cached NR BG2 codec and tone templates.
 #[derive(Debug)]
 pub struct Candidate {
@@ -351,6 +486,14 @@ impl Candidate {
     /// # Errors
     /// Reports the deepest receiver stage reached; never delivers unchecked bits.
     pub fn receive(&self, audio: &[f32]) -> Result<Vec<u8>, CandidateError> {
+        self.receive_after(audio, 0).map(|(payload, _)| payload)
+    }
+
+    fn receive_after(
+        &self,
+        audio: &[f32],
+        min_start: usize,
+    ) -> Result<(Vec<u8>, usize), CandidateError> {
         if audio.len() > CAPTURE_LIMIT || audio.iter().any(|x| !x.is_finite()) {
             return Err(CandidateError::Acquisition);
         }
@@ -358,6 +501,9 @@ impl Candidate {
         let stride = SYMBOL_SAMPLES / HOP;
         let mut candidates = Vec::new();
         for start in 0..energy.len().saturating_sub((SYNC.len() - 1) * stride) {
+            if start * HOP < min_start {
+                continue;
+            }
             let score: f32 = SYNC
                 .iter()
                 .enumerate()
@@ -442,7 +588,10 @@ impl Candidate {
             {
                 continue;
             }
-            return Ok(bytes[..usize::from(header[1])].to_vec());
+            return Ok((
+                bytes[..usize::from(header[1])].to_vec(),
+                start * HOP + FRAME_SAMPLES,
+            ));
         }
         Err(error)
     }
