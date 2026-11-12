@@ -16,3 +16,10 @@ bar_db=-8
 sync_share_violations=[4.0]
 wrong_payloads=0
 passes=false
+<<<<<<< HEAD
+=======
+acceptance_run=false
+final_sweep_seed_base=0x16900000
+final_session_seed_base=0x16910000
+session_ramp=SnrProfile { points: [(0.0, 20.0), (20.0, 20.0), (50.0, -6.0), (80.0, -6.0), (110.0, 20.0), (170.0, 20.0)] } (170 s)
+>>>>>>> f28564c475ccc00e6c4ea047a3a598ec94c23329
