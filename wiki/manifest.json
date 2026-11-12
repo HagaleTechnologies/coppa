@@ -535,7 +535,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:5dd9fe901f5ef83757b657ed2e9d8a91dca7f2237bfa31a202fa456e7fb450fd",
+      "hash": "sha256:9f031a9234de7249902ccafa8906dd701434c677590686671e27f36cacee8f3b",
       "id": "low-rate-floor",
       "kind": "gotcha",
       "links": [
@@ -548,12 +548,13 @@
       "sources": [
         "BENCHMARKS.md",
         "docs/LIMITATIONS.md",
-        "crates/coppa-bench/src/floor_candidate.rs"
+        "crates/coppa-bench/src/floor_candidate.rs",
+        "crates/coppa-protocol/src/modem/floor.rs"
       ],
       "status": "current",
       "title": "What has the low-rate floor experiment measured?",
-      "verified_commit": "9295659",
-      "verified_date": "2026-11-11",
+      "verified_commit": "19948e9f8eb8e8139fb86b9237112cc83ed6095a",
+      "verified_date": "2026-11-12",
       "visibility": "public"
     },
     {
@@ -591,7 +592,7 @@
         "CLAUDE.md"
       ],
       "status": "current",
-      "title": "Coppa \u2014 what is this and where do things live?",
+      "title": "Coppa — what is this and where do things live?",
       "verified_commit": "56361d6",
       "verified_date": "2026-10-28",
       "visibility": "public"

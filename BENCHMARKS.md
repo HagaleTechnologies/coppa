@@ -16,7 +16,9 @@ Raw per-point data is regenerable into `results/awgn.csv` (gitignored).
 ## COP-169: floor-mode measurement contract and the `ofdm:1` baseline
 
 Measured 2026-11-11 on x86_64 Linux, release build, with the new
-`floor_mode` diagnostic. There is no production floor waveform yet; these rows are the
+`floor_mode` diagnostic. The production floor waveform now exists (COP-190:
+`coppa-codec::floor` and `coppa-protocol::modem::floor`, air-protocol
+version 2) but has no measured rows here yet; these rows remain the
 `hf_narrow` level-1 frame (56-byte payload, 6.93 s airtime) that the floor
 has to beat, measured the way the floor will be judged:
 
