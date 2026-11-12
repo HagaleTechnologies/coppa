@@ -450,12 +450,17 @@ stall scenario does (`docs/testing/bpq-session.md`).
 - The capture adapter still decodes only when asked. COP-189 adds a separate
   continuous experimental receiver, available with `floor_candidate --streaming`.
   It retains at most 480,000 samples, attempts one window decode per second and
-  tries at most 16 sync candidates per window. Chunk, corrupt/truncated header,
+  tries at most 16 sync candidates per CFO hypothesis, with 13 hypotheses
+  from -150 to +150 Hz in 25 Hz steps, or at most 208 per window.
+  Chunk, corrupt/truncated header,
   nonfinite-input and duplicate-delivery regressions pass. An explicit release
   test delivers nothing during 300 seconds each of seeded white noise,
   block-filtered SSB noise and 1 kHz tone plus noise. These checks are not a
-  production acquisition or FER claim. BPSK comparison, CFO acquisition,
-  production integration and final acceptance measurements remain open.
+  production acquisition or FER claim. Batch and chunked regressions recover
+  noiseless frames at CFO -150, -75, +75 and +150 Hz without an offset oracle.
+  This fixed grid does not track intra-frame drift or guarantee reception
+  between grid points. BPSK comparison, fading tracking, production integration
+  and final acceptance measurements remain open.
 - The candidate's literal header value 2 is experimental, not an allocation of
   production air version 2. Frozen v1 formats, host fields and C ABI are unchanged.
 - See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for raw

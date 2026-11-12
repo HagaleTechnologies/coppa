@@ -47,3 +47,12 @@ or a fading FER crossing.
 streaming receive paths on the same seeds, but only for the `ofdm:1` baseline
 until a floor waveform is selected. `connect` and `ramp` need the production
 floor session and do not exist yet.
+
+
+CFO search in the experimental batch and continuous receiver uses thirteen
+hypotheses from -150 to +150 Hz in 25 Hz steps. Its matched-filter recurrence
+must use separate incoming and outgoing phases: half-bin templates repeat every
+two symbols. Reusing the old one-symbol recurrence breaks the +/-75 Hz cases.
+The bound is now sixteen sync candidates per hypothesis, or 208 per window.
+See [the regression and remaining work](../../BENCHMARKS.md#cop-189-cfo-acquisition-repair).
+This search does not supply production framing, negotiation or fading tracking.

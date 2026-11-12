@@ -186,7 +186,7 @@ mod tests {
                     let start = (SYNC.len() + rep * 8 + byte * 2 + nibble) * SYMBOL_SAMPLES;
                     for (sample, tone) in audio[start..start + SYMBOL_SAMPLES]
                         .iter_mut()
-                        .zip(&c.oscillators[usize::from(tone)])
+                        .zip(&c.oscillators[6 + 2 * usize::from(tone)][..SYMBOL_SAMPLES])
                     {
                         *sample = tone.re;
                     }
@@ -208,6 +208,30 @@ mod tests {
             c.receive(&vec![0.0; CAPTURE_LIMIT + 1]),
             Err(CandidateError::Acquisition)
         );
+    }
+
+    #[test]
+    fn cfo_search_decodes_unknown_offset_in_batch_and_chunks() {
+        let candidate = Candidate::new();
+        let payload = b"CFO acquisition regression";
+        let clean = candidate.encode(payload).unwrap();
+        for cfo in [-150.0, -75.0, 75.0, 150.0] {
+            let mut audio = vec![0.0; 137];
+            audio.extend(coppa_channel::frequency_shift(
+                &clean,
+                cfo,
+                SAMPLE_RATE as f32,
+            ));
+            assert_eq!(candidate.receive(&audio), Ok(payload.to_vec()), "CFO {cfo}");
+            audio.extend(vec![0.0; SAMPLE_RATE]);
+            let mut receiver = CandidateStream::default();
+            let mut delivered = Vec::new();
+            for chunk in audio.chunks(317) {
+                delivered.extend(receiver.push(chunk));
+                assert!(receiver.retained_samples() <= CAPTURE_LIMIT);
+            }
+            assert_eq!(delivered, [payload.to_vec()], "stream CFO {cfo}");
+        }
     }
 
     #[test]
@@ -259,6 +283,10 @@ pub const MAX_PAYLOAD: usize = 40;
 const K: usize = 352;
 const E: usize = 1408;
 const HOP: usize = 120;
+// 450..1500 Hz in 25 Hz steps covers all 16 tones at every CFO hypothesis.
+const SEARCH_BINS: usize = 43;
+const TEMPLATE_SAMPLES: usize = 2 * SYMBOL_SAMPLES;
+const CFO_HYPOTHESES: [usize; 13] = [6, 5, 7, 4, 8, 3, 9, 2, 10, 1, 11, 0, 12];
 const SYNC: [usize; 16] = [0, 9, 4, 15, 2, 13, 6, 11, 1, 14, 7, 10, 3, 12, 5, 8];
 const HEADER_SYMBOLS: usize = 32;
 /// Exact fixed airtime, including sync and four header repetitions: 8 seconds.
@@ -312,8 +340,8 @@ impl Capture {
 
 /// Continuous experimental receiver. Decode one overlapping window per second,
 /// independently of caller chunking. Retain at most ten seconds of audio and
-/// try at most 16 separated sync candidates per window. This intentionally
-/// reuses the batch zero-CFO decoder; it is not a selected production waveform.
+/// try at most 16 separated sync candidates per CFO hypothesis, with 13 hypotheses
+/// spanning -150..150 Hz in 25 Hz steps. It is not a selected production waveform.
 #[derive(Debug, Default)]
 pub struct CandidateStream {
     candidate: Candidate,
@@ -387,16 +415,16 @@ impl Default for Candidate {
     }
 }
 impl Candidate {
-    /// Build reusable codec and 600..1350 Hz tone templates.
+    /// Build reusable codec and 450..1500 Hz search templates in 25 Hz steps.
     #[must_use]
     pub fn new() -> Self {
-        let oscillators = (0..16)
+        let oscillators = (0..SEARCH_BINS)
             .map(|tone| {
-                (0..SYMBOL_SAMPLES)
+                (0..TEMPLATE_SAMPLES)
                     .map(|n| {
                         Complex32::from_polar(
                             1.0,
-                            std::f32::consts::TAU * (600 + 50 * tone) as f32 * n as f32
+                            std::f32::consts::TAU * (450 + 25 * tone) as f32 * n as f32
                                 / SAMPLE_RATE as f32,
                         )
                     })
@@ -445,18 +473,22 @@ impl Candidate {
         }
         let mut audio = Vec::with_capacity(FRAME_SAMPLES);
         for tone in tones {
-            audio.extend(self.oscillators[tone].iter().map(|z| z.re));
+            audio.extend(
+                self.oscillators[6 + 2 * tone][..SYMBOL_SAMPLES]
+                    .iter()
+                    .map(|z| z.re),
+            );
         }
         Ok(audio)
     }
 
-    fn energies(&self, audio: &[f32]) -> Vec<[f32; 16]> {
-        // Sliding matched filters evaluate all eight symbol phases. Templates
-        // repeat every symbol, so subtract/add updates are exact up to rounding.
+    fn energies(&self, audio: &[f32]) -> Vec<[f32; SEARCH_BINS]> {
+        // Sliding matched filters evaluate all eight symbol phases. The 25 Hz
+        // search grid repeats every two symbols, including half-bin offsets.
         if audio.len() < SYMBOL_SAMPLES {
             return Vec::new();
         }
-        let mut sums = [Complex32::new(0.0, 0.0); 16];
+        let mut sums = [Complex32::new(0.0, 0.0); SEARCH_BINS];
         for (tone, sum) in sums.iter_mut().enumerate() {
             for (n, &x) in audio[..SYMBOL_SAMPLES].iter().enumerate() {
                 *sum += self.oscillators[tone][n] * x;
@@ -471,8 +503,9 @@ impl Candidate {
             }
             for (tone, sum) in sums.iter_mut().enumerate() {
                 for n in start..start + HOP {
-                    *sum += self.oscillators[tone][n % SYMBOL_SAMPLES]
-                        * (audio[n + SYMBOL_SAMPLES] - audio[n]);
+                    *sum += self.oscillators[tone][(n + SYMBOL_SAMPLES) % TEMPLATE_SAMPLES]
+                        * audio[n + SYMBOL_SAMPLES]
+                        - self.oscillators[tone][n % TEMPLATE_SAMPLES] * audio[n];
                 }
             }
             start += HOP;
@@ -480,9 +513,11 @@ impl Candidate {
         out
     }
 
-    /// Search unknown sample alignment, decode at most 16 separated candidates,
+    /// Search unknown sample alignment and 13 CFO hypotheses, trying at most 16
+    /// separated candidates per hypothesis,
     /// and deliver only a CRC-validated PDU. No timing or header oracle is used.
-    /// This initial candidate searches zero CFO only.
+    /// The fixed search grid is -150..150 Hz in 25 Hz steps. It is not tracking
+    /// intra-frame drift or guaranteeing reception between grid points.
     /// # Errors
     /// Reports the deepest receiver stage reached; never delivers unchecked bits.
     pub fn receive(&self, audio: &[f32]) -> Result<Vec<u8>, CandidateError> {
@@ -497,7 +532,32 @@ impl Candidate {
         if audio.len() > CAPTURE_LIMIT || audio.iter().any(|x| !x.is_finite()) {
             return Err(CandidateError::Acquisition);
         }
-        let energy = self.energies(audio);
+        let bank = self.energies(audio);
+        let mut deepest = CandidateError::Acquisition;
+        // Reuse the same matched-filter bank across hypotheses. Only a single
+        // 16-tone energy view is allocated at a time. Zero CFO is tried first.
+        for offset in CFO_HYPOTHESES {
+            let energy: Vec<[f32; 16]> = bank
+                .iter()
+                .map(|row| std::array::from_fn(|tone| row[offset + 2 * tone]))
+                .collect();
+            match self.receive_energies(&energy, min_start) {
+                Ok(frame) => return Ok(frame),
+                Err(CandidateError::Payload) => deepest = CandidateError::Payload,
+                Err(CandidateError::Header) if deepest == CandidateError::Acquisition => {
+                    deepest = CandidateError::Header;
+                }
+                Err(_) => {}
+            }
+        }
+        Err(deepest)
+    }
+
+    fn receive_energies(
+        &self,
+        energy: &[[f32; 16]],
+        min_start: usize,
+    ) -> Result<(Vec<u8>, usize), CandidateError> {
         let stride = SYMBOL_SAMPLES / HOP;
         let mut candidates = Vec::new();
         for start in 0..energy.len().saturating_sub((SYNC.len() - 1) * stride) {
@@ -538,7 +598,7 @@ impl Candidate {
             if base + (HEADER_SYMBOLS - 1) * stride >= energy.len() {
                 continue;
             }
-            let Some(header) = decode_header(&energy, base, stride) else {
+            let Some(header) = decode_header(energy, base, stride) else {
                 continue;
             };
             error = CandidateError::Payload;

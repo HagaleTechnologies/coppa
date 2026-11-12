@@ -5809,7 +5809,8 @@ production floor waveform those sweeps must select does not exist yet.
 `floor_candidate --streaming` exercises continuous acquisition of the existing
 experimental 16-FSK candidate. It ingests arbitrary chunks, decodes overlapping
 windows on a one-second cadence, and keeps at most 480,000 audio samples. Each
-window attempts at most 16 separated sync candidates. Decode work is independent
+window originally attempted at most 16 separated sync candidates at zero CFO.
+The CFO search described below increases that bound. Decode work is independent
 of caller chunk sizes and stream duration. Tone energies and candidate lists
 remain bounded by the ten-second window; this implementation recomputes them
 for each window rather than claiming an incremental matched-filter receiver.
@@ -5825,3 +5826,26 @@ attempted 293 decodes and retained at most 480,000 samples. This is synthetic
 noise rejection evidence only. It does not select a production waveform or
 resolve the floor FER, connection or fade-ramp acceptance requirements. No
 final-seed production results are published for this slice.
+
+
+### COP-189 CFO acquisition repair
+
+The experimental batch and continuous receivers now share a matched-filter bank
+covering 450..1500 Hz in 25 Hz steps. Thirteen views select the sixteen nominal
+tones shifted by -150..+150 Hz. Each view may try sixteen separated candidates,
+so a window attempts at most 208 candidate decodes. Only one sixteen-tone view
+is allocated at a time. Audio retention and the one-second window cadence are
+unchanged. Templates repeat after two symbols, including the half-bin offsets.
+Transmit tones, framing, eight-second airtime and CRC checks are unchanged.
+
+`cargo test --release -p coppa-bench --lib cfo_search_decodes_unknown_offset_in_batch_and_chunks`
+requires exact payload delivery at -150, -75, +75 and +150 Hz, with an unknown
+137-sample prefix, in batch and 317-sample chunks. It failed at -150 Hz before
+the repair. This is a noiseless acquisition regression, not a fading FER curve.
+Diagnostic metadata now records the grid and expanded work bound. Historical
+COP-169 and COP-187 CSVs remain measurements of their original receivers.
+
+The search holds CFO constant over the frame. It does not implement fading
+tracking or prove reception between grid points. The BPSK comparison, production
+selection and integration, session support and final sweep/connect/ramp evidence
+remain unbuilt. No acceptance criterion is declared complete by this repair.
