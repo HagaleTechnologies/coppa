@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<ExitCode> {
                 coppa_channel::frequency_shift(&clean, args.cfo, SAMPLE_RATE as f32)
             };
             if args.ssb {
-                impaired = coppa_channel::ssb_filter(&impaired, SAMPLE_RATE as f32);
+                impaired = filter_ssb(impaired);
             }
             let mut cable = VirtualCable::new(
                 SAMPLE_RATE as f32,
@@ -115,7 +115,7 @@ fn main() -> anyhow::Result<ExitCode> {
     }
     fs::write(args.out_dir.join("sweep.csv"), csv)?;
     fs::write(args.out_dir.join("metadata.txt"), format!(
-        "waveform=experimental-mfsk16\nproduction=false\nacceptance_run=false\nseed_base={}\nseed_derivation=attempt_seed(base,point,trials,trial); persistent derive_seed for direction/noise/fading\ntrials_per_point={}\nchannel={}\ncfo_hz={}\nssb={}\nsample_rate={}\nsymbol_samples=960\ntones=600:50:1350\nsync_symbols=16\nheader_repetitions=4\nheader_bytes=version2,length,crc16-ibm-sdlc-be\npayload=40-byte-zero-padded-pdu,crc32-iso-hdlc-be\nfec=NR-BG2-k352-e1408-rv0-unscrambled\ninterleaver=coded[(wire_bit*31)%1408]\nframe_samples={}\nframe_airtime_s=8\nrx=bounded-batch-zero-cfo-search\nrx_wall_seconds={rx_seconds}\nwall_seconds={}\nverdict={verdict:?}\npasses={}\nclean_room=original implementation using repository primitives; no external source copied\n",
+        "waveform=experimental-mfsk16\nproduction=false\nacceptance_run=false\nseed_base={}\nseed_derivation=attempt_seed(base,point,trials,trial); persistent derive_seed for direction/noise/fading\ntrials_per_point={}\nchannel={}\ncfo_hz={}\nssb={}\nsample_rate={}\nsymbol_samples=960\ntones=600:50:1350\nsync_symbols=16\nheader_repetitions=4\nheader_bytes=version2,length,crc16-ibm-sdlc-be\nheader_decoder=normalized-energy-legal-length-crc-codewords; independent-version-check; score>0.16; unique-winner\npayload=40-byte-zero-padded-pdu,crc32-iso-hdlc-be\npayload_crc_scope=unpadded-pdu\nfec=NR-BG2-k352-e1408-rv0-unscrambled\ninterleaver=coded[(wire_bit*31)%1408]\nframe_samples={}\nframe_airtime_s=8\nrx=bounded-batch-integer-tone-cfo-search\ncfo_search_hz=-150:50:150\nmax_decode_candidates=16\nrx_wall_seconds={rx_seconds}\nwall_seconds={}\nverdict={verdict:?}\npasses={}\nclean_room=original implementation using repository primitives; no external source copied\n",
         args.seed, args.trials, channel.name(), args.cfo, args.ssb, SAMPLE_RATE, FRAME_SAMPLES,
         started.elapsed().as_secs_f64(), verdict.passes()))?;
     Ok(if verdict.passes() {
@@ -123,4 +123,31 @@ fn main() -> anyhow::Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+// Keep the rig filter's delayed samples in the transmitted capture.
+fn filter_ssb(mut audio: Vec<f32>) -> Vec<f32> {
+    // One 960-sample symbol covers the 601-tap FIR's full 600-sample tail.
+    audio.resize(audio.len() + 960, 0.0);
+    coppa_channel::ssb_filter(&audio, SAMPLE_RATE as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssb_transmit_preserves_the_filter_tail() {
+        // An impulse at the frame boundary exposes samples that would be
+        // discarded even if payload FEC happened to hide the truncation.
+        let mut audio = vec![0.0; FRAME_SAMPLES];
+        audio[FRAME_SAMPLES - 1] = 1.0;
+        let filtered = filter_ssb(audio);
+        assert!(filtered.len() >= FRAME_SAMPLES + 600);
+        assert!(filtered[FRAME_SAMPLES..].iter().any(|x| x.abs() > 0.01));
+        let candidate = Candidate::new();
+        let payload = b"SSB sweep tail regression";
+        let filtered = filter_ssb(candidate.encode(payload).unwrap());
+        assert_eq!(candidate.receive(&filtered), Ok(payload.to_vec()));
+    }
 }
