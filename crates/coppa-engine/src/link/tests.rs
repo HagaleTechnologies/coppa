@@ -24,7 +24,11 @@ struct Cable {
 }
 
 impl Cable {
-    fn new(a: LinkConfig, b: LinkConfig) -> Self {
+    fn new(mut a: LinkConfig, mut b: LinkConfig) -> Self {
+        // These frozen framing/count/timer regressions exercise the v1-only contract.
+        // Floor-enabled pairs run through production audio in tests/floor_session.rs.
+        a.robust_floor = false;
+        b.robust_floor = false;
         Self {
             a: Link::new(a).expect("station A config"),
             b: Link::new(b).expect("station B config"),
@@ -651,4 +655,72 @@ fn retries_exhausted_is_reported_after_disconnect_frame_finishes() {
     );
     assert_eq!(c.a.state(), LinkState::Idle);
     assert_eq!(c.a.frames_transmitted(), 6);
+}
+
+#[test]
+fn floor_two_window_fallback() {
+    let mut link = Link::new(LinkConfig::new("N0BBB")).unwrap();
+    let base = Instant::now();
+    link.connect("N0AAA", base).unwrap();
+    let mut out = vec![0.0; 8 * 48_000];
+    link.process(base, &[], &mut out);
+    assert_eq!(link.frames_transmitted(), 1);
+    link.process(base + Duration::from_millis(4999), &[], &mut out);
+    assert_eq!(link.frames_transmitted(), 1);
+    link.process(base + Duration::from_secs(5), &[], &mut out);
+    assert_eq!(link.frames_transmitted(), 2);
+    assert!(matches!(link.phy_mode().0, Some(LinkPhyMode::Ofdm { .. })));
+    link.process(base + Duration::from_millis(9999), &[], &mut out);
+    assert_eq!(link.frames_transmitted(), 2);
+    link.process(base + Duration::from_secs(10), &[], &mut out);
+    assert_eq!(link.frames_transmitted(), 3);
+    assert_eq!(link.phy_mode().0, Some(LinkPhyMode::Floor));
+    link.process(base + Duration::from_millis(28999), &[], &mut out);
+    assert_eq!(link.frames_transmitted(), 3);
+    link.process(base + Duration::from_secs(29), &[], &mut out);
+    assert_eq!(link.frames_transmitted(), 4);
+}
+
+#[test]
+fn floor_rto_covers_configured_turnaround() {
+    let mut config = LinkConfig::new("N0AAA");
+    config.turnaround = Duration::from_secs(5);
+    let mut link = Link::new(config).unwrap();
+    let now = Instant::now();
+    let mut session = link.new_session(Callsign::new("N0BBB").unwrap(), 0, now);
+    session.negotiated = Some(LinkCapabilities {
+        robust_floor: true,
+        ..Default::default()
+    });
+    link.session = Some(session);
+    link.established();
+    assert!(link.arq.as_ref().unwrap().tx.rto() >= Duration::from_secs(29));
+    link.floor.received(LinkPhyMode::Floor);
+    assert!(link.key(
+        QueuedFrame {
+            kind: FrameKind::Data,
+            bytes: vec![0; 21],
+            mode: None
+        },
+        now
+    ));
+    assert!(link.arq.as_ref().unwrap().tx.rto() >= Duration::from_secs(29));
+}
+
+#[test]
+fn floor_keepalive_precedes_configured_timeout() {
+    let mut a = LinkConfig::new("N0AAA");
+    a.keepalive_interval = Duration::from_secs(5);
+    a.session_timeout = Duration::from_secs(30);
+    let mut b = a.clone();
+    b.callsign = "N0BBB".to_owned();
+    // Unlike Cable::new's frozen v1 fixtures, exercise default floor negotiation.
+    let mut c = Cable::new(a.clone(), b.clone());
+    c.a = Link::new(a).unwrap();
+    c.b = Link::new(b).unwrap();
+    c.b.set_listening(true);
+    c.connect();
+    c.run_until(Duration::from_secs(90), |_, _| false);
+    assert_eq!(c.a.state(), LinkState::Connected);
+    assert_eq!(c.b.state(), LinkState::Connected);
 }

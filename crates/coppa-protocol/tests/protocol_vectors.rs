@@ -882,6 +882,7 @@ fn capabilities_are_p23_to_p27() {
         outer_code_rx: false,
         outer_code_req: false,
         app_messages: false,
+        robust_floor: false,
         mcs_index: 5,
     };
     let b = LinkCapabilities {
@@ -894,6 +895,7 @@ fn capabilities_are_p23_to_p27() {
         outer_code_rx: false,
         outer_code_req: false,
         app_messages: false,
+        robust_floor: false,
         mcs_index: 3,
     };
     assert_eq!(
@@ -927,11 +929,11 @@ fn capabilities_are_p23_to_p27() {
         "air protocol v1: split_caps(&bytes_of(\"P27\"))"
     );
 
-    // Reserved flag bits (5–7; bits 2–3 are the outer-code capability of
+    // Reserved flag bits (5 and 7; bits 2–3 are the outer-code capability of
     // §22.1 and bit 4 is COP-121's `app_messages`, §23) and trailing bytes
     // are ignored on read; fewer than 7 bytes is an error.
     let mut lenient = bytes_of("P23");
-    lenient[5] |= 0xE0;
+    lenient[5] |= 0xA0;
     lenient.push(0xAA);
     assert_eq!(
         LinkCapabilities::from_bytes(&lenient).unwrap(),

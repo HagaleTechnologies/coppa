@@ -20,7 +20,8 @@ links:
 
 COP-187's batch header repair reduces experimental candidate errors on paired
 development seeds. COP-190 then moved the measured 16-FSK design into the
-production crates as air-protocol version 2; no session uses it yet. The
+production crates as air-protocol version 2. The library Link now uses it
+for negotiated sessions; the daemon controller remains open. The
 remaining Poor failures on the frozen bench copy still violate the separate
 acquisition bar, despite a favorable FER crossing. See
 [measurements](../../BENCHMARKS.md#cop-187-experimental-header-repair)
@@ -74,3 +75,11 @@ on identical persistent-channel captures. Favorable crossings still fail the
 sync-share clause. See [the production measurements](../../BENCHMARKS.md#cop-190-production-floor-development-measurements)
 for seeds, accounting and remaining acceptance work. Session integration stays
 open; a decoded floor frame does not prove a connection.
+
+The library floor controller reserves streaming delivery time in addition to
+airtime. Keying interrupts capture, so Link breaks floor acquisition history
+at each transmission boundary. Otherwise retained samples from before and
+after transmission can be mistaken for contiguous audio. Probe recovery also
+needs room before idle keepalives. See the
+[session policy](../../docs/SPEC.md#negotiated-low-rate-floor-session-policy)
+and `crates/coppa-engine/tests/floor_session.rs` for deterministic regressions.
