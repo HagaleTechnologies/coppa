@@ -136,9 +136,12 @@ thoughts/
 !/results/cop-190/dev-poor/
 !/results/cop-190/dev-poor/sweep.csv
 !/results/cop-190/dev-poor/metadata.txt
+<<<<<<< HEAD
 # COP-196: committed connect-bar evidence audited by floor_session.rs.
 !/results/cop-190/connect/
 /results/cop-190/connect/**
 !/results/cop-190/connect/link.csv
 !/results/cop-190/connect/daemon.csv
 !/results/cop-190/connect/metadata.md
+=======
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
