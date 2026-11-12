@@ -456,7 +456,11 @@ dependencies = [
 
 [[package]]
 name = "coppa"
+<<<<<<< HEAD
 version = "0.15.0"
+=======
+version = "0.14.0"
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 dependencies = [
  "coppa-audio",
  "coppa-bench",
@@ -473,7 +477,11 @@ dependencies = [
 
 [[package]]
 name = "coppa-audio"
+<<<<<<< HEAD
 version = "0.15.0"
+=======
+version = "0.14.0"
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 dependencies = [
  "anyhow",
  "coppa-dsp",
@@ -486,7 +494,11 @@ dependencies = [
 
 [[package]]
 name = "coppa-bench"
+<<<<<<< HEAD
 version = "0.15.0"
+=======
+version = "0.14.0"
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 dependencies = [
  "anyhow",
  "clap",
@@ -505,7 +517,11 @@ dependencies = [
 
 [[package]]
 name = "coppa-channel"
+<<<<<<< HEAD
 version = "0.15.0"
+=======
+version = "0.14.0"
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 dependencies = [
  "approx",
  "coppa-dsp",
@@ -515,7 +531,11 @@ dependencies = [
 
 [[package]]
 name = "coppa-cli"
+<<<<<<< HEAD
 version = "0.15.0"
+=======
+version = "0.14.0"
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 dependencies = [
  "anyhow",
  "clap",
@@ -537,7 +557,11 @@ dependencies = [
 
 [[package]]
 name = "coppa-codec"
+<<<<<<< HEAD
 version = "0.15.0"
+=======
+version = "0.14.0"
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 dependencies = [
  "approx",
  "coppa-channel",
@@ -552,7 +576,11 @@ dependencies = [
 
 [[package]]
 name = "coppa-daemon"
+<<<<<<< HEAD
 version = "0.15.0"
+=======
+version = "0.14.0"
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 dependencies = [
  "anyhow",
  "clap",
@@ -580,7 +608,11 @@ dependencies = [
 
 [[package]]
 name = "coppa-dsp"
+<<<<<<< HEAD
 version = "0.15.0"
+=======
+version = "0.14.0"
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 dependencies = [
  "approx",
  "num-complex",
@@ -589,7 +621,11 @@ dependencies = [
 
 [[package]]
 name = "coppa-engine"
+<<<<<<< HEAD
 version = "0.15.0"
+=======
+version = "0.14.0"
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 dependencies = [
  "approx",
  "coppa-channel",
@@ -603,7 +639,11 @@ dependencies = [
 
 [[package]]
 name = "coppa-ffi"
+<<<<<<< HEAD
 version = "0.15.0"
+=======
+version = "0.14.0"
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 dependencies = [
  "cbindgen",
  "coppa-engine",
@@ -611,7 +651,11 @@ dependencies = [
 
 [[package]]
 name = "coppa-host"
+<<<<<<< HEAD
 version = "0.15.0"
+=======
+version = "0.14.0"
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 dependencies = [
  "base64",
  "coppa-engine",
@@ -630,7 +674,11 @@ dependencies = [
 
 [[package]]
 name = "coppa-ml"
+<<<<<<< HEAD
 version = "0.15.0"
+=======
+version = "0.14.0"
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 dependencies = [
  "num-complex",
  "rustfft",
@@ -638,7 +686,11 @@ dependencies = [
 
 [[package]]
 name = "coppa-protocol"
+<<<<<<< HEAD
 version = "0.15.0"
+=======
+version = "0.14.0"
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 dependencies = [
  "approx",
  "coppa-bench",
@@ -659,7 +711,11 @@ dependencies = [
 
 [[package]]
 name = "coppa-radio"
+<<<<<<< HEAD
 version = "0.15.0"
+=======
+version = "0.14.0"
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 dependencies = [
  "anyhow",
  "gpiocdev",

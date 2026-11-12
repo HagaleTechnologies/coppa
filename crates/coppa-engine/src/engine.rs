@@ -135,8 +135,14 @@ pub struct CoppaCore {
     streaming: StreamingReceiver,
     /// Separately detected low-rate floor receive path (air-protocol
     /// version 2, COP-190/ADR-014), constructed alongside the OFDM paths.
+<<<<<<< HEAD
     /// Link feeds this detector alongside OFDM and selects the codec through
     /// negotiated floor policy. Direct callers may also use it explicitly.
+=======
+    /// The session controller does not switch onto it yet; it is the
+    /// engine's floor codec and detector for callers that ask for them
+    /// explicitly.
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
     floor: FloorFrame,
     /// Continuous floor detector over [`Self::push_floor_samples`].
     floor_stream: FloorStream,

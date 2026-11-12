@@ -2,8 +2,13 @@
 //! constructs a separately detected floor receive path next to its OFDM
 //! paths, floor audio decodes through the seeded persistent channel with
 //! zero wrong payloads, and the v1 OFDM path is unaffected. The negotiated,
+<<<<<<< HEAD
 //! floor-aware library controller is exercised below; the daemon and measured
 //! connection bar remain open; see `docs/LIMITATIONS.md`, COP-169 section.
+=======
+//! floor-aware session controller (fallback, OFDM probe, connect bar) is
+//! not built yet; see `docs/LIMITATIONS.md`, COP-169 section.
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 
 use coppa_channel::persistent::{PersistentChannel, SnrProfile};
 use coppa_engine::CoppaCore;
@@ -59,6 +64,7 @@ fn floor_audio_through_the_persistent_channel_decodes_exactly() {
     assert_eq!(received, [payload.to_vec()]);
 }
 
+<<<<<<< HEAD
 // Deterministic library session regressions below do not establish a connection probability.
 
 use coppa_engine::{Link, LinkConfig, LinkPhyMode, LinkState};
@@ -272,3 +278,8 @@ fn floor_duplicate_handshake() {
         assert_eq!(receiver.received_len(), 0);
     }
 }
+=======
+// The full floor session controller (negotiation, fallback, OFDM probe and
+// the release-mode -6 dB 9-of-10 connect bar) is deferred with Phase 2 of
+// the COP-190 plan; this file carries the receive cases that are built.
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b

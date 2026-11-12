@@ -65,10 +65,16 @@ receiver in `coppa-protocol` (`modem/floor.rs`). The frozen parameters:
   do not pass sync share. Final-seed sweeps remain open
   (see `docs/LIMITATIONS.md` and BENCHMARKS, COP-190 section).
 - The engine `CoppaCore` constructs separate batch and streaming floor
+<<<<<<< HEAD
   receivers alongside OFDM. The library Link negotiates capability bit 6,
   starts on OFDM and falls back after two unanswered windows. Five newly
   acknowledged floor exchanges allow one sequence-bound OFDM level-1 probe.
   A failed probe retries the bounded segment on the floor.
   The daemon controller and the −6 dB connection probability bar remain open.
+=======
+  receivers alongside OFDM. The library Link and daemon session controller
+  do not negotiate or transmit on the floor yet. Connecting on the floor,
+  OFDM fallback and the −6 dB connect bar remain open.
+>>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 - Version 2 spends one of the fourteen remaining version values; the next
   incompatible format allocates 3.
