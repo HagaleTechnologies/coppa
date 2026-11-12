@@ -86,3 +86,92 @@ fn development_awgn_check_is_auditable() {
     assert_eq!(points[0].payload_failed, 1);
     assert!(evaluate(&points, -8.0).passes());
 }
+
+#[test]
+fn cop191_final_sweeps_recompute() {
+    use coppa_bench::floor_sweep::{SweepChannel, FINAL_SWEEP_SEED_BASE, TRIALS_PER_POINT};
+    use coppa_protocol::modem::floor::{FRAME_SAMPLES, MAX_PAYLOAD};
+    for channel in [SweepChannel::Awgn, SweepChannel::Poor] {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../results/cop-191")
+            .join(format!("final-{}", channel.name()));
+        let metadata = fs::read_to_string(root.join("metadata.txt")).unwrap();
+        for expected in [
+            "waveform=floor".to_owned(),
+            "production=true".to_owned(),
+            "complete=true".to_owned(),
+            "acceptance_run=true".to_owned(),
+            format!("seed_base={FINAL_SWEEP_SEED_BASE:#x}"),
+            format!("trials_per_point={TRIALS_PER_POINT}"),
+            "rx_paths=[\"batch\", \"streaming\"]".to_owned(),
+            "tail_s=1.25".to_owned(),
+            "stream_chunk_samples=4800".to_owned(),
+            "snr_reference=clean frame mean power, 3 kHz".to_owned(),
+        ] {
+            assert!(metadata.lines().any(|line| line == expected), "{expected}");
+        }
+        assert!(metadata.contains(
+            "seed_rule=attempt_seed(base, point, trials, trial) = base + point*trials + trial"
+        ));
+        assert!(metadata.contains("invocation="));
+        let csv = fs::read_to_string(root.join("sweep.csv")).unwrap();
+        let mut lines = csv.lines();
+        assert_eq!(lines.next(), Some(CSV_HEADER));
+        let rows: Vec<_> = lines.collect();
+        assert_eq!(rows.len(), 18);
+        let mut passes = Vec::new();
+        for (path, rows) in ["batch", "streaming"].into_iter().zip(rows.chunks(9)) {
+            let mut points = Vec::new();
+            for (&snr, &line) in acceptance_grid().iter().zip(rows) {
+                let fields: Vec<_> = line.split(',').collect();
+                assert_eq!(fields.len(), CSV_HEADER.split(',').count());
+                assert_eq!(&fields[..3], &["floor", path, channel.name()]);
+                let count = |i: usize| fields[i].parse::<usize>().unwrap();
+                let errors = count(5);
+                let trials = count(4);
+                assert_eq!(trials, TRIALS_PER_POINT);
+                let point = PointTally {
+                    snr_db: fields[3].parse().unwrap(),
+                    trials,
+                    delivered: trials.checked_sub(errors).unwrap(),
+                    sync_failed: count(6),
+                    sync_no_detection: count(7),
+                    sync_mistimed: count(8),
+                    sync_header_decode: count(9),
+                    header_corrupt: count(10),
+                    payload_failed: count(11),
+                    wrong_payload: count(12),
+                    airtime_samples: (trials * FRAME_SAMPLES) as u64,
+                    delivered_bytes: ((trials - errors) * MAX_PAYLOAD) as u64,
+                };
+                assert_eq!(point.snr_db, f64::from(snr));
+                assert!(point.is_partition());
+                assert_eq!(point.frame_errors(), errors);
+                assert_eq!(point.csv_row("floor", path, channel.name()), line);
+                points.push(point);
+            }
+            let verdict = evaluate(&points, channel.bar_db());
+            let block = metadata.split(&format!("rx_path={path}\n")).nth(1).unwrap();
+            for expected in [
+                format!("crossing={:?}", verdict.crossing),
+                format!("sync_share_violations={:?}", verdict.sync_share_violations),
+                format!("wrong_payloads={}", verdict.wrong_payloads),
+                format!("passes={}", verdict.passes()),
+            ] {
+                assert!(
+                    block
+                        .split("rx_path=")
+                        .next()
+                        .unwrap()
+                        .lines()
+                        .any(|l| l == expected),
+                    "{expected}"
+                );
+            }
+            passes.push(verdict.passes());
+        }
+        assert!(metadata
+            .lines()
+            .any(|line| line == format!("all_selected_pass={}", passes.iter().all(|p| *p))));
+    }
+}

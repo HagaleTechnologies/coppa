@@ -5849,3 +5849,55 @@ The search holds CFO constant over the frame. It does not implement fading
 tracking or prove reception between grid points. The BPSK comparison, production
 selection and integration, session support and final sweep/connect/ramp evidence
 remain unbuilt. No acceptance criterion is declared complete by this repair.
+
+## COP-191 production floor sweeps
+
+These simulated audio-channel measurements use the production air-v2
+`FloorFrame` and continuous `FloorStream`, not the experimental bench codec.
+Each channel has nine points from -12 to +4 dB in 2 dB steps and 200 trials
+per point. The final base is `0x16900000`; each seed is
+`base + point*200 + trial`. Both receivers consume the same captured audio
+per attempt, with a randomized noise lead-in, an 8 s transmitted frame and
+a 1.25 s noisy tail. Streaming chunks contain 4,800 samples.
+
+| Channel | Receiver | Frame errors / trials | 50% FER crossing | Sync-share violations, dB | Passes |
+| --- | --- | --- | --- | --- | --- |
+| AWGN | batch | 22 / 1800 | at or below -12 dB | -12, -10 | false |
+| AWGN | streaming | 22 / 1800 | at or below -12 dB | -12, -10 | false |
+| Poor | batch | 329 / 1800 | -10.148936 dB | -10, -8, -6, -4, +2 | false |
+| Poor | streaming | 329 / 1800 | -10.148936 dB | -10, -8, -6, -4, +2 | false |
+
+All four receiver/channel combinations delivered zero wrong payloads.
+Poor has one interpolated crossing and no recrossings. AWGN is below 50%
+throughout the grid, so its crossing is a bound rather than an interpolation.
+The crossings meet their respective -8 and -2 dB bars, but all four verdicts
+fail the separate `2 * sync_failed < frame_errors` clause above the crossing.
+Zero-failure points satisfy that clause.
+
+Batch failures retain their observed stages. Streaming exposes no trusted-header
+failure diagnostics, so every non-delivery is conservatively SyncFailed.
+Its counters do not establish that all those failures occurred in acquisition.
+
+The [AWGN CSV](results/cop-191/final-awgn/sweep.csv) and
+[Poor CSV](results/cop-191/final-poor/sweep.csv) retain all attempts in the
+unchanged sweep schema, including failed protected headers. Adjacent
+`metadata.txt` files record the invocation, seed rule, power reference,
+completion and independent verdicts. `cop191_final_sweeps_recompute` checks
+both receiver grids, counts, Wilson 95% intervals, airtime, goodput,
+crossings and metadata. Airtime excludes noise lead-in and tail; goodput is
+correct payload bits divided by transmitted airtime.
+
+Reproduce with:
+
+```sh
+cargo run --release -p coppa-bench --example floor_mode -- sweep --waveform floor --rx both --channel awgn --snr-min -12 --snr-max 4 --snr-step 2 --trials 200 --seed 378535936 --out-dir results/cop-191/final-awgn
+cargo run --release -p coppa-bench --example floor_mode -- sweep --waveform floor --rx both --channel poor --snr-min -12 --snr-max 4 --snr-step 2 --trials 200 --seed 378535936 --out-dir results/cop-191/final-poor
+```
+
+Both commands exited 1 because the measured verdicts fail. `acceptance_run=true`
+identifies the locked experiment configuration, not a passing result.
+Omitting `--waveform` still selects the `ofdm:1` baseline. There is no overall
+floor acceptance claim: `connect` and `ramp` remain unavailable until COP-190
+provides the negotiated Link/daemon controller. No session trials, ACK traces
+or OFDM recovery evidence are claimed here. These are simulated channel
+measurements, not RF certification.

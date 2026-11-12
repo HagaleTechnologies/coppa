@@ -370,8 +370,9 @@ update.
   `0x00C0FFEE`, `0x16900000` and `0x16910000`, conservative `SyncFailed`
   with diagnostic subcounts, Wilson intervals, the interpolated 50% crossing
   and the sync-share clause) and the `floor_mode` diagnostic, which measures
-  the production receiver through the new persistent channel. Its only
-  waveform today is the `ofdm:1` baseline; see BENCHMARKS, "COP-169".
+  the production receiver through the new persistent channel. COP-191 adds `--waveform floor` through production batch and continuous
+  receivers on one capture per attempt; omitting it preserves the `ofdm:1`
+  baseline. See BENCHMARKS, "COP-191 production floor sweeps".
 - `coppa_channel::persistent` is the session channel: one continuous
   Watterson process per direction, carried across calls and turnarounds,
   with noise set from a fixed clean power and an SNR schedule (including the
@@ -443,12 +444,12 @@ stall scenario does (`docs/testing/bpq-session.md`).
   `coppa-codec::floor`, and the framing plus a separately detected
   streaming receiver (`FloorFrame`, `FloorStream`) live in
   `coppa-protocol::modem::floor`, guarded by `air_v2_conformance.rs` and
-  `floor_receive.rs`. The engine, library Link and daemon still construct
-  no floor receive path and no floor-aware session controller: capability
+  `floor_receive.rs`. CoppaCore constructs a floor codec and continuous receive path, but
+  Link and daemon have no floor-aware session controller: capability
   negotiation, connect-on-floor, OFDM fallback and the −6 dB connect bar
-  (9 of 10 within 60 s) remain unmet, as do the Poor ramp acceptance, the
-  production final-seed FER sweeps and the `--waveform floor`, `connect`
-  and `ramp` drivers, which belong to COP-191.
+  (9 of 10 within 60 s) remain unmet, as does Poor ramp acceptance. COP-191 adds the
+  production sweep driver; `connect` and `ramp` remain blocked on the
+  COP-190 production session controller.
 - COP-187 repairs the experimental 16-FSK candidate's independent hard header
   decisions by jointly decoding legal length/CRC combinations. Paired Poor
   development runs reduce frame errors from 24/90 to 20/90, but header failures
@@ -456,9 +457,11 @@ stall scenario does (`docs/testing/bpq-session.md`).
 - The `floor_mode sweep` diagnostic accepts `--rx batch|streaming|both` and
   measures the production batch (`CoppaTransceiver::receive`) and streaming
   (`StreamingReceiver`) receive paths over the same grid, seeds and channel
-  realizations. The measured waveform is still only the `ofdm:1` baseline: the
-  production floor those sweeps must select is unbuilt, `connect` and `ramp`
-  remain unimplemented, and no final-seed sweep has been recorded.
+  realizations. COP-191 adds `--waveform floor` through `FloorFrame` and
+  `FloorStream`. Floor non-delivery without trusted-header diagnostics is
+  SyncFailed. The floor capture includes a 1.25 s noisy tail for its
+  one-second decode schedule. `connect` and `ramp` remain unimplemented.
+  See BENCHMARKS, "COP-191 production floor sweeps", for final-seed results.
 - The capture adapter still decodes only when asked. COP-189 adds a separate
   continuous experimental receiver, available with `floor_candidate --streaming`.
   It retains at most 480,000 samples, attempts one window decode per second and
@@ -479,4 +482,8 @@ stall scenario does (`docs/testing/bpq-session.md`).
   and receiver search bounds. Frozen v1 formats, host fields and C ABI are
   unchanged.
 - See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for raw
-  development evidence. No final-seed sweep or production session result is claimed.
+  development evidence. COP-191's production final-seed sweeps are in
+  [BENCHMARKS](../BENCHMARKS.md#cop-191-production-floor-sweeps): both receivers
+  cross at or below -12 dB AWGN and at -10.148936 dB Poor, with zero wrong
+  payloads, but both fail the sync-share clause on both channels. No
+  production session result is claimed.

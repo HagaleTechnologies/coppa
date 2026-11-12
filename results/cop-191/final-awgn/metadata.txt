@@ -1,0 +1,33 @@
+waveform=floor
+production=true
+complete=true
+
+payload_bytes=40
+channel=awgn
+snr_grid_db=[-12, -10, -8, -6, -4, -2, 0, 2, 4]
+trials_per_point=200
+seed_base=0x16900000
+seed_rule=attempt_seed(base, point, trials, trial) = base + point*trials + trial; channel streams = coppa_channel::persistent::derive_seed(attempt_seed, direction, stream)
+lead_in_s=0.35 (+ uniform 0-0.05 s)
+tail_s=1.25
+snr_reference=clean frame mean power, 3 kHz
+rx_paths=["batch", "streaming"]
+stream_chunk_samples=4800
+acceptance_run=true
+final_sweep_seed_base=0x16900000
+final_session_seed_base=0x16910000
+session_ramp=SnrProfile { points: [(0.0, 20.0), (20.0, 20.0), (50.0, -6.0), (80.0, -6.0), (110.0, 20.0), (170.0, 20.0)] } (170 s)
+invocation=target/release/examples/floor_mode sweep --waveform floor --rx both --channel awgn --snr-min -12 --snr-max 4 --snr-step 2 --trials 200 --seed 378535936 --out-dir results/cop-191/final-awgn
+rx_path=batch
+crossing=Some(BelowGrid { upper_bound_db: -12.0 })
+bar_db=-8
+sync_share_violations=[-12.0, -10.0]
+wrong_payloads=0
+passes=false
+rx_path=streaming
+crossing=Some(BelowGrid { upper_bound_db: -12.0 })
+bar_db=-8
+sync_share_violations=[-12.0, -10.0]
+wrong_payloads=0
+passes=false
+all_selected_pass=false
