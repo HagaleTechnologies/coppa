@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 //! Engine-side floor session coverage of the COP-190/COP-196 connect bar:
 //! the engine constructs a separately detected floor receive path next to
 //! its OFDM paths, floor audio decodes through the seeded persistent
@@ -417,20 +416,6 @@ fn floor_connection_audit_rejects_an_incomplete_seed_set() {
     );
 }
 
-=======
-//! Engine-side receive cases of the COP-190 floor session work: the engine
-//! constructs a separately detected floor receive path next to its OFDM
-//! paths, floor audio decodes through the seeded persistent channel with
-//! zero wrong payloads, and the v1 OFDM path is unaffected. The negotiated,
-//! floor-aware session controller (fallback, OFDM probe, connect bar) is
-//! not built yet; see `docs/LIMITATIONS.md`, COP-169 section.
-
-use coppa_channel::persistent::{PersistentChannel, SnrProfile};
-use coppa_engine::CoppaCore;
-
-const SAMPLE_RATE: usize = 48_000;
-
->>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 #[test]
 fn engine_constructs_a_separately_detected_floor_receive_path() {
     let mut core = CoppaCore::new();
@@ -480,15 +465,9 @@ fn floor_audio_through_the_persistent_channel_decodes_exactly() {
     assert_eq!(received, [payload.to_vec()]);
 }
 
-<<<<<<< HEAD
 // The paired connection trials above cover the COP-190 connect bar for
 // library Links (and, in coppa-daemon, for EventLoop pairs) against the
 // built physical layer. The negotiated floor session controller that must
 // carry the handshake legs at -6 dB -- floor-aware discovery, fallback and
 // OFDM probing -- remains COP-195's scope: until it is incorporated these
 // trials measure and record its absence as failing trials.
-=======
-// The full floor session controller (negotiation, fallback, OFDM probe and
-// the release-mode -6 dB 9-of-10 connect bar) is deferred with Phase 2 of
-// the COP-190 plan; this file carries the receive cases that are built.
->>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
