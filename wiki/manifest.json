@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-11T21:20:42Z",
-  "head_commit": "f0a716d",
+  "generated_at": "2026-11-06T09:21:18Z",
+  "head_commit": "14d87c5",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -535,7 +535,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:356463d64bc2cb8ba9980fe071802aa996c10c2a91a4dc2e95d679f63a48ac4c",
+      "hash": "sha256:5dd9fe901f5ef83757b657ed2e9d8a91dca7f2237bfa31a202fa456e7fb450fd",
       "id": "low-rate-floor",
       "kind": "gotcha",
       "links": [
@@ -548,12 +548,11 @@
       "sources": [
         "BENCHMARKS.md",
         "docs/LIMITATIONS.md",
-        "crates/coppa-bench/src/floor_candidate.rs",
-        "crates/coppa-bench/diagnostics/floor_candidate.rs"
+        "crates/coppa-bench/src/floor_candidate.rs"
       ],
       "status": "current",
-      "title": "What has COP-169 measured about a low-rate floor?",
-      "verified_commit": "aa4bf43",
+      "title": "What has the low-rate floor experiment measured?",
+      "verified_commit": "9295659",
       "verified_date": "2026-11-11",
       "visibility": "public"
     },

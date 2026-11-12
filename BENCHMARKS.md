@@ -5742,3 +5742,110 @@ the rejected integration, not the final pilot-based tree. The final production
 recommendations and transmitted samples match the paired baseline, so no second
 candidate run is claimed after withdrawal. Further receiver redesign needs a new
 evidence-backed plan; no thresholds or controller parameters were relaxed here.
+
+## COP-187 experimental header repair
+
+This is a development measurement of the COP-169 16-FSK candidate, not a
+production floor or completion of COP-187. Modulation and duration remain 48 kHz,
+50 baud, 16 tones from 600 to 1350 Hz, four header repetitions, 40 payload
+bytes plus CRC32 under NR BG2, and exactly eight seconds of audio.
+
+The old receiver hard-decided each header nibble before checking CRC16. The
+repair combines normalized tone energies across repetitions and scores the 41
+legal length/CRC combinations together. It requires independent version checks,
+positive header evidence and a unique winner. Delivery still requires payload
+FEC convergence, CRC32 over the unpadded application bytes and zero padding.
+The CRC now binds the decoded length, so a header miscorrection cannot merely
+append padding zeros. All sweep payloads use the full 40-byte capacity, where
+this CRC coverage change leaves transmitted bytes identical. Failed header
+acquisition remains in `sync_failed`; the measurement contract and channel mathematics are unchanged.
+
+Paired Watterson Poor simulations use development seed base `0x00C0FFEE`, ten
+trials at each of nine points from -12 to +4 dB. Payloads, channel draws and
+unknown frame offsets are identical between receivers. Noise power references
+clean active TX power in 3 kHz, not the faded output. The before receiver is
+`019b161612b941a40412ce2164727b34d6915bd1`'s candidate, imported from this
+repository. No external implementation was read or copied.
+
+| SNR dB | Before frame errors | After frame errors | Before header failures | After header failures |
+| --- | --- | --- | --- | --- |
+| -12 | 10/10 | 10/10 | 5 | 4 |
+| -10 | 7/10 | 6/10 | 7 | 6 |
+| -8 | 4/10 | 3/10 | 4 | 3 |
+| -6 | 3/10 | 1/10 | 3 | 1 |
+| -4 through +4 | 0/50 | 0/50 | 0 | 0 |
+
+Across 90 attempts, frame errors fall from 24 to 20. The highest interpolated
+50% FER crossing moves from -8.67 to -9.33 dB. Both receivers still FAIL the
+sync-share bar at -8 and -6 dB. Neither delivers a wrong payload. An AWGN
+check of the repaired candidate has one payload failure at -12 dB in 90
+attempts, giving a crossing upper bound of -12 dB on these development seeds only.
+
+Raw counts, Wilson intervals, aggregate airtime, goodput and decoder metadata
+are under [`results/cop-187/`](results/cop-187/). The audit in
+`crates/coppa-bench/tests/floor_results.rs` recomputes the CSV fields and verdicts.
+To reproduce the repaired Poor run:
+
+```sh
+cargo run --release -p coppa-bench --example floor_candidate -- --channel poor --trials 10 --seed 12648430 --out-dir results/cop-187/dev-header-poor
+```
+
+Use `--channel awgn` and `dev-header-awgn` for the AWGN development check.
+The before CSV uses the same command on the imported COP-169 receiver.
+These are batch simulations at zero CFO without SSB filtering. They do not
+establish streaming acquisition, connect/ramp success, a production air version,
+or the locked 200-trial final-seed acceptance bars.
+
+The acceptance sweep interface itself now covers both production receive
+paths: `floor_mode sweep --rx batch|streaming|both` sweeps the production
+batch and `StreamingReceiver` paths over the same grid, seeds and channel
+realizations, with one CSV row set and metadata verdict block per path. The
+development CSVs above remain batch-only measurements of the experimental
+candidate; no final-seed `--rx both` sweep has been recorded, and the
+production floor waveform those sweeps must select does not exist yet.
+
+## COP-189 continuous candidate acquisition slice
+
+`floor_candidate --streaming` exercises continuous acquisition of the existing
+experimental 16-FSK candidate. It ingests arbitrary chunks, decodes overlapping
+windows on a one-second cadence, and keeps at most 480,000 audio samples. Each
+window originally attempted at most 16 separated sync candidates at zero CFO.
+The CFO search described below increases that bound. Decode work is independent
+of caller chunk sizes and stream duration. Tone energies and candidate lists
+remain bounded by the ten-second window; this implementation recomputes them
+for each window rather than claiming an incremental matched-filter receiver.
+Metadata records decode attempts and peak retained samples at chunk boundaries.
+A missing streaming delivery counts conservatively as SyncFailed because this
+adapter does not expose a validated failure-stage trace.
+
+The release regression
+`cargo test --release -p coppa-bench --lib continuous_acquisition_300_seconds_noise -- --ignored`
+passed with zero deliveries for 300 seconds each of seeded white noise,
+SSB-filtered one-second noise blocks and a 1 kHz tone plus noise. Each stream
+attempted 293 decodes and retained at most 480,000 samples. This is synthetic
+noise rejection evidence only. It does not select a production waveform or
+resolve the floor FER, connection or fade-ramp acceptance requirements. No
+final-seed production results are published for this slice.
+
+
+### COP-189 CFO acquisition repair
+
+The experimental batch and continuous receivers now share a matched-filter bank
+covering 450..1500 Hz in 25 Hz steps. Thirteen views select the sixteen nominal
+tones shifted by -150..+150 Hz. Each view may try sixteen separated candidates,
+so a window attempts at most 208 candidate decodes. Only one sixteen-tone view
+is allocated at a time. Audio retention and the one-second window cadence are
+unchanged. Templates repeat after two symbols, including the half-bin offsets.
+Transmit tones, framing, eight-second airtime and CRC checks are unchanged.
+
+`cargo test --release -p coppa-bench --lib cfo_search_decodes_unknown_offset_in_batch_and_chunks`
+requires exact payload delivery at -150, -75, +75 and +150 Hz, with an unknown
+137-sample prefix, in batch and 317-sample chunks. It failed at -150 Hz before
+the repair. This is a noiseless acquisition regression, not a fading FER curve.
+Diagnostic metadata now records the grid and expanded work bound. Historical
+COP-169 and COP-187 CSVs remain measurements of their original receivers.
+
+The search holds CFO constant over the frame. It does not implement fading
+tracking or prove reception between grid points. The BPSK comparison, production
+selection and integration, session support and final sweep/connect/ramp evidence
+remain unbuilt. No acceptance criterion is declared complete by this repair.

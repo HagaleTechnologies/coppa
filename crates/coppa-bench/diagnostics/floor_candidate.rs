@@ -1,7 +1,9 @@
 //! COP-169 development sweep of the experimental 16-FSK candidate.
 //! This does not select a winner or exercise a production session.
 use clap::{Parser, ValueEnum};
-use coppa_bench::floor_candidate::{Candidate, CandidateError, FRAME_SAMPLES, SAMPLE_RATE};
+use coppa_bench::floor_candidate::{
+    Candidate, CandidateError, CandidateStream, FRAME_SAMPLES, SAMPLE_RATE,
+};
 use coppa_bench::floor_sweep::{
     acceptance_grid, attempt_seed, evaluate, AttemptOutcome, PointTally, SweepChannel, SyncCause,
     CSV_HEADER, DEV_SEED_BASE,
@@ -30,6 +32,9 @@ struct Args {
     ssb: bool,
     #[arg(long)]
     out_dir: PathBuf,
+    /// Exercise continuous acquisition instead of batch capture decoding.
+    #[arg(long)]
+    streaming: bool,
 }
 fn main() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
@@ -50,9 +55,12 @@ fn main() -> anyhow::Result<ExitCode> {
         Channel::Poor => Some(WattersonPreset::Poor.config()),
     };
     let candidate = Candidate::new();
+    let rx_path = if args.streaming { "streaming" } else { "batch" };
     let mut points = Vec::new();
     let started = Instant::now();
     let mut rx_seconds = 0.0;
+    let mut stream_attempts = 0;
+    let mut stream_retained_peak = 0;
     for (pi, snr) in acceptance_grid().iter().enumerate() {
         let mut point = PointTally::new(f64::from(*snr));
         for trial in 0..args.trials {
@@ -82,7 +90,24 @@ fn main() -> anyhow::Result<ExitCode> {
             received.extend(cable.transmit(Direction::AToB, &impaired).at_b);
             received.extend(cable.idle(0.1).at_b);
             let rx_start = Instant::now();
-            let result = candidate.receive(&received);
+            let result = if args.streaming {
+                let mut rx = CandidateStream::default();
+                // Flush a full decode interval using actual channel noise.
+                received.extend(cable.idle(1.0).at_b);
+                let mut frames = Vec::new();
+                for chunk in received.chunks(4800) {
+                    frames.extend(rx.push(chunk));
+                    stream_retained_peak = stream_retained_peak.max(rx.retained_samples());
+                }
+                stream_attempts += rx.decode_attempts();
+                if frames.iter().any(|got| *got != payload) || frames.len() > 1 {
+                    Ok(Vec::new()) // Conservatively count extra/wrong delivery.
+                } else {
+                    frames.pop().ok_or(CandidateError::Acquisition)
+                }
+            } else {
+                candidate.receive(&received)
+            };
             rx_seconds += rx_start.elapsed().as_secs_f64();
             let outcome = match result {
                 Ok(got) if got == payload => AttemptOutcome::Delivered,
@@ -102,7 +127,7 @@ fn main() -> anyhow::Result<ExitCode> {
             "{} {} dB: {}",
             channel.name(),
             snr,
-            point.csv_row("experimental-mfsk16", "batch", channel.name())
+            point.csv_row("experimental-mfsk16", rx_path, channel.name())
         );
         points.push(point);
     }
@@ -110,12 +135,12 @@ fn main() -> anyhow::Result<ExitCode> {
     fs::create_dir_all(&args.out_dir)?;
     let mut csv = format!("{CSV_HEADER}\n");
     for point in &points {
-        csv.push_str(&point.csv_row("experimental-mfsk16", "batch", channel.name()));
+        csv.push_str(&point.csv_row("experimental-mfsk16", rx_path, channel.name()));
         csv.push('\n');
     }
     fs::write(args.out_dir.join("sweep.csv"), csv)?;
     fs::write(args.out_dir.join("metadata.txt"), format!(
-        "waveform=experimental-mfsk16\nproduction=false\nacceptance_run=false\nseed_base={}\nseed_derivation=attempt_seed(base,point,trials,trial); persistent derive_seed for direction/noise/fading\ntrials_per_point={}\nchannel={}\ncfo_hz={}\nssb={}\nsample_rate={}\nsymbol_samples=960\ntones=600:50:1350\nsync_symbols=16\nheader_repetitions=4\nheader_bytes=version2,length,crc16-ibm-sdlc-be\npayload=40-byte-zero-padded-pdu,crc32-iso-hdlc-be\nfec=NR-BG2-k352-e1408-rv0-unscrambled\ninterleaver=coded[(wire_bit*31)%1408]\nframe_samples={}\nframe_airtime_s=8\nrx=bounded-batch-zero-cfo-search\nrx_wall_seconds={rx_seconds}\nwall_seconds={}\nverdict={verdict:?}\npasses={}\nclean_room=original implementation using repository primitives; no external source copied\n",
+        "waveform=experimental-mfsk16\nproduction=false\nacceptance_run=false\nseed_base={}\nseed_derivation=attempt_seed(base,point,trials,trial); persistent derive_seed for direction/noise/fading\ntrials_per_point={}\nchannel={}\ncfo_hz={}\nssb={}\nsample_rate={}\nsymbol_samples=960\ntones=600:50:1350\nsync_symbols=16\nheader_repetitions=4\nheader_bytes=version2,length,crc16-ibm-sdlc-be\nheader_decoder=normalized-energy-legal-length-crc-codewords; independent-version-check; score>0.16; unique-winner\npayload=40-byte-zero-padded-pdu,crc32-iso-hdlc-be\npayload_crc_scope=unpadded-pdu\nfec=NR-BG2-k352-e1408-rv0-unscrambled\ninterleaver=coded[(wire_bit*31)%1408]\nframe_samples={}\nframe_airtime_s=8\nrx={rx_path}\nrx_search=bounded-window-cfo-grid\ncfo_search_hz=-150:25:150\nmax_sync_candidates_per_hypothesis=16\nmax_sync_candidates_per_window=208\nstream_decode_attempts={stream_attempts}\nstream_retained_samples_peak={stream_retained_peak}\nrx_wall_seconds={rx_seconds}\nwall_seconds={}\nverdict={verdict:?}\npasses={}\nclean_room=original implementation using repository primitives; no external source copied\n",
         args.seed, args.trials, channel.name(), args.cfo, args.ssb, SAMPLE_RATE, FRAME_SAMPLES,
         started.elapsed().as_secs_f64(), verdict.passes()))?;
     Ok(if verdict.passes() {

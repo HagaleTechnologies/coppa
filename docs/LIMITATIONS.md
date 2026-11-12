@@ -431,3 +431,37 @@ after its last request, and in the COP-172 lab a new dial on that coppad
 in that window was refused with `another session is active`. A host that
 drops its connection mid-dial should send `ABORT` first; the BPQ lab's
 stall scenario does (`docs/testing/bpq-session.md`).
+
+## COP-169 robust low-rate floor not built yet
+
+- The production modem still has no separately detected low-rate floor, v2
+  floor framing, or floor-aware Link/daemon session controller. COP-187's
+  connection at -6 dB and fade-ramp requirements remain unmet.
+- COP-187 repairs the experimental 16-FSK candidate's independent hard header
+  decisions by jointly decoding legal length/CRC combinations. Paired Poor
+  development runs reduce frame errors from 24/90 to 20/90, but header failures
+  still dominate above the crossing. The candidate remains unselected.
+- The `floor_mode sweep` diagnostic accepts `--rx batch|streaming|both` and
+  measures the production batch (`CoppaTransceiver::receive`) and streaming
+  (`StreamingReceiver`) receive paths over the same grid, seeds and channel
+  realizations. The measured waveform is still only the `ofdm:1` baseline: the
+  production floor those sweeps must select is unbuilt, `connect` and `ramp`
+  remain unimplemented, and no final-seed sweep has been recorded.
+- The capture adapter still decodes only when asked. COP-189 adds a separate
+  continuous experimental receiver, available with `floor_candidate --streaming`.
+  It retains at most 480,000 samples, attempts one window decode per second and
+  tries at most 16 sync candidates per CFO hypothesis, with 13 hypotheses
+  from -150 to +150 Hz in 25 Hz steps, or at most 208 per window.
+  Chunk, corrupt/truncated header,
+  nonfinite-input and duplicate-delivery regressions pass. An explicit release
+  test delivers nothing during 300 seconds each of seeded white noise,
+  block-filtered SSB noise and 1 kHz tone plus noise. These checks are not a
+  production acquisition or FER claim. Batch and chunked regressions recover
+  noiseless frames at CFO -150, -75, +75 and +150 Hz without an offset oracle.
+  This fixed grid does not track intra-frame drift or guarantee reception
+  between grid points. BPSK comparison, fading tracking, production integration
+  and final acceptance measurements remain open.
+- The candidate's literal header value 2 is experimental, not an allocation of
+  production air version 2. Frozen v1 formats, host fields and C ABI are unchanged.
+- See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for raw
+  development evidence. No final-seed sweep or production session result is claimed.
