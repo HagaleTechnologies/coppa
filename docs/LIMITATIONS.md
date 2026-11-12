@@ -355,6 +355,33 @@ update.
   protected-mode bound covers two slow HF ACKs, but does not reserve a third
   frame for a peer ID. A lost first ACK during that prepend can cause a retry.
 
+## COP-169 robust low-rate floor (not built yet)
+
+- There is no production floor waveform yet. Below about +3 dB (3 kHz reference) on AWGN,
+  `hf_narrow` level 1 still loses nearly every frame, and the failures are
+  `SyncFailed`. A session cannot connect at −6 dB or hold through a fade to
+  −6 dB. The COP-169 bars (50% FER crossing at or below −8 dB AWGN and −2 dB
+  Watterson Poor, connect within 60 s at −6 dB in 9 of 10 trials, survive a
+  20 → −6 → 20 dB Poor ramp) are unmet.
+- What exists is the measurement contract the floor will be judged by:
+  `coppa_bench::floor_sweep` (nine-point −12…+4 dB grid, locked seed bases
+  `0x00C0FFEE`, `0x16900000` and `0x16910000`, conservative `SyncFailed`
+  with diagnostic subcounts, Wilson intervals, the interpolated 50% crossing
+  and the sync-share clause) and the `floor_mode` diagnostic, which measures
+  the production receiver through the new persistent channel. Its only
+  waveform today is the `ofdm:1` baseline; see BENCHMARKS, "COP-169".
+- `coppa_channel::persistent` is the session channel: one continuous
+  Watterson process per direction, carried across calls and turnarounds,
+  with noise set from a fixed clean power and an SNR schedule (including the
+  COP-169 ramp). Its fading is generated at 100 Hz and linearly interpolated,
+  and its streaming Hilbert FIR adds a fixed 511-sample (10.6 ms) latency on
+  faded paths. No endpoint (Link or daemon) drives it yet.
+- A measurement-only 16-FSK prototype now carries a 40-byte PDU in exactly
+  eight seconds. It has no Link or daemon caller and no production streaming
+  detector. Its development Poor sweep fails the conservative sync-share
+  clause. It is not a selected floor design. See BENCHMARKS, "COP-169
+  experimental 16-FSK candidate", for raw results and scope.
+
 ## COP-178 versioned wire contract
 
 - There is no in-band air-protocol version negotiation and no automatic
@@ -378,3 +405,29 @@ update.
   commit, including the ABI 1.1 accessors `coppa_air_protocol_version` and
   `coppa_host_api_version`, is compared only as an addition: a later change
   to one of them is not caught. Tagging the 0.12.0 release closes this.
+
+## LinBPQ/BPQ32 gateway (COP-172)
+
+The lab uses LinBPQ 6.0.26.1 i386 Linux as a B2F BBS peer, with no RMS
+account, CMS or RMS-user forwarding queue. BPQ32, RF, a rig, Raspberry Pi
+and the root apt installation route were not run. Use a dwell of at least
+7 s so five intervals cover the 35 s handshake timeout; LISTEN OFF cancels
+a shorter scanner hold. A gateway dying mid-session leaves Pat waiting
+for dead-link detection (prior black-box measurements: DISCONNECT at 174 s,
+exit 1 at 263 s). RETRIES covers VARA-style dials only; Pat sends one
+request by default. LinBPQ needs a tmpfs working directory where the host
+filesystem allocates inode numbers above 2**32. See [BPQ.md](BPQ.md).
+
+An idle session with no outstanding application data can keep sending
+KEEPALIVE after its peer dies. The COP-172 black-box restart probe stayed
+up for the full 400 s harness limit when the gateway was killed before
+the BBS banner. The restart experiment now interrupts an outstanding
+B2F write to exercise the existing data-retry dead-link bound. Idle-peer
+liveness is a separate follow-up, not a finite-bound claim.
+
+Closing a VARA command connection does not end the dial that client
+started. The dial lasts until the handshake reaper ends it, 30 to 35 s
+after its last request, and in the COP-172 lab a new dial on that coppad
+in that window was refused with `another session is active`. A host that
+drops its connection mid-dial should send `ABORT` first; the BPQ lab's
+stall scenario does (`docs/testing/bpq-session.md`).

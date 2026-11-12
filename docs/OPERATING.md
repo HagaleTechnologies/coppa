@@ -1438,6 +1438,11 @@ transmission out over it.
 
 ## Inbound connect attempts
 
+MYCALL accepts one to five callsigns. The first identifies transmissions;
+coppad answers a call to any listed callsign. LISTEN OFF immediately ends
+a pending inbound attempt with CANCELPENDING and leaves established
+sessions and outbound dials alone. See [BPQ.md](BPQ.md) for scanning gateways.
+
 A listening coppad (`LISTEN ON`) pushes `PENDING` to every host when it
 answers another station's `CONNECT_REQ`. The attempt then ends in `CONNECTED`
 when the caller confirms, or in `CANCELPENDING` when the handshake does not
