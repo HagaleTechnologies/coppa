@@ -14,6 +14,27 @@ numbers separately, because they move independently:
 Older releases have no entry here. Their on-air breaks are listed in
 `docs/SPEC.md` §0.1.
 
+## Unreleased: 0.14.0
+
+COP-190 adds the low-rate floor as a production air format, framed at
+air-protocol version 2. It is a separate format from the OFDM speed
+ladder: nothing a version-1 station sends or parses changes.
+
+- **Crate version:** 0.14.0 (minor: new public modules).
+- **Air-protocol version:** 2 allocated for the floor, in addition to the
+  unchanged version 1. SPEC §0.3.3 registers the allocation and
+  `docs/adr/014-cop190-low-rate-floor.md` freezes the framing: 16-FSK, 50
+  baud, 600–1350 Hz, 4-byte header (version, length, CRC16) repeated four
+  times and decoded jointly, NR BG2 LDPC payload with CRC32, 40-byte PDU
+  in a fixed 8.0 s airtime. New `coppa_codec::floor` (modulation) and
+  `coppa_protocol::modem::floor` (`FloorFrame`, `FloorStream`,
+  `FloorError`, `FLOOR_AIR_PROTOCOL_VERSION`), guarded by
+  `air_v2_conformance.rs` and `floor_receive.rs`.
+- **Host-API version:** 1, unchanged. The `phy_mode` status field and the
+  floor-aware session controller are not built yet; see
+  `docs/LIMITATIONS.md`, COP-169 section.
+- **C ABI version:** unchanged; no exported symbol or layout change.
+
 ## Unreleased: 0.12.0
 
 The first release covered by the air-protocol version 1 compatibility

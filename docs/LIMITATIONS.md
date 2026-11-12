@@ -355,14 +355,16 @@ update.
   protected-mode bound covers two slow HF ACKs, but does not reserve a third
   frame for a peer ID. A lost first ACK during that prepend can cause a retry.
 
-## COP-169 robust low-rate floor (not built yet)
+## COP-169 robust low-rate floor (session integration open)
 
-- There is no production floor waveform yet. Below about +3 dB (3 kHz reference) on AWGN,
-  `hf_narrow` level 1 still loses nearly every frame, and the failures are
-  `SyncFailed`. A session cannot connect at −6 dB or hold through a fade to
-  −6 dB. The COP-169 bars (50% FER crossing at or below −8 dB AWGN and −2 dB
-  Watterson Poor, connect within 60 s at −6 dB in 9 of 10 trials, survive a
-  20 → −6 → 20 dB Poor ramp) are unmet.
+- The OFDM ladder still cannot serve the floor's job: below about +3 dB
+  (3 kHz reference) on AWGN, `hf_narrow` level 1 loses nearly every frame,
+  and the failures are `SyncFailed`. A session cannot connect at −6 dB or
+  hold through a fade to −6 dB. The COP-169 bars (50% FER crossing at or
+  below −8 dB AWGN and −2 dB Watterson Poor, connect within 60 s at −6 dB
+  in 9 of 10 trials, survive a 20 → −6 → 20 dB Poor ramp) are unmet. COP-190
+  adds the air-protocol version 2 floor waveform to the production crates,
+  but no session can send or receive it yet.
 - What exists is the measurement contract the floor will be judged by:
   `coppa_bench::floor_sweep` (nine-point −12…+4 dB grid, locked seed bases
   `0x00C0FFEE`, `0x16900000` and `0x16910000`, conservative `SyncFailed`
@@ -376,10 +378,12 @@ update.
   COP-169 ramp). Its fading is generated at 100 Hz and linearly interpolated,
   and its streaming Hilbert FIR adds a fixed 511-sample (10.6 ms) latency on
   faded paths. No endpoint (Link or daemon) drives it yet.
-- A measurement-only 16-FSK prototype now carries a 40-byte PDU in exactly
-  eight seconds. It has no Link or daemon caller and no production streaming
-  detector. Its development Poor sweep fails the conservative sync-share
-  clause. It is not a selected floor design. See BENCHMARKS, "COP-169
+- The 16-FSK design now exists twice: COP-190 moved it into the production
+  crates as `coppa-codec::floor` and `coppa-protocol::modem::floor`
+  (air-protocol version 2, ADR-014), while the measurement-only bench copy
+  stays frozen for measurement continuity. The production floor has no
+  Link or daemon caller yet. Its development Poor sweep fails the
+  conservative sync-share clause. See BENCHMARKS, "COP-169
   experimental 16-FSK candidate", for raw results and scope.
 
 ## COP-178 versioned wire contract
@@ -432,11 +436,19 @@ in that window was refused with `another session is active`. A host that
 drops its connection mid-dial should send `ABORT` first; the BPQ lab's
 stall scenario does (`docs/testing/bpq-session.md`).
 
-## COP-169 robust low-rate floor not built yet
+## COP-169 robust low-rate floor (session integration open)
 
-- The production modem still has no separately detected low-rate floor, v2
-  floor framing, or floor-aware Link/daemon session controller. COP-187's
-  connection at -6 dB and fade-ramp requirements remain unmet.
+- COP-190 builds the production floor framing: air-protocol version 2 is
+  allocated (SPEC §0.3.3, ADR-014), the 16-FSK modulation lives in
+  `coppa-codec::floor`, and the framing plus a separately detected
+  streaming receiver (`FloorFrame`, `FloorStream`) live in
+  `coppa-protocol::modem::floor`, guarded by `air_v2_conformance.rs` and
+  `floor_receive.rs`. The engine, library Link and daemon still construct
+  no floor receive path and no floor-aware session controller: capability
+  negotiation, connect-on-floor, OFDM fallback and the −6 dB connect bar
+  (9 of 10 within 60 s) remain unmet, as do the Poor ramp acceptance, the
+  production final-seed FER sweeps and the `--waveform floor`, `connect`
+  and `ramp` drivers, which belong to COP-191.
 - COP-187 repairs the experimental 16-FSK candidate's independent hard header
   decisions by jointly decoding legal length/CRC combinations. Paired Poor
   development runs reduce frame errors from 24/90 to 20/90, but header failures
@@ -461,7 +473,10 @@ stall scenario does (`docs/testing/bpq-session.md`).
   This fixed grid does not track intra-frame drift or guarantee reception
   between grid points. BPSK comparison, fading tracking, production integration
   and final acceptance measurements remain open.
-- The candidate's literal header value 2 is experimental, not an allocation of
-  production air version 2. Frozen v1 formats, host fields and C ABI are unchanged.
+- COP-190 allocates the candidate's header version value 2 as production
+  air-protocol version 2 (SPEC §0.3.3, ADR-014), freezing the tone
+  alphabet, header layout, FEC envelope, 40-byte capacity, 8.0 s airtime
+  and receiver search bounds. Frozen v1 formats, host fields and C ABI are
+  unchanged.
 - See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for raw
   development evidence. No final-seed sweep or production session result is claimed.
