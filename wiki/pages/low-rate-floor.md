@@ -9,6 +9,7 @@ sources:
   - docs/LIMITATIONS.md
   - crates/coppa-bench/src/floor_candidate.rs
 verified:
+  commit: 9295659
   date: 2026-11-11
 links:
   - coppa-protocol
