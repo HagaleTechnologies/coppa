@@ -235,11 +235,7 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn acquires_integer_tone_cfo_without_timing_or_frequency_oracle() {
-=======
-    fn cfo_characterization_never_delivers_wrong_bytes() {
->>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
         let c = Candidate::new();
         let payload: Vec<_> = (0..MAX_PAYLOAD as u8).collect();
         let audio = c.encode(&payload).unwrap();

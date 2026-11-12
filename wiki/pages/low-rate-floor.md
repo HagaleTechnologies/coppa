@@ -8,15 +8,10 @@ sources:
   - BENCHMARKS.md
   - docs/LIMITATIONS.md
   - crates/coppa-bench/src/floor_candidate.rs
-<<<<<<< HEAD
   - crates/coppa-bench/src/floor_sweep.rs
-verified:
-  commit: 19948e9
-=======
   - crates/coppa-protocol/src/modem/floor.rs
 verified:
   commit: 19948e9f8eb8e8139fb86b9237112cc83ed6095a
->>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
   date: 2026-11-12
 links:
   - coppa-protocol
@@ -25,19 +20,12 @@ links:
 # What has the low-rate floor experiment measured?
 
 COP-187's batch header repair reduces experimental candidate errors on paired
-<<<<<<< HEAD
-development seeds. It does not select a production waveform. The remaining
-Poor failures still violate the separate acquisition bar, despite a favorable
-FER crossing. See [measurements](../../BENCHMARKS.md#cop-187-experimental-header-repair)
-and [unmet requirements](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-session-integration-open).
-=======
 development seeds. COP-190 then moved the measured 16-FSK design into the
 production crates as air-protocol version 2; no session uses it yet. The
 remaining Poor failures on the frozen bench copy still violate the separate
 acquisition bar, despite a favorable FER crossing. See
 [measurements](../../BENCHMARKS.md#cop-187-experimental-header-repair)
 and [open requirements](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-session-integration-open).
->>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 
 Joint length/CRC decoding uses redundancy that independent hard nibble decisions
 discard. A legal header hypothesis alone cannot justify delivery. Preserve the
@@ -51,13 +39,9 @@ and suppresses delivery of the same frame from successive windows. The
 audio through the next one-second decode interval. Work and retention bounds,
 and the remaining production gap, are in
 [LIMITATIONS](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-session-integration-open).
-<<<<<<< HEAD
-The experimental header value 2 does not allocate a production air version.
-=======
 COP-190 allocates the header's version value 2 as production air-protocol
 version 2 (SPEC §0.3.3, ADR-014); the frozen v1 bytes, host fields and C ABI
 are unchanged.
->>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 
 Run the long noise regression explicitly with
 `cargo test --release -p coppa-bench --lib continuous_acquisition_300_seconds_noise -- --ignored`.
@@ -66,7 +50,6 @@ and a 1 kHz tone plus noise. It does not establish RF false-alarm probability
 or a fading FER crossing.
 
 `floor_mode sweep --rx batch|streaming|both` measures the production batch and
-<<<<<<< HEAD
 streaming receive paths. COP-191 adds `--waveform floor` using the production
 `FloorFrame` and `FloorStream`, with one impaired capture per seed fed to both.
 The noisy tail must cover the continuous receiver's next scheduled decode.
@@ -75,20 +58,6 @@ for measured verdicts. Both receivers fail the sync-share bar on both channels,
 with zero wrong payloads. `connect` and `ramp` still need COP-190's deferred
 production session controller. A codec receive test does not prove session
 establishment, floor ACKs or OFDM recovery.
-
-
-CFO search in the experimental batch and continuous receiver uses thirteen
-hypotheses from -150 to +150 Hz in 25 Hz steps. Its matched-filter recurrence
-must use separate incoming and outgoing phases: half-bin templates repeat every
-two symbols. Reusing the old one-symbol recurrence breaks the +/-75 Hz cases.
-The bound is now sixteen sync candidates per hypothesis, or 208 per window.
-See [the regression and remaining work](../../BENCHMARKS.md#cop-189-cfo-acquisition-repair).
-This search does not supply production framing, negotiation or fading tracking.
-=======
-streaming receive paths on the same seeds, but only for the `ofdm:1`
-baseline; sweeping the production floor waveform through the diagnostic is
-COP-191's driver work. `connect` and `ramp` need the production floor
-session and do not exist yet.
 
 
 CFO search in the experimental batch and continuous receiver uses thirteen
@@ -110,4 +79,3 @@ on identical persistent-channel captures. Favorable crossings still fail the
 sync-share clause. See [the production measurements](../../BENCHMARKS.md#cop-190-production-floor-development-measurements)
 for seeds, accounting and remaining acceptance work. Session integration stays
 open; a decoded floor frame does not prove a connection.
->>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b

@@ -400,7 +400,6 @@ Unit tests separately cover clean SSB filtering with its FIR tail flushed and
 one seeded -6 dB AWGN capture at 0 and +/-150 Hz. They do not establish a filtered
 FER curve or a noisy SSB compatibility envelope.
 
-<<<<<<< HEAD
 ## COP-189 continuous candidate acquisition slice
 
 `floor_candidate --streaming` exercises continuous acquisition of the existing
@@ -498,7 +497,7 @@ floor acceptance claim: `connect` and `ramp` remain unavailable until COP-190
 provides the negotiated Link/daemon controller. No session trials, ACK traces
 or OFDM recovery evidence are claimed here. These are simulated channel
 measurements, not RF certification.
-=======
+
 
 ## COP-190 production floor development measurements
 
@@ -541,4 +540,3 @@ the 200-trial final-seed bar, negotiated sessions, connection success or fade
 recovery. The floor-aware Link/daemon controller and connection trials are
 still missing. COP-191 owns the final-seed sweeps, Poor ramp and diagnostic
 drivers.
->>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b

@@ -535,11 +535,7 @@
       "visibility": "public"
     },
     {
-<<<<<<< HEAD
-      "hash": "sha256:3bb93f39b6b6ff24f1c99f97f808f357f76deccc7f773f7fc704f53614f5b6ef",
-=======
-      "hash": "sha256:82db27f9cb0c1db97b1d7bb9d56b73a683331f765a09e6ea63f7ca752cafa2f9",
->>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
+      "hash": "sha256:ae2b9c71c4a2e4e8849498167c6e0dbc598575397dbbd92643634c2dd81625a3",
       "id": "low-rate-floor",
       "kind": "gotcha",
       "links": [
@@ -553,19 +549,12 @@
         "BENCHMARKS.md",
         "docs/LIMITATIONS.md",
         "crates/coppa-bench/src/floor_candidate.rs",
-<<<<<<< HEAD
-        "crates/coppa-bench/src/floor_sweep.rs"
-      ],
-      "status": "current",
-      "title": "What has the low-rate floor experiment measured?",
-      "verified_commit": "19948e9",
-=======
+        "crates/coppa-bench/src/floor_sweep.rs",
         "crates/coppa-protocol/src/modem/floor.rs"
       ],
       "status": "current",
       "title": "What has the low-rate floor experiment measured?",
       "verified_commit": "19948e9f8eb8e8139fb86b9237112cc83ed6095a",
->>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
       "verified_date": "2026-11-12",
       "visibility": "public"
     },

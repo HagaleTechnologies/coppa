@@ -60,23 +60,14 @@ receiver in `coppa-protocol` (`modem/floor.rs`). The frozen parameters:
   production floor surface (`FloorFrame`, `FloorStream`, `FloorError`,
   `FLOOR_AIR_PROTOCOL_VERSION = 2`). The workspace takes a minor bump for
   the public addition.
-<<<<<<< HEAD
-- The experimental `coppa-bench` copy stays frozen for measurement
-  continuity; production sweeps of the production path are not yet
-  recorded (see `docs/LIMITATIONS.md`).
-- The engine `CoppaCore`, the library Link and the daemon session
-  controller do not construct or negotiate the floor yet; connecting on
-  the floor, OFDM fallback and the −6 dB connect bar remain open, as does
-  the Poor-channel sync share near the crossing.
-=======
 - The experimental `coppa-bench` copy retains its historical measurements.
   Production development sweeps cover batch and streaming reception, but
-  do not pass sync share. Final-seed sweeps remain open
-  (see `docs/LIMITATIONS.md` and BENCHMARKS, COP-190 section).
+  do not pass sync share. COP-191 records final-seed sweeps, which also
+  fail sync share (see `docs/LIMITATIONS.md` and BENCHMARKS, COP-190
+  and COP-191 sections).
 - The engine `CoppaCore` constructs separate batch and streaming floor
   receivers alongside OFDM. The library Link and daemon session controller
   do not negotiate or transmit on the floor yet. Connecting on the floor,
   OFDM fallback and the −6 dB connect bar remain open.
->>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 - Version 2 spends one of the fourteen remaining version values; the next
   incompatible format allocates 3.
