@@ -86,3 +86,32 @@ fn development_awgn_check_is_auditable() {
     assert_eq!(points[0].payload_failed, 1);
     assert!(evaluate(&points, -8.0).passes());
 }
+
+#[test]
+fn integer_tone_cfo_development_measurements_are_auditable() {
+    for (directory, cfo) in [
+        ("dev-cfo-zero-poor", 0),
+        ("dev-cfo-minus150-poor", -150),
+        ("dev-cfo-plus150-poor", 150),
+    ] {
+        let points = audit(directory, "poor");
+        let metadata = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../results/cop-187")
+                .join(directory)
+                .join("metadata.txt"),
+        )
+        .unwrap();
+        for expected in [
+            format!("cfo_hz={cfo}"),
+            "rx=bounded-batch-integer-tone-cfo-search".to_owned(),
+            "cfo_search_hz=-150:50:150".to_owned(),
+            "max_decode_candidates=16".to_owned(),
+        ] {
+            assert!(metadata.lines().any(|line| line == expected), "{expected}");
+        }
+        // These development data must not be promoted to final acceptance:
+        // only ten trials per point, no streaming receiver or session caller.
+        assert!(points.iter().all(|point| point.wrong_payload == 0));
+    }
+}

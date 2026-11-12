@@ -1,0 +1,10 @@
+waveform,rx_path,channel,snr_db,trials,frame_errors,sync_failed,sync_no_detection,sync_mistimed,sync_header_decode,header_corrupt,payload_failed,wrong_payload,fer,fer_lo,fer_hi,airtime_s,goodput_bps
+experimental-mfsk16,batch,poor,-12,10,10,6,1,0,5,0,4,0,1.0000,0.7225,1.0000,80.000,0.00
+experimental-mfsk16,batch,poor,-10,10,4,3,0,0,3,0,1,0,0.4000,0.1682,0.6873,80.000,24.00
+experimental-mfsk16,batch,poor,-8,10,2,2,0,0,2,0,0,0,0.2000,0.0567,0.5098,80.000,32.00
+experimental-mfsk16,batch,poor,-6,10,0,0,0,0,0,0,0,0,0.0000,0.0000,0.2775,80.000,40.00
+experimental-mfsk16,batch,poor,-4,10,0,0,0,0,0,0,0,0,0.0000,0.0000,0.2775,80.000,40.00
+experimental-mfsk16,batch,poor,-2,10,0,0,0,0,0,0,0,0,0.0000,0.0000,0.2775,80.000,40.00
+experimental-mfsk16,batch,poor,0,10,0,0,0,0,0,0,0,0,0.0000,0.0000,0.2775,80.000,40.00
+experimental-mfsk16,batch,poor,2,10,0,0,0,0,0,0,0,0,0.0000,0.0000,0.2775,80.000,40.00
+experimental-mfsk16,batch,poor,4,10,0,0,0,0,0,0,0,0,0.0000,0.0000,0.2775,80.000,40.00

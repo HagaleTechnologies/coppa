@@ -36,3 +36,11 @@ header value 2 does not allocate a production air version.
 streaming receive paths on the same seeds, but only for the `ofdm:1` baseline
 until a floor waveform is selected. `connect` and `ramp` need the production
 floor session and do not exist yet.
+
+The candidate's batch receiver searches seven CFO hypotheses in 50 Hz steps
+between -150 and +150 Hz, sharing a 22-tone matched-filter bank. Decode work
+is limited to 16 timing/frequency candidates across the whole search. The
+transmitted tone frequencies and frame bytes stay unchanged. See the
+[remaining acquisition limits](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-not-built-yet).
+Clean SSB tests must flush the FIR tail. Truncating at the original frame
+length drops delayed payload samples and measures truncation as well as filtering.

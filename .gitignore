@@ -102,6 +102,16 @@ docs/superpowers/
 !/results/cop-187/dev-header-awgn/
 !/results/cop-187/dev-header-awgn/metadata.txt
 !/results/cop-187/dev-header-awgn/sweep.csv
+# COP-187 integer-tone CFO development evidence.
+!/results/cop-187/dev-cfo-zero-poor/
+!/results/cop-187/dev-cfo-zero-poor/metadata.txt
+!/results/cop-187/dev-cfo-zero-poor/sweep.csv
+!/results/cop-187/dev-cfo-minus150-poor/
+!/results/cop-187/dev-cfo-minus150-poor/metadata.txt
+!/results/cop-187/dev-cfo-minus150-poor/sweep.csv
+!/results/cop-187/dev-cfo-plus150-poor/
+!/results/cop-187/dev-cfo-plus150-poor/metadata.txt
+!/results/cop-187/dev-cfo-plus150-poor/sweep.csv
 # Catalyst orchestrator runtime state (worktree-local; never committed — see
 # catalyst's execution-core/worktree-safety.mjs MACHINE_LOCAL_NOISE list)
 .catalyst/.workflow-context.json

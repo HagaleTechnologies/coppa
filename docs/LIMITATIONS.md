@@ -422,7 +422,12 @@ stall scenario does (`docs/testing/bpq-session.md`).
   remain unimplemented, and no final-seed sweep has been recorded.
 - The capture adapter bounds retained history but decodes only when asked.
   It is not a continuous streaming detector. The 300-second noise tests,
-  BPSK challenger, CFO acquisition and production integration remain open.
+  BPSK challenger and production integration remain open. The batch candidate
+  now searches seven integer-tone CFO hypotheses from -150 to +150 Hz in 50 Hz
+  steps with at most 16 timing/frequency decode attempts per capture. Tests
+  cover clean unknown timing at each hypothesis, and -6 dB AWGN, flushed SSB
+  filtering and corrupted payload rejection at 0 and +/-150 Hz. This is not
+  evidence for arbitrary CFO between hypotheses or continuous acquisition.
 - The candidate's literal header value 2 is experimental, not an allocation of
   production air version 2. Frozen v1 formats, host fields and C ABI are unchanged.
 - See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for raw

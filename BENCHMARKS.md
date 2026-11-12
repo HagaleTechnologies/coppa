@@ -5710,3 +5710,38 @@ realizations, with one CSV row set and metadata verdict block per path. The
 development CSVs above remain batch-only measurements of the experimental
 candidate; no final-seed `--rx both` sweep has been recorded, and the
 production floor waveform those sweeps must select does not exist yet.
+
+
+### COP-187 integer-tone CFO acquisition development check
+
+The experimental batch 16-FSK receiver now shares 22 matched-filter tones
+across seven CFO hypotheses from -150 to +150 Hz in 50 Hz steps. It attempts
+at most 16 timing/frequency candidates per capture. The transmitter is unchanged.
+This is a development check, not production or final-seed acceptance.
+
+Reproduce each committed directory with the following command, substituting
+`-150`, `0` and `150` and the corresponding directory below:
+
+```sh
+cargo run --release -p coppa-bench --example floor_candidate -- --channel poor --trials 10 --seed 12648430 --cfo -150 --out-dir results/cop-187/dev-cfo-minus150-poor
+```
+
+All arms use development base `0x00C0FFEE`, the -12..+4 dB grid in 2 dB steps,
+and ten attempts per point through the persistent seeded Poor channel. The
+columns below aggregate 90 attempts. FER, Wilson intervals, crossings and
+accounting are recomputed by `integer_tone_cfo_development_measurements_are_auditable`.
+
+| CFO Hz | Directory under `results/cop-187/` | Frame errors | Sync failures | 50% crossing dB | Sync-share violations dB |
+|---:|---|---:|---:|---:|---|
+| -150 | `dev-cfo-minus150-poor` | 16 | 11 | -10.3333 | -10, -8 |
+| 0 | `dev-cfo-zero-poor` | 20 | 16 | -9.3333 | -8, -6 |
+| 150 | `dev-cfo-plus150-poor` | 16 | 10 | -10.0000 | -8 |
+
+No arm delivered wrong payloads. All three commands exit 1 because acquisition
+failures violate the unchanged sync-share bar above the crossing. Better
+crossings do not select this candidate. The historical zero-CFO-only evidence
+above remains intact. These measurements do not establish arbitrary fractional
+CFO tolerance, continuous acquisition, production v2 framing or session recovery.
+Unit tests separately cover clean SSB filtering with its FIR tail flushed and
+one seeded -6 dB AWGN capture at 0 and +/-150 Hz. They do not establish a filtered
+FER curve or a noisy SSB compatibility envelope.
