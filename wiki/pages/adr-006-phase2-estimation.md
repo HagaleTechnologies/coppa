@@ -8,8 +8,8 @@ sources:
   - docs/adr/006-phase2-parametric-estimation-nr-bg2.md
   - crates/coppa-protocol/src/modem/**
 verified:
-  commit: 59b0b63
-  date: 2026-07-14
+  commit: d04f6f3
+  date: 2026-11-11
 links:
   - overview
   - adr-004-strongest-path-timing
@@ -60,6 +60,6 @@ HARQ reconstruction uses the current RV. Turbo rescues retain the matching pilot
 recommendation because the original observations no longer match re-equalization.
 The full loop failed both bars and regressed Poor-segment goodput, so production
 retains the pilot selector. SNR telemetry and LDPC noise retain their separate meaning.
-See [the COP-152 benchmark record](../../BENCHMARKS.md#cop-152-bounded-prefix-payload-residual)
+See [the COP-152 benchmark record](../../docs/benchmarks/2026-11-06-cop-152-bounded-prefix-residual.md#cop-152-bounded-prefix-payload-residual)
 for screening coverage, full comparisons and their limits. The historical COP-133
 full-observation experiment remains a failed control, not the new contract.

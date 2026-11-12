@@ -19,7 +19,7 @@ not measure a single isolated receiver change.
 
 | Gap | Historical observation | Tracked evidence |
 |---|---|---|
-| Level 4 after the Phase 1 timing hotfix | Moderate peak goodput was 1632 bps before Phase 1, 633 bps broken, then 1234 bps after the hotfix. Poor was 772, 333, then 555 bps. Recovery was only 72% to 76% of the pre-Phase-1 peak. | [BENCHMARKS, hotfix section](../../BENCHMARKS.md#2026-07--hotfix-sparse-pilot-header-watterson-fading-regression-adr-004), [ADR-004](../adr/004-strongest-path-timing.md) |
+| Level 4 after the Phase 1 timing hotfix | Moderate peak goodput was 1632 bps before Phase 1, 633 bps broken, then 1234 bps after the hotfix. Poor was 772, 333, then 555 bps. Recovery was only 72% to 76% of the pre-Phase-1 peak. | [BENCHMARKS, hotfix section](../benchmarks/2026-07-phase1-radio-reality.md#2026-07--hotfix-sparse-pilot-header-watterson-fading-regression-adr-004), [ADR-004](../adr/004-strongest-path-timing.md) |
 | Levels 3 to 6 after cumulative Phase 2 | Moderate FER regressed at matched SNR. Level 6 at 30 dB went from 10.25% to 40.0% FER. | [ADR-006, cumulative results](../adr/006-phase2-parametric-estimation-nr-bg2.md#consequences), [limitations](../LIMITATIONS.md) |
 
 The hotfix tables used 400 trials per point with the same seed/grid as their
@@ -49,7 +49,7 @@ level 4 is QPSK 3/4.
   fixed it. [ADR-006's addendum](../adr/006-phase2-parametric-estimation-nr-bg2.md)
   records the fix and combined CFO/fading checks. Those checks do not establish
   recovery of either historical fading curve.
-- The later [fading root-cause investigation](../../BENCHMARKS.md#2026-07--fading-root-cause-investigation-the-coarse-delay-reference-theory-falsified)
+- The later [fading root-cause investigation](../benchmarks/2026-07-fading-coarse-delay-falsified.md#2026-07--fading-root-cause-investigation-the-coarse-delay-reference-theory-falsified)
   falsified the coarse-delay-reference explanation at level 2. Moderate's
   configured 0.5 Hz Doppler spread, Gaussian PSD sigma 0.25 Hz, leaves about 10%
   correlation by the end of a 1.365 s level-2 frame. Single-tap FER at 9/12/15 dB
@@ -67,7 +67,7 @@ level 4 is QPSK 3/4.
   channel, ACK assumptions and receiver path differ from the frame sweep.
   It is evidence for a candidate mechanism, not a demonstrated fix for these
   frame regressions. Short CP likewise has channel/SNR-dependent results in
-  [BENCHMARKS](../../BENCHMARKS.md#2026-07--short-cp-coherence-time-lever-measured-against-real-fading).
+  [BENCHMARKS](../benchmarks/2026-07-short-cp-coherence-time.md#2026-07--short-cp-coherence-time-lever-measured-against-real-fading).
 
 Searches of the available read-only research/plans history by COP-134, H-108,
 `fade-spike` and `repository: coppa` found no separate fade-spike report. Its

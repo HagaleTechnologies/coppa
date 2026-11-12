@@ -9,7 +9,8 @@ PHY header (§4.2) and the MAC header (§17.1).
 | 3 (adds §22, COP-119) | 2026-11-04 | 0.9.0 | `79ee3aa` |
 | 4 (adds §23, COP-121) | 2026-11-08 | 0.11.0 | COP-121 branch, based on `f6e9951` |
 | 5 (adds §0.3 air-protocol v1 contract, COP-178) | 2026-11-09 | 0.12.0 | COP-178 branch, based on `4237273` |
-| 6 (names capability flag bit 5 `windowed_arq` in §20.1, COP-168) | 2026-11-10 | 0.14.0 | COP-168 branch, based on `28d4c9a` |
+| 6 (registers air-protocol version 2, the low-rate floor, COP-190) | 2026-11-12 | 0.14.0 | COP-190 branch, based on `cddfc25` + COP-189 `84f0d5e` |
+| 7 (names capability flag bit 5 `windowed_arq` in §20.1, COP-168) | 2026-11-12 | 0.14.0 | COP-168 branch, based on `28d4c9a`, merged over revision 6 |
 
 There is no in-band version negotiation. §0.1 records the wire-break
 history; §0.3 states what air-protocol version 1 freezes from crate 0.12.0
@@ -183,6 +184,16 @@ signalled.
 The MAC header version nibble keeps its documented receive leniency (§17.6):
 a receiver parses a MAC header whatever its version nibble. This contract
 adds no rejection behavior.
+
+Value `2` is allocated (COP-190, revision 6) to the low-rate floor framing:
+a separate 16-FSK air format — 50 baud, 16 tones at 600–1350 Hz, 8.0 s
+fixed airtime, 40-byte PDU — whose header version nibble is stamped `2`.
+Its frozen parameters, receiver search bounds and delivery rules are
+normative in `docs/adr/014-cop190-low-rate-floor.md`, implemented as
+`coppa_protocol::modem::floor` and guarded by
+`crates/coppa-protocol/tests/air_v2_conformance.rs` and
+`crates/coppa-protocol/tests/floor_receive.rs`. It changes nothing in this
+version-1 contract; every §0.3.5 freeze row still applies to version 1.
 
 #### 0.3.4 What is frozen, what may change
 

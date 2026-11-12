@@ -126,3 +126,13 @@ thoughts/
 
 # COP-114 independent FX.25 audio regression fixtures.
 !crates/coppa-codec/tests/fixtures/fx25/*.wav
+
+# COP-190 production-floor development evidence.
+!/results/cop-190/
+/results/cop-190/**
+!/results/cop-190/dev-awgn/
+!/results/cop-190/dev-awgn/sweep.csv
+!/results/cop-190/dev-awgn/metadata.txt
+!/results/cop-190/dev-poor/
+!/results/cop-190/dev-poor/sweep.csv
+!/results/cop-190/dev-poor/metadata.txt
