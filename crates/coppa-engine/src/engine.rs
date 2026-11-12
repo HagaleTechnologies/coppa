@@ -8,6 +8,7 @@ use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::compression::huffman::HuffmanCodec;
 use coppa_protocol::compression::lz4::{lz4_compress, lz4_decompress};
 use coppa_protocol::cp_negotiator::CpMode;
+use coppa_protocol::modem::floor::{FloorFrame, FloorStream};
 use coppa_protocol::modem::streaming::StreamingReceiver;
 use coppa_protocol::modem::transceiver::{CoppaTransceiver, MAX_CODEWORDS};
 
@@ -132,6 +133,14 @@ pub struct CoppaCore {
     /// that one-time extra per-level cache construction at startup is an
     /// acceptable, bounded cost (not a hot-path duplication).
     streaming: StreamingReceiver,
+    /// Separately detected low-rate floor receive path (air-protocol
+    /// version 2, COP-190/ADR-014), constructed alongside the OFDM paths.
+    /// The session controller does not switch onto it yet; it is the
+    /// engine's floor codec and detector for callers that ask for them
+    /// explicitly.
+    floor: FloorFrame,
+    /// Continuous floor detector over [`Self::push_floor_samples`].
+    floor_stream: FloorStream,
 }
 
 impl std::fmt::Debug for CoppaCore {
@@ -142,7 +151,6 @@ impl std::fmt::Debug for CoppaCore {
         f.debug_struct("CoppaCore")
             .field("config", &self.config)
             .field("fft_size", &profile.fft_size)
-            .field("cp_samples", &profile.cp_samples)
             .finish_non_exhaustive()
     }
 }
@@ -175,11 +183,32 @@ impl CoppaCore {
             Self::select_ofdm_profile(config.speed_level, config.cp_mode, config.ofdm_band);
         let transceiver = CoppaTransceiver::new(ofdm_profile.clone(), WIRE_FORMAT_VERSION);
         let streaming = StreamingReceiver::new(ofdm_profile, WIRE_FORMAT_VERSION);
+        let floor = FloorFrame::new();
+        let floor_stream = FloorStream::default();
         Self {
             transceiver,
             config,
             streaming,
+            floor,
+            floor_stream,
         }
+    }
+
+    /// The engine's separately detected low-rate floor codec
+    /// (air-protocol version 2, COP-190). Encode and receive floor frames
+    /// through it directly; the OFDM paths are untouched by it, and the
+    /// session controller does not switch onto it yet.
+    #[must_use]
+    pub fn floor(&self) -> &FloorFrame {
+        &self.floor
+    }
+
+    /// Push floor-band audio into the engine's continuous floor detector
+    /// and return CRC-validated floor PDUs once each (COP-190). This path
+    /// is separate from [`Self::push_samples`]: an OFDM frame never
+    /// delivers here and a floor frame never delivers there.
+    pub fn push_floor_samples(&mut self, chunk: &[f32]) -> Vec<Vec<u8>> {
+        self.floor_stream.push(chunk)
     }
 
     /// Whether `speed_level` on an engine bound to `band` resolves to the VHF
