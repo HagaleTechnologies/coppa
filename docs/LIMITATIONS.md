@@ -374,8 +374,9 @@ update.
   floor-aware Link/daemon session controller (capability negotiation,
   connect-on-floor, OFDM fallback after two expired response windows, the
   five-acknowledged-exchange OFDM probe) is unbuilt, the −6 dB connect bar
-  (9 of 10 within 60 s) is unmet, and no production-floor FER sweep
-  (development or final seed) has been recorded. The Poor ramp acceptance,
+  (9 of 10 within 60 s) is unmet. Production development sweeps now
+  cover batch and streaming reception on AWGN and Poor; final-seed
+  production sweeps remain unrecorded. The Poor ramp acceptance,
   the final-seed 200-trial sweeps and the `--waveform floor`, `connect`
   and `ramp` drivers belong to COP-191.
 - What exists for judgement is the measurement contract the floor will be
@@ -394,12 +395,14 @@ update.
   faded paths. No endpoint (Link or daemon) drives it yet.
 - The 16-FSK design now exists twice: COP-190 moved it into the production
   crates, while the measurement-only bench copy (`floor_candidate.rs`)
-  stays frozen for measurement continuity. The production floor has no
+  retains its historical measurements. The production floor has no
   Link or daemon caller yet. The design's development Poor sweep, measured
   on the frozen bench copy, fails the conservative sync-share clause:
-  header sync dominates near the crossing, the honest open RF question.
-  See BENCHMARKS, "COP-169 experimental 16-FSK candidate", for raw results
-  and scope.
+  header sync dominates near the crossing. Production development sweeps
+  also fail sync share, at −12 dB AWGN and −8/−6 dB Poor for both paths.
+  Production 50% crossings are at or below −12 dB AWGN and −9 dB Poor.
+  These ten-trial development points do not establish final acceptance.
+  See BENCHMARKS, "COP-190 production floor development measurements".
 - COP-187 repairs the experimental candidate's independent hard header
   decisions by jointly decoding legal length/CRC combinations. Paired Poor
   development runs reduce frame errors from 24/90 to 20/90, but header

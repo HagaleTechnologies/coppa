@@ -1,0 +1,22 @@
+waveform=floor-v2
+production=true
+acceptance_run=false
+air_protocol_version=2
+seed_base=12648430
+seed_derivation=attempt_seed(base,point,10,trial); persistent direction=0
+trials_per_point=10
+channel=poor
+frame_samples=384000
+payload_bytes=40
+sample_rate=48000
+cfo_hz=0
+ssb=false
+rx=FloorFrame::receive,FloorStream::push
+lead_samples=16800..19199
+tail_samples=48000
+stream_chunk_samples=4800
+stream_failure_accounting=no-delivery-is-sync-no-detection; no trusted stage trace
+batch_verdict=Verdict { crossing: Some(At { db: -9.0, all: [-9.0] }), bar_db: -2.0, sync_share_violations: [-8.0, -6.0], wrong_payloads: 0, accounting_errors: [] }
+streaming_verdict=Verdict { crossing: Some(At { db: -9.0, all: [-9.0] }), bar_db: -2.0, sync_share_violations: [-8.0, -6.0], wrong_payloads: 0, accounting_errors: [] }
+wall_seconds=69.731476806
+command=cargo test --release -p coppa-bench --test floor_results record_production_floor_development_sweeps -- --ignored --nocapture

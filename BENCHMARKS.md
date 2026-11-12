@@ -18,7 +18,8 @@ Raw per-point data is regenerable into `results/awgn.csv` (gitignored).
 Measured 2026-11-11 on x86_64 Linux, release build, with the new
 `floor_mode` diagnostic. The production floor waveform now exists (COP-190:
 `coppa-codec::floor` and `coppa-protocol::modem::floor`, air-protocol
-version 2) but has no measured rows here yet; these rows remain the
+version 2); its development measurements are in the COP-190 section below.
+These baseline rows remain the
 `hf_narrow` level-1 frame (56-byte payload, 6.93 s airtime) that the floor
 has to beat, measured the way the floor will be judged:
 
@@ -5804,9 +5805,9 @@ batch and `StreamingReceiver` paths over the same grid, seeds and channel
 realizations, with one CSV row set and metadata verdict block per path. The
 development CSVs above remain batch-only measurements of the experimental
 candidate; no final-seed `--rx both` sweep has been recorded, and the
-production floor waveform those sweeps must select does not exist yet.
+production floor waveform is now implemented as air-protocol version 2.
+The `floor_mode` diagnostic still measures only the OFDM baseline.
 
-<<<<<<< HEAD
 ## COP-189 continuous candidate acquisition slice
 
 `floor_candidate --streaming` exercises continuous acquisition of the existing
@@ -5849,20 +5850,22 @@ Diagnostic metadata now records the grid and expanded work bound. Historical
 COP-169 and COP-187 CSVs remain measurements of their original receivers.
 
 The search holds CFO constant over the frame. It does not implement fading
-tracking or prove reception between grid points. The BPSK comparison, production
-selection and integration, session support and final sweep/connect/ramp evidence
-remain unbuilt. No acceptance criterion is declared complete by this repair.
-=======
+tracking or prove reception between grid points. The BPSK comparison,
+session integration and final sweep/connect/ramp evidence
+remain unbuilt. COP-190 separately implements production v2 framing and
+engine receive paths. No acceptance criterion is declared complete by this repair.
 
 ### COP-187 integer-tone CFO acquisition development check
 
-The experimental batch 16-FSK receiver now shares 22 matched-filter tones
+This historical experimental batch 16-FSK receiver shared 22 matched-filter tones
 across seven CFO hypotheses from -150 to +150 Hz in 50 Hz steps. It attempts
 at most 16 timing/frequency candidates per capture. The transmitter is unchanged.
 This is a development check, not production or final-seed acceptance.
 
-Reproduce each committed directory with the following command, substituting
-`-150`, `0` and `150` and the corresponding directory below:
+These historical runs used revision `456661e`, before COP-189 expanded
+the search grid. On that revision, reproduce each committed directory with
+the following command, substituting `-150`, `0` and `150` and the
+corresponding directory below:
 
 ```sh
 cargo run --release -p coppa-bench --example floor_candidate -- --channel poor --trials 10 --seed 12648430 --cfo -150 --out-dir results/cop-187/dev-cfo-minus150-poor
@@ -5887,4 +5890,46 @@ CFO tolerance, continuous acquisition, production v2 framing or session recovery
 Unit tests separately cover clean SSB filtering with its FIR tail flushed and
 one seeded -6 dB AWGN capture at 0 and +/-150 Hz. They do not establish a filtered
 FER curve or a noisy SSB compatibility envelope.
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
+
+
+## COP-190 production floor development measurements
+
+Measured 2026-11-12, x86_64 Linux, release build. These are production
+`FloorFrame::receive` and `FloorStream::push` measurements of air version 2,
+not the experimental candidate. Reproduce through the bench test harness:
+
+```sh
+cargo test --release -p coppa-bench --test floor_results record_production_floor_development_sweeps -- --ignored --nocapture
+cargo test -p coppa-bench --test floor_results production_floor_development_measurements_are_auditable
+```
+
+The nine-point −12..+4 dB grid uses ten 40-byte payloads per point, development
+base `0x00C0FFEE`, and `attempt_seed(base, point, 10, trial)`. Each attempt
+uses one persistent channel, direction 0, with noise referenced to clean active
+power in 3 kHz. Batch and streaming see the same capture. It has 16,800..19,199
+lead-in noise samples and 48,000 trailing noise samples to cover channel delay
+and the next streaming decode interval. Streaming chunks are 4,800 samples.
+CFO is zero and SSB filtering is off. Waveform airtime is 8 s, excluding noise
+padding. Goodput counts delivered payload bits per waveform airtime.
+
+| Channel | RX | Errors / attempts | 50% crossing dB | Sync-share violations dB |
+|---|---|---:|---:|---|
+| AWGN | batch | 2 / 90 | ≤ −12 | −12 |
+| AWGN | streaming | 2 / 90 | ≤ −12 | −12 |
+| Poor | batch | 21 / 90 | −9 | −8, −6 |
+| Poor | streaming | 21 / 90 | −9 | −8, −6 |
+
+All four arms deliver zero wrong payloads. All fail the unchanged sync-share
+clause despite crossing below its threshold. The AWGN crossing is a bound,
+not an extrapolated crossing. Streaming exposes no trusted failure-stage trace;
+every absent delivery is conservatively counted as SyncFailed/NoDetection.
+Batch separates acquisition, header and payload failures without claiming
+mistiming detection. The CSV audit recomputes counts, FER, Wilson 95% intervals,
+airtime, goodput, crossings and verdicts, including failed trials.
+
+Raw CSVs and metadata are in `results/cop-190/dev-awgn/` and
+`results/cop-190/dev-poor/`. These ten-trial development runs do not establish
+the 200-trial final-seed bar, negotiated sessions, connection success or fade
+recovery. The floor-aware Link/daemon controller and connection trials are
+still missing. COP-191 owns the final-seed sweeps, Poor ramp and diagnostic
+drivers.

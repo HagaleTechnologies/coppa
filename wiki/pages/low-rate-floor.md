@@ -10,13 +10,8 @@ sources:
   - crates/coppa-bench/src/floor_candidate.rs
   - crates/coppa-protocol/src/modem/floor.rs
 verified:
-<<<<<<< HEAD
   commit: 19948e9f8eb8e8139fb86b9237112cc83ed6095a
   date: 2026-11-12
-=======
-  commit: 9295659
-  date: 2026-11-11
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
 links:
   - coppa-protocol
   - band-conventions
@@ -24,26 +19,18 @@ links:
 # What has the low-rate floor experiment measured?
 
 COP-187's batch header repair reduces experimental candidate errors on paired
-<<<<<<< HEAD
 development seeds. COP-190 then moved the measured 16-FSK design into the
 production crates as air-protocol version 2; no session uses it yet. The
 remaining Poor failures on the frozen bench copy still violate the separate
 acquisition bar, despite a favorable FER crossing. See
 [measurements](../../BENCHMARKS.md#cop-187-experimental-header-repair)
 and [open requirements](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-session-integration-open).
-=======
-development seeds. It does not select a production waveform. The remaining
-Poor failures still violate the separate acquisition bar, despite a favorable
-FER crossing. See [measurements](../../BENCHMARKS.md#cop-187-experimental-header-repair)
-and [unmet requirements](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-not-built-yet).
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
 
 Joint length/CRC decoding uses redundancy that independent hard nibble decisions
 discard. A legal header hypothesis alone cannot justify delivery. Preserve the
 version check, evidence threshold, payload CRC and padding checks, and continue
 to count failed headers in SyncFailed.
 
-<<<<<<< HEAD
 The Capture adapter bounds history but requires an explicit batch decode.
 COP-189's separate `CandidateStream` decodes overlapping windows once per second
 and suppresses delivery of the same frame from successive windows. The
@@ -77,21 +64,13 @@ See [the regression and remaining work](../../BENCHMARKS.md#cop-189-cfo-acquisit
 COP-190 carries this search into the production floor receiver
 (`coppa-protocol::modem::floor`); session negotiation and fading tracking
 are still open.
-=======
-The Capture adapter bounds history but requires an explicit batch decode. Its
-chunk-partition test does not prove continuous acquisition. The experimental
-header value 2 does not allocate a production air version.
 
-`floor_mode sweep --rx batch|streaming|both` measures the production batch and
-streaming receive paths on the same seeds, but only for the `ofdm:1` baseline
-until a floor waveform is selected. `connect` and `ramp` need the production
-floor session and do not exist yet.
-
-The candidate's batch receiver searches seven CFO hypotheses in 50 Hz steps
-between -150 and +150 Hz, sharing a 22-tone matched-filter bank. Decode work
-is limited to 16 timing/frequency candidates across the whole search. The
-transmitted tone frequencies and frame bytes stay unchanged. See the
-[remaining acquisition limits](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-not-built-yet).
 Clean SSB tests must flush the FIR tail. Truncating at the original frame
 length drops delayed payload samples and measures truncation as well as filtering.
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
+
+
+COP-190 production development sweeps now exercise both floor receive paths
+on identical persistent-channel captures. Favorable crossings still fail the
+sync-share clause. See [the production measurements](../../BENCHMARKS.md#cop-190-production-floor-development-measurements)
+for seeds, accounting and remaining acceptance work. Session integration stays
+open; a decoded floor frame does not prove a connection.

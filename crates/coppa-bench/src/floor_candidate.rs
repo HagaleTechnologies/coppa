@@ -186,11 +186,7 @@ mod tests {
                     let start = (SYNC.len() + rep * 8 + byte * 2 + nibble) * SYMBOL_SAMPLES;
                     for (sample, tone) in audio[start..start + SYMBOL_SAMPLES]
                         .iter_mut()
-<<<<<<< HEAD
                         .zip(&c.oscillators[6 + 2 * usize::from(tone)][..SYMBOL_SAMPLES])
-=======
-                        .zip(&c.oscillators[usize::from(tone) + CFO_BINS])
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
                     {
                         *sample = tone.re;
                     }
@@ -215,7 +211,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn cfo_search_decodes_unknown_offset_in_batch_and_chunks() {
         let candidate = Candidate::new();
         let payload = b"CFO acquisition regression";
@@ -241,9 +236,6 @@ mod tests {
 
     #[test]
     fn cfo_characterization_never_delivers_wrong_bytes() {
-=======
-    fn acquires_integer_tone_cfo_without_timing_or_frequency_oracle() {
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
         let c = Candidate::new();
         let payload: Vec<_> = (0..MAX_PAYLOAD as u8).collect();
         let audio = c.encode(&payload).unwrap();
@@ -318,17 +310,10 @@ pub const MAX_PAYLOAD: usize = 40;
 const K: usize = 352;
 const E: usize = 1408;
 const HOP: usize = 120;
-<<<<<<< HEAD
 // 450..1500 Hz in 25 Hz steps covers all 16 tones at every CFO hypothesis.
 const SEARCH_BINS: usize = 43;
 const TEMPLATE_SAMPLES: usize = 2 * SYMBOL_SAMPLES;
 const CFO_HYPOTHESES: [usize; 13] = [6, 5, 7, 4, 8, 3, 9, 2, 10, 1, 11, 0, 12];
-=======
-// Integer tone offsets cover -150..+150 Hz in 50 Hz steps. This does not
-// claim acquisition at arbitrary offsets between those hypotheses.
-const CFO_BINS: usize = 3;
-const RX_TONES: usize = 16 + 2 * CFO_BINS;
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
 const SYNC: [usize; 16] = [0, 9, 4, 15, 2, 13, 6, 11, 1, 14, 7, 10, 3, 12, 5, 8];
 const HEADER_SYMBOLS: usize = 32;
 /// Exact fixed airtime, including sync and four header repetitions: 8 seconds.
@@ -457,27 +442,16 @@ impl Default for Candidate {
     }
 }
 impl Candidate {
-<<<<<<< HEAD
     /// Build reusable codec and 450..1500 Hz search templates in 25 Hz steps.
     #[must_use]
     pub fn new() -> Self {
         let oscillators = (0..SEARCH_BINS)
-=======
-    /// Build reusable codec and 450..1500 Hz receive tone templates.
-    #[must_use]
-    pub fn new() -> Self {
-        let oscillators = (0..RX_TONES)
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
             .map(|tone| {
                 (0..TEMPLATE_SAMPLES)
                     .map(|n| {
                         Complex32::from_polar(
                             1.0,
-<<<<<<< HEAD
                             std::f32::consts::TAU * (450 + 25 * tone) as f32 * n as f32
-=======
-                            std::f32::consts::TAU * (450 + 50 * tone) as f32 * n as f32
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
                                 / SAMPLE_RATE as f32,
                         )
                     })
@@ -526,20 +500,15 @@ impl Candidate {
         }
         let mut audio = Vec::with_capacity(FRAME_SAMPLES);
         for tone in tones {
-<<<<<<< HEAD
             audio.extend(
                 self.oscillators[6 + 2 * tone][..SYMBOL_SAMPLES]
                     .iter()
                     .map(|z| z.re),
             );
-=======
-            audio.extend(self.oscillators[tone + CFO_BINS].iter().map(|z| z.re));
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
         }
         Ok(audio)
     }
 
-<<<<<<< HEAD
     fn energies(&self, audio: &[f32]) -> Vec<[f32; SEARCH_BINS]> {
         // Sliding matched filters evaluate all eight symbol phases. The 25 Hz
         // search grid repeats every two symbols, including half-bin offsets.
@@ -547,15 +516,6 @@ impl Candidate {
             return Vec::new();
         }
         let mut sums = [Complex32::new(0.0, 0.0); SEARCH_BINS];
-=======
-    fn energies(&self, audio: &[f32]) -> Vec<[f32; RX_TONES]> {
-        // Sliding matched filters evaluate all eight symbol phases. Templates
-        // repeat every symbol, so subtract/add updates are exact up to rounding.
-        if audio.len() < SYMBOL_SAMPLES {
-            return Vec::new();
-        }
-        let mut sums = [Complex32::new(0.0, 0.0); RX_TONES];
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
         for (tone, sum) in sums.iter_mut().enumerate() {
             for (n, &x) in audio[..SYMBOL_SAMPLES].iter().enumerate() {
                 *sum += self.oscillators[tone][n] * x;
@@ -580,18 +540,11 @@ impl Candidate {
         out
     }
 
-<<<<<<< HEAD
     /// Search unknown sample alignment and 13 CFO hypotheses, trying at most 16
     /// separated candidates per hypothesis,
     /// and deliver only a CRC-validated PDU. No timing or header oracle is used.
     /// The fixed search grid is -150..150 Hz in 25 Hz steps. It is not tracking
     /// intra-frame drift or guaranteeing reception between grid points.
-=======
-    /// Search unknown sample alignment and seven integer-tone CFO hypotheses,
-    /// decode at most 16 separated timing/frequency candidates,
-    /// and deliver only a CRC-validated PDU. No timing or header oracle is used.
-    /// Fractional-tone CFO acquisition remains uncharacterized.
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
     /// # Errors
     /// Reports the deepest receiver stage reached; never delivers unchecked bits.
     pub fn receive(&self, audio: &[f32]) -> Result<Vec<u8>, CandidateError> {
@@ -634,7 +587,6 @@ impl Candidate {
     ) -> Result<(Vec<u8>, usize), CandidateError> {
         let stride = SYMBOL_SAMPLES / HOP;
         let mut candidates = Vec::new();
-<<<<<<< HEAD
         for start in 0..energy.len().saturating_sub((SYNC.len() - 1) * stride) {
             if start * HOP < min_start {
                 continue;
@@ -650,37 +602,22 @@ impl Candidate {
                 / SYNC.len() as f32;
             if score > 0.16 {
                 candidates.push((start, score));
-=======
-        for offset in 0..=2 * CFO_BINS {
-            for start in 0..energy.len().saturating_sub((SYNC.len() - 1) * stride) {
-                let score: f32 = SYNC
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &tone)| {
-                        let row = &energy[start + i * stride][offset..offset + 16];
-                        row[tone] / row.iter().sum::<f32>().max(1e-20)
-                    })
-                    .sum::<f32>()
-                    / SYNC.len() as f32;
-                if score > 0.16 {
-                    candidates.push((start, offset, score));
-                }
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
             }
         }
-        candidates.sort_by(|a, b| b.2.total_cmp(&a.2));
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
         let mut tried = Vec::new();
         let mut error = CandidateError::Acquisition;
-        for (start, offset, _) in candidates {
-            if tried.iter().any(|&(old, old_offset): &(usize, usize)| {
-                old_offset == offset && old.abs_diff(start) < stride
-            }) {
+        for (start, _) in candidates {
+            if tried
+                .iter()
+                .any(|&old: &usize| old.abs_diff(start) < stride)
+            {
                 continue;
             }
             if tried.len() == 16 {
                 break;
             }
-            tried.push((start, offset));
+            tried.push(start);
             if error == CandidateError::Acquisition {
                 error = CandidateError::Header;
             }
@@ -688,14 +625,7 @@ impl Candidate {
             if base + (HEADER_SYMBOLS - 1) * stride >= energy.len() {
                 continue;
             }
-<<<<<<< HEAD
             let Some(header) = decode_header(energy, base, stride) else {
-=======
-            let header_energy: Vec<[f32; 16]> = (0..HEADER_SYMBOLS)
-                .map(|i| std::array::from_fn(|tone| energy[base + i * stride][offset + tone]))
-                .collect();
-            let Some(header) = decode_header(&header_energy, 0, 1) else {
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
                 continue;
             };
             error = CandidateError::Payload;
@@ -705,7 +635,7 @@ impl Candidate {
             }
             let mut soft = vec![0.0; E];
             for symbol in 0..E / 4 {
-                let row = &energy[base + symbol * stride][offset..offset + 16];
+                let row = energy[base + symbol * stride];
                 let scale = row.iter().sum::<f32>().max(1e-20) / 16.0;
                 for bit in 0..4 {
                     let mut zero = 0.0f32;
