@@ -9,8 +9,8 @@ sources:
   - ARCHITECTURE.md
   - CLAUDE.md
 verified:
-  commit: 56361d6
-  date: 2026-10-28
+  commit: d04f6f3
+  date: 2026-11-11
 links:
 ---
 Coppa is an open-source OFDM digital modem for amateur radio written in Rust,
@@ -40,9 +40,9 @@ waveform definition is `docs/SPEC.md`; operator documentation is
 - `crates/coppa-cli/` — CLI binary (`coppa`), incl. live `rx` and two-tone `tune`
 - `crates/coppa-daemon/` — daemon binary (`coppad`): PTT-gated TX chokepoint, busy gate, station ID/beacon; see [[phase4-field-readiness]]
 - `crates/coppa-bench/` — measurement harness (not a product crate); its lib tests guard each level's FER waterfall
-- `docs/adr/` — eight ADRs (workspace, FEC, Phase 1 waveform, sync timing, NR BG2, Phase 2 estimation, multi-codeword, Phase 3 system layer)
+- `docs/adr/` has 15 ADR files, indexed with status in [docs/adr/README.md](../../docs/adr/README.md)
 - `docs/SPEC.md` — normative waveform conformance spec; `docs/OPERATING.md` — operator guide
-- `BENCHMARKS.md` — measured performance data; normative for phase acceptance results
+- `BENCHMARKS.md` is the current-state summary; `docs/benchmarks/` holds the unchanged measurement logs and phase acceptance results
 
 ## Start here
 

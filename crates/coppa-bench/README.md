@@ -12,11 +12,12 @@ Not on crates.io and not a product crate. From a clone of the repository:
 
 - `cargo run -p coppa-bench --release -- --trials 50` sweeps every speed level over AWGN.
 - `cargo run -p coppa-bench --release --example <name>` runs one scenario from
-  `crates/coppa-bench/examples/`.
+  `crates/coppa-bench/diagnostics/`.
 - `cargo test -p coppa-bench --lib waterfall_bracket` runs the per-level FER guards.
 
 Results are logged in [BENCHMARKS.md](https://github.com/HagaleTechnologies/coppa/blob/main/BENCHMARKS.md).
-Read its "Measurement conventions corrected" section first: entries older than that section
+Read its [Conventions](../../BENCHMARKS.md) section and the
+[conventions-correction log](../../docs/benchmarks/2026-07-measurement-conventions-rebaseline.md) first: entries older than that section
 use an SNR convention that reads about 9 dB optimistic.
 
 ## Limits
