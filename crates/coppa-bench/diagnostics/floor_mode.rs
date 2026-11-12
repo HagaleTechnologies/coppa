@@ -14,10 +14,18 @@
 //! swept over the same grid, seeds and channel realizations and gets its own
 //! CSV `rx_path` rows and metadata verdict block.
 //!
+<<<<<<< HEAD
 //! Select `--waveform floor` for the production 8 s floor codec or omit it
 //! for the unchanged `ofdm:1` baseline. Floor batch and continuous receivers
 //! consume the same capture per seed. Connect/ramp still require COP-190's
 //! deferred Link/daemon session controller.
+=======
+//! The floor waveform itself is not built yet (see `docs/LIMITATIONS.md`,
+//! COP-169), so the only waveform this measures today is `ofdm:1`, the
+//! `hf_narrow` level-1 frame the floor has to beat. Its sweep is expected to
+//! fail the bar; that failure is the baseline. `connect` and `ramp` are still
+//! unimplemented: they need the production floor session first.
+>>>>>>> 456661e52470aee3cd02511b9442932d0330b409
 //!
 //! Run:
 //! `cargo run --release -p coppa-bench --example floor_mode -- sweep --rx both --channel awgn --trials 200 --seed 378535936 --out-dir results/cop-169/baseline-awgn`
@@ -29,9 +37,15 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use coppa_bench::floor_sweep::{
+<<<<<<< HEAD
     acceptance_grid, evaluate, run_floor_sweep, run_sweep, snr_grid, RxPath, SweepChannel,
     CSV_HEADER, DEV_SEED_BASE, FINAL_SESSION_SEED_BASE, FINAL_SWEEP_SEED_BASE, FLOOR_TAIL_S,
     LEAD_IN_S, STREAM_CHUNK_SAMPLES, TAIL_S, TRIALS_PER_POINT,
+=======
+    acceptance_grid, evaluate, run_sweep, snr_grid, RxPath, SweepChannel, CSV_HEADER,
+    DEV_SEED_BASE, FINAL_SESSION_SEED_BASE, FINAL_SWEEP_SEED_BASE, LEAD_IN_S, STREAM_CHUNK_SAMPLES,
+    TAIL_S, TRIALS_PER_POINT,
+>>>>>>> 456661e52470aee3cd02511b9442932d0330b409
 };
 use coppa_channel::persistent::SnrProfile;
 use coppa_codec::ofdm::CoppaProfile;
@@ -66,6 +80,7 @@ impl RxArg {
     }
 }
 
+<<<<<<< HEAD
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum WaveformArg {
     #[value(name = "ofdm:1")]
@@ -98,6 +113,8 @@ fn all_selected_pass(verdicts: &[bool]) -> bool {
     !verdicts.is_empty() && verdicts.iter().all(|&v| v)
 }
 
+=======
+>>>>>>> 456661e52470aee3cd02511b9442932d0330b409
 #[derive(Subcommand)]
 enum Command {
     /// FER sweep of one waveform over an SNR grid.
@@ -143,6 +160,7 @@ fn main() -> anyhow::Result<ExitCode> {
         ChannelArg::Awgn => SweepChannel::Awgn,
         ChannelArg::Poor => SweepChannel::Poor,
     };
+<<<<<<< HEAD
     let grid = validate_configuration(snr_min, snr_max, snr_step, trials)?;
     let paths = rx.paths();
     let payload_bytes;
@@ -179,6 +197,17 @@ fn main() -> anyhow::Result<ExitCode> {
     } else {
         TAIL_S
     };
+=======
+    let grid = snr_grid(snr_min, snr_max, snr_step);
+    anyhow::ensure!(!grid.is_empty(), "empty SNR grid");
+    anyhow::ensure!(trials > 0, "--trials must be positive");
+    let paths = rx.paths();
+
+    let tx = CoppaTransceiver::new(CoppaProfile::hf_narrow(), 1);
+    let payload_bytes = coppa_protocol::modem::speed_levels::max_payload_for_level(LEVEL)
+        .ok_or_else(|| anyhow::anyhow!("no level {LEVEL}"))?;
+
+>>>>>>> 456661e52470aee3cd02511b9442932d0330b409
     fs::create_dir_all(&out_dir)?;
     let mut csv = String::from(CSV_HEADER);
     csv.push('\n');
@@ -188,11 +217,19 @@ fn main() -> anyhow::Result<ExitCode> {
         grid == acceptance_grid() && trials == TRIALS_PER_POINT && seed == FINAL_SWEEP_SEED_BASE;
     let ramp = SnrProfile::cop169_ramp();
     let mut meta = format!(
+<<<<<<< HEAD
         "waveform={waveform_name}\nproduction=true\ncomplete=true\n\npayload_bytes={payload_bytes}\n\
          channel={}\nsnr_grid_db={grid:?}\ntrials_per_point={trials}\n\
          seed_base={seed:#x}\nseed_rule=attempt_seed(base, point, trials, trial) = base + point*trials + trial; \
          channel streams = coppa_channel::persistent::derive_seed(attempt_seed, direction, stream)\n\
          lead_in_s={LEAD_IN_S} (+ uniform 0-0.05 s)\ntail_s={tail_s}\nsnr_reference=clean frame mean power, 3 kHz\n\
+=======
+        "waveform={WAVEFORM}\nprofile=hf_narrow\nlevel={LEVEL}\npayload_bytes={payload_bytes}\n\
+         channel={}\nsnr_grid_db={grid:?}\ntrials_per_point={trials}\n\
+         seed_base={seed:#x}\nseed_rule=attempt_seed(base, point, trials, trial) = base + point*trials + trial; \
+         channel streams = coppa_channel::persistent::derive_seed(attempt_seed, direction, stream)\n\
+         lead_in_s={LEAD_IN_S} (+ uniform 0-0.05 s)\ntail_s={TAIL_S}\nsnr_reference=clean frame mean power, 3 kHz\n\
+>>>>>>> 456661e52470aee3cd02511b9442932d0330b409
          rx_paths={:?}\nstream_chunk_samples={STREAM_CHUNK_SAMPLES}\n\
          acceptance_run={acceptance_run}\nfinal_sweep_seed_base={FINAL_SWEEP_SEED_BASE:#x}\n\
          final_session_seed_base={FINAL_SESSION_SEED_BASE:#x}\nsession_ramp={ramp:?} ({} s)\n",
@@ -201,6 +238,7 @@ fn main() -> anyhow::Result<ExitCode> {
         ramp.duration_s(),
     );
     // Every measured receive path must meet the bar on its own.
+<<<<<<< HEAD
     meta.push_str(&format!(
         "invocation={}\n",
         std::env::args().collect::<Vec<_>>().join(" ")
@@ -212,6 +250,22 @@ fn main() -> anyhow::Result<ExitCode> {
     for (path, points) in results {
         for p in &points {
             let row = p.csv_row(waveform_name, path.name(), channel.name());
+=======
+    let mut all_pass = true;
+    for &path in paths {
+        let points = run_sweep(
+            &tx,
+            LEVEL,
+            payload_bytes,
+            channel,
+            path,
+            &grid,
+            trials,
+            seed,
+        )?;
+        for p in &points {
+            let row = p.csv_row(WAVEFORM, path.name(), channel.name());
+>>>>>>> 456661e52470aee3cd02511b9442932d0330b409
             println!("{row}");
             csv.push_str(&row);
             csv.push('\n');
@@ -227,10 +281,15 @@ fn main() -> anyhow::Result<ExitCode> {
             verdict.wrong_payloads,
             verdict.passes(),
         ));
+<<<<<<< HEAD
         verdicts.push(verdict.passes());
     }
     let all_pass = all_selected_pass(&verdicts);
     meta.push_str(&format!("all_selected_pass={all_pass}\n"));
+=======
+        all_pass &= verdict.passes();
+    }
+>>>>>>> 456661e52470aee3cd02511b9442932d0330b409
     fs::write(out_dir.join("sweep.csv"), csv)?;
     fs::write(out_dir.join("metadata.txt"), &meta)?;
     print!("{meta}");
