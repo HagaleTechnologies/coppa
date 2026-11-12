@@ -71,6 +71,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn header_length_erasure_recovers_from_crc_redundancy() {
         let c = Candidate::new();
         let sent = b"header fade regression!";
@@ -127,6 +128,8 @@ mod tests {
     }
 
     #[test]
+=======
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
     fn rejects_payload_corruption_and_nonfinite_audio() {
         let c = Candidate::new();
         let mut audio = c.encode(b"crc regression").unwrap();
@@ -141,6 +144,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn acquires_integer_tone_cfo_without_timing_or_frequency_oracle() {
         let c = Candidate::new();
         let payload: Vec<_> = (0..MAX_PAYLOAD as u8).collect();
@@ -177,6 +181,17 @@ mod tests {
             let mut corrupt = shifted;
             corrupt[(SYNC.len() + HEADER_SYMBOLS) * SYMBOL_SAMPLES..].fill(0.0);
             assert!(c.receive(&corrupt).is_err(), "corrupt CFO {cfo}");
+=======
+    fn cfo_characterization_never_delivers_wrong_bytes() {
+        let c = Candidate::new();
+        let payload = b"CFO characterization";
+        let audio = c.encode(payload).unwrap();
+        for cfo in [-150.0, 150.0] {
+            let shifted = coppa_channel::frequency_shift(&audio, cfo, SAMPLE_RATE as f32);
+            if let Ok(got) = c.receive(&shifted) {
+                assert_eq!(got, payload);
+            }
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
         }
     }
 
@@ -216,10 +231,13 @@ pub const MAX_PAYLOAD: usize = 40;
 const K: usize = 352;
 const E: usize = 1408;
 const HOP: usize = 120;
+<<<<<<< HEAD
 // Integer tone offsets cover -150..+150 Hz in 50 Hz steps. This does not
 // claim acquisition at arbitrary offsets between those hypotheses.
 const CFO_BINS: usize = 3;
 const RX_TONES: usize = 16 + 2 * CFO_BINS;
+=======
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
 const SYNC: [usize; 16] = [0, 9, 4, 15, 2, 13, 6, 11, 1, 14, 7, 10, 3, 12, 5, 8];
 const HEADER_SYMBOLS: usize = 32;
 /// Exact fixed airtime, including sync and four header repetitions: 8 seconds.
@@ -283,16 +301,27 @@ impl Default for Candidate {
     }
 }
 impl Candidate {
+<<<<<<< HEAD
     /// Build reusable codec and 450..1500 Hz receive tone templates.
     #[must_use]
     pub fn new() -> Self {
         let oscillators = (0..RX_TONES)
+=======
+    /// Build reusable codec and 600..1350 Hz tone templates.
+    #[must_use]
+    pub fn new() -> Self {
+        let oscillators = (0..16)
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
             .map(|tone| {
                 (0..SYMBOL_SAMPLES)
                     .map(|n| {
                         Complex32::from_polar(
                             1.0,
+<<<<<<< HEAD
                             std::f32::consts::TAU * (450 + 50 * tone) as f32 * n as f32
+=======
+                            std::f32::consts::TAU * (600 + 50 * tone) as f32 * n as f32
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
                                 / SAMPLE_RATE as f32,
                         )
                     })
@@ -315,7 +344,11 @@ impl Candidate {
         }
         let mut bytes = [0u8; MAX_PAYLOAD + 4];
         bytes[..payload.len()].copy_from_slice(payload);
+<<<<<<< HEAD
         let checksum = CRC32.checksum(payload).to_be_bytes();
+=======
+        let checksum = CRC32.checksum(&bytes[..MAX_PAYLOAD]).to_be_bytes();
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
         bytes[MAX_PAYLOAD..].copy_from_slice(&checksum);
         let mut info = vec![0; NrLdpc::INFO_LEN];
         for (i, b) in bytes.iter().enumerate() {
@@ -341,18 +374,30 @@ impl Candidate {
         }
         let mut audio = Vec::with_capacity(FRAME_SAMPLES);
         for tone in tones {
+<<<<<<< HEAD
             audio.extend(self.oscillators[tone + CFO_BINS].iter().map(|z| z.re));
+=======
+            audio.extend(self.oscillators[tone].iter().map(|z| z.re));
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
         }
         Ok(audio)
     }
 
+<<<<<<< HEAD
     fn energies(&self, audio: &[f32]) -> Vec<[f32; RX_TONES]> {
+=======
+    fn energies(&self, audio: &[f32]) -> Vec<[f32; 16]> {
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
         // Sliding matched filters evaluate all eight symbol phases. Templates
         // repeat every symbol, so subtract/add updates are exact up to rounding.
         if audio.len() < SYMBOL_SAMPLES {
             return Vec::new();
         }
+<<<<<<< HEAD
         let mut sums = [Complex32::new(0.0, 0.0); RX_TONES];
+=======
+        let mut sums = [Complex32::new(0.0, 0.0); 16];
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
         for (tone, sum) in sums.iter_mut().enumerate() {
             for (n, &x) in audio[..SYMBOL_SAMPLES].iter().enumerate() {
                 *sum += self.oscillators[tone][n] * x;
@@ -376,10 +421,16 @@ impl Candidate {
         out
     }
 
+<<<<<<< HEAD
     /// Search unknown sample alignment and seven integer-tone CFO hypotheses,
     /// decode at most 16 separated timing/frequency candidates,
     /// and deliver only a CRC-validated PDU. No timing or header oracle is used.
     /// Fractional-tone CFO acquisition remains uncharacterized.
+=======
+    /// Search unknown sample alignment, decode at most 16 separated candidates,
+    /// and deliver only a CRC-validated PDU. No timing or header oracle is used.
+    /// This initial candidate searches zero CFO only.
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
     /// # Errors
     /// Reports the deepest receiver stage reached; never delivers unchecked bits.
     pub fn receive(&self, audio: &[f32]) -> Result<Vec<u8>, CandidateError> {
@@ -389,6 +440,7 @@ impl Candidate {
         let energy = self.energies(audio);
         let stride = SYMBOL_SAMPLES / HOP;
         let mut candidates = Vec::new();
+<<<<<<< HEAD
         for offset in 0..=2 * CFO_BINS {
             for start in 0..energy.len().saturating_sub((SYNC.len() - 1) * stride) {
                 let score: f32 = SYNC
@@ -412,12 +464,40 @@ impl Candidate {
             if tried.iter().any(|&(old, old_offset): &(usize, usize)| {
                 old_offset == offset && old.abs_diff(start) < stride
             }) {
+=======
+        for start in 0..energy.len().saturating_sub((SYNC.len() - 1) * stride) {
+            let score: f32 = SYNC
+                .iter()
+                .enumerate()
+                .map(|(i, &tone)| {
+                    let row = energy[start + i * stride];
+                    row[tone] / row.iter().sum::<f32>().max(1e-20)
+                })
+                .sum::<f32>()
+                / SYNC.len() as f32;
+            if score > 0.16 {
+                candidates.push((start, score));
+            }
+        }
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut tried = Vec::new();
+        let mut error = CandidateError::Acquisition;
+        for (start, _) in candidates {
+            if tried
+                .iter()
+                .any(|&old: &usize| old.abs_diff(start) < stride)
+            {
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
                 continue;
             }
             if tried.len() == 16 {
                 break;
             }
+<<<<<<< HEAD
             tried.push((start, offset));
+=======
+            tried.push(start);
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
             if error == CandidateError::Acquisition {
                 error = CandidateError::Header;
             }
@@ -425,12 +505,37 @@ impl Candidate {
             if base + (HEADER_SYMBOLS - 1) * stride >= energy.len() {
                 continue;
             }
+<<<<<<< HEAD
             let header_energy: Vec<[f32; 16]> = (0..HEADER_SYMBOLS)
                 .map(|i| std::array::from_fn(|tone| energy[base + i * stride][offset + tone]))
                 .collect();
             let Some(header) = decode_header(&header_energy, 0, 1) else {
                 continue;
             };
+=======
+            let mut header = [0u8; 4];
+            for nibble in 0..8 {
+                let mut combined = [0.0; 16];
+                for rep in 0..4 {
+                    for (dst, e) in combined
+                        .iter_mut()
+                        .zip(energy[base + (rep * 8 + nibble) * stride])
+                    {
+                        *dst += e;
+                    }
+                }
+                let tone = combined
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                header[nibble / 2] |= (tone as u8) << (if nibble % 2 == 0 { 4 } else { 0 });
+            }
+            if !valid_header(&header) {
+                continue;
+            }
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
             error = CandidateError::Payload;
             let base = base + HEADER_SYMBOLS * stride;
             if base + (E / 4 - 1) * stride >= energy.len() {
@@ -438,7 +543,11 @@ impl Candidate {
             }
             let mut soft = vec![0.0; E];
             for symbol in 0..E / 4 {
+<<<<<<< HEAD
                 let row = &energy[base + symbol * stride][offset..offset + 16];
+=======
+                let row = energy[base + symbol * stride];
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
                 let scale = row.iter().sum::<f32>().max(1e-20) / 16.0;
                 for bit in 0..4 {
                     let mut zero = 0.0f32;
@@ -465,11 +574,15 @@ impl Candidate {
                 .chunks_exact(8)
                 .map(|bits| bits.iter().fold(0, |acc, b| (acc << 1) | b))
                 .collect();
+<<<<<<< HEAD
             if CRC32
                 .checksum(&bytes[..usize::from(header[1])])
                 .to_be_bytes()
                 != bytes[MAX_PAYLOAD..]
             {
+=======
+            if CRC32.checksum(&bytes[..MAX_PAYLOAD]).to_be_bytes() != bytes[MAX_PAYLOAD..] {
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
                 continue;
             }
             if bytes[usize::from(header[1])..MAX_PAYLOAD]
@@ -494,6 +607,7 @@ fn valid_header(header: &[u8; 4]) -> bool {
         && usize::from(header[1]) <= MAX_PAYLOAD
         && CRC16.checksum(&header[..2]).to_be_bytes() == header[2..]
 }
+<<<<<<< HEAD
 
 // Decode the repeated header as a short code over its legal length/CRC
 // combinations. Independent hard nibble decisions throw away CRC redundancy
@@ -548,3 +662,5 @@ fn decode_header(energy: &[[f32; 16]], base: usize, stride: usize) -> Option<[u8
         None
     }
 }
+=======
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38

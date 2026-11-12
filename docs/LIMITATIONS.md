@@ -355,6 +355,33 @@ update.
   protected-mode bound covers two slow HF ACKs, but does not reserve a third
   frame for a peer ID. A lost first ACK during that prepend can cause a retry.
 
+## COP-169 robust low-rate floor (not built yet)
+
+- There is no production floor waveform yet. Below about +3 dB (3 kHz reference) on AWGN,
+  `hf_narrow` level 1 still loses nearly every frame, and the failures are
+  `SyncFailed`. A session cannot connect at −6 dB or hold through a fade to
+  −6 dB. The COP-169 bars (50% FER crossing at or below −8 dB AWGN and −2 dB
+  Watterson Poor, connect within 60 s at −6 dB in 9 of 10 trials, survive a
+  20 → −6 → 20 dB Poor ramp) are unmet.
+- What exists is the measurement contract the floor will be judged by:
+  `coppa_bench::floor_sweep` (nine-point −12…+4 dB grid, locked seed bases
+  `0x00C0FFEE`, `0x16900000` and `0x16910000`, conservative `SyncFailed`
+  with diagnostic subcounts, Wilson intervals, the interpolated 50% crossing
+  and the sync-share clause) and the `floor_mode` diagnostic, which measures
+  the production receiver through the new persistent channel. Its only
+  waveform today is the `ofdm:1` baseline; see BENCHMARKS, "COP-169".
+- `coppa_channel::persistent` is the session channel: one continuous
+  Watterson process per direction, carried across calls and turnarounds,
+  with noise set from a fixed clean power and an SNR schedule (including the
+  COP-169 ramp). Its fading is generated at 100 Hz and linearly interpolated,
+  and its streaming Hilbert FIR adds a fixed 511-sample (10.6 ms) latency on
+  faded paths. No endpoint (Link or daemon) drives it yet.
+- A measurement-only 16-FSK prototype now carries a 40-byte PDU in exactly
+  eight seconds. It has no Link or daemon caller and no production streaming
+  detector. Its development Poor sweep fails the conservative sync-share
+  clause. It is not a selected floor design. See BENCHMARKS, "COP-169
+  experimental 16-FSK candidate", for raw results and scope.
+
 ## COP-178 versioned wire contract
 
 - There is no in-band air-protocol version negotiation and no automatic

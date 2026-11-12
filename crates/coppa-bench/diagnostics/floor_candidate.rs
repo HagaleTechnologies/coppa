@@ -115,7 +115,11 @@ fn main() -> anyhow::Result<ExitCode> {
     }
     fs::write(args.out_dir.join("sweep.csv"), csv)?;
     fs::write(args.out_dir.join("metadata.txt"), format!(
+<<<<<<< HEAD
         "waveform=experimental-mfsk16\nproduction=false\nacceptance_run=false\nseed_base={}\nseed_derivation=attempt_seed(base,point,trials,trial); persistent derive_seed for direction/noise/fading\ntrials_per_point={}\nchannel={}\ncfo_hz={}\nssb={}\nsample_rate={}\nsymbol_samples=960\ntones=600:50:1350\nsync_symbols=16\nheader_repetitions=4\nheader_bytes=version2,length,crc16-ibm-sdlc-be\nheader_decoder=normalized-energy-legal-length-crc-codewords; independent-version-check; score>0.16; unique-winner\npayload=40-byte-zero-padded-pdu,crc32-iso-hdlc-be\npayload_crc_scope=unpadded-pdu\nfec=NR-BG2-k352-e1408-rv0-unscrambled\ninterleaver=coded[(wire_bit*31)%1408]\nframe_samples={}\nframe_airtime_s=8\nrx=bounded-batch-integer-tone-cfo-search\ncfo_search_hz=-150:50:150\nmax_decode_candidates=16\nrx_wall_seconds={rx_seconds}\nwall_seconds={}\nverdict={verdict:?}\npasses={}\nclean_room=original implementation using repository primitives; no external source copied\n",
+=======
+        "waveform=experimental-mfsk16\nproduction=false\nacceptance_run=false\nseed_base={}\nseed_derivation=attempt_seed(base,point,trials,trial); persistent derive_seed for direction/noise/fading\ntrials_per_point={}\nchannel={}\ncfo_hz={}\nssb={}\nsample_rate={}\nsymbol_samples=960\ntones=600:50:1350\nsync_symbols=16\nheader_repetitions=4\nheader_bytes=version2,length,crc16-ibm-sdlc-be\npayload=40-byte-zero-padded-pdu,crc32-iso-hdlc-be\nfec=NR-BG2-k352-e1408-rv0-unscrambled\ninterleaver=coded[(wire_bit*31)%1408]\nframe_samples={}\nframe_airtime_s=8\nrx=bounded-batch-zero-cfo-search\nrx_wall_seconds={rx_seconds}\nwall_seconds={}\nverdict={verdict:?}\npasses={}\nclean_room=original implementation using repository primitives; no external source copied\n",
+>>>>>>> cddfc25087a370f4b7178ed48f234674c26ecf38
         args.seed, args.trials, channel.name(), args.cfo, args.ssb, SAMPLE_RATE, FRAME_SAMPLES,
         started.elapsed().as_secs_f64(), verdict.passes()))?;
     Ok(if verdict.passes() {
