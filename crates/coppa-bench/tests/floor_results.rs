@@ -88,7 +88,6 @@ fn development_awgn_check_is_auditable() {
 }
 
 #[test]
-<<<<<<< HEAD
 fn cop191_final_sweeps_recompute() {
     use coppa_bench::floor_sweep::{SweepChannel, FINAL_SWEEP_SEED_BASE, TRIALS_PER_POINT};
     use coppa_protocol::modem::floor::{FRAME_SAMPLES, MAX_PAYLOAD};
@@ -174,7 +173,10 @@ fn cop191_final_sweeps_recompute() {
         assert!(metadata
             .lines()
             .any(|line| line == format!("all_selected_pass={}", passes.iter().all(|p| *p))));
-=======
+    }
+}
+
+#[test]
 fn integer_tone_cfo_development_measurements_are_auditable() {
     for (directory, cfo) in [
         ("dev-cfo-zero-poor", 0),
@@ -200,6 +202,5 @@ fn integer_tone_cfo_development_measurements_are_auditable() {
         // These development data must not be promoted to final acceptance:
         // only ten trials per point, no streaming receiver or session caller.
         assert!(points.iter().all(|point| point.wrong_payload == 0));
->>>>>>> 456661e52470aee3cd02511b9442932d0330b409
     }
 }
