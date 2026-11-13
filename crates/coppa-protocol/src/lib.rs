@@ -94,6 +94,7 @@ pub mod arq;
 pub mod broadcast_file;
 pub mod cp_negotiator;
 pub mod fec;
+pub mod floor_controller;
 pub mod frame;
 pub mod mac;
 pub mod outer_code;

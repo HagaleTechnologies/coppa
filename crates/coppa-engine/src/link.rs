@@ -63,6 +63,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use coppa_protocol::floor_controller::FloorController;
+pub use coppa_protocol::floor_controller::LinkPhyMode;
+
 use coppa_protocol::arq::{self, ArqConfig, ArqRx, ArqTx};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu};
 use coppa_protocol::session::{self, LinkCapabilities, Session};
@@ -86,6 +89,8 @@ const DEFAULT_TURNAROUND: Duration = Duration::from_millis(500);
 /// Settings for one [`Link`]. `LinkConfig::new(callsign)` fills coppad's defaults.
 #[derive(Debug, Clone)]
 pub struct LinkConfig {
+    /// Enable negotiated low-rate floor discovery and fallback. Default true.
+    pub robust_floor: bool,
     /// Engine (modem) settings. Both ends must agree on the band and on
     /// compression. Default: [`EngineConfig::default()`].
     pub engine: EngineConfig,
@@ -118,6 +123,7 @@ impl LinkConfig {
     /// [`EngineConfig::default()`] (level 1, compression off).
     pub fn new(callsign: impl Into<String>) -> Self {
         Self {
+            robust_floor: true,
             engine: EngineConfig::default(),
             callsign: callsign.into(),
             turnaround: DEFAULT_TURNAROUND,
@@ -254,6 +260,7 @@ enum FrameKind {
 struct QueuedFrame {
     kind: FrameKind,
     bytes: Vec<u8>,
+    mode: Option<LinkPhyMode>,
 }
 
 /// Reliable-delivery state of an established session.
@@ -268,6 +275,9 @@ struct Arq {
 #[derive(Debug)]
 pub struct Link {
     config: LinkConfig,
+    floor: FloorController,
+    tx_mode: Option<LinkPhyMode>,
+    rx_mode: Option<LinkPhyMode>,
     core: CoppaCore,
     local: Callsign,
     listening: bool,
@@ -320,6 +330,9 @@ impl Link {
         )?;
         Ok(Link {
             config,
+            floor: FloorController::default(),
+            tx_mode: None,
+            rx_mode: None,
             core,
             local,
             listening: false,
@@ -371,6 +384,7 @@ impl Link {
         self.req_frame = Some(req.clone());
         self.queue.push_back(QueuedFrame {
             kind: FrameKind::Req,
+            mode: None,
             bytes: req,
         });
         Ok(())
@@ -475,6 +489,18 @@ impl Link {
         }
     }
 
+    /// Last transmitted and validated received physical modes. Cleared at disconnect.
+    pub fn phy_mode(&self) -> (Option<LinkPhyMode>, Option<LinkPhyMode>) {
+        (self.tx_mode, self.rx_mode)
+    }
+
+    fn floor_negotiated(&self) -> bool {
+        self.session
+            .as_ref()
+            .and_then(|s| s.negotiated.as_ref())
+            .is_some_and(|caps| caps.robust_floor)
+    }
+
     /// The peer's callsign while a session exists.
     pub fn remote(&self) -> Option<&str> {
         self.session.as_ref().map(|s| s.remote.as_str())
@@ -515,7 +541,10 @@ impl Link {
             self.local.clone(),
             remote,
             ssid,
-            LinkCapabilities::default(),
+            LinkCapabilities {
+                robust_floor: self.config.robust_floor,
+                ..Default::default()
+            },
             now,
         );
         s.keepalive_interval = self.config.keepalive_interval;
@@ -544,7 +573,17 @@ impl Link {
         let config = ArqConfig::new(
             SESSION_ARQ_WINDOW,
             self.config.max_retransmit,
-            self.config.initial_rto,
+            if self.floor_negotiated() {
+                self.config.initial_rto.max(
+                    FloorController::response_window(
+                        LinkPhyMode::Floor,
+                        Duration::ZERO,
+                        self.config.turnaround,
+                    ) + Duration::from_secs(1),
+                )
+            } else {
+                self.config.initial_rto
+            },
         )
         .map(|c| c.with_airtime_params(level, self.config.turnaround, profile));
         // A window of 1 is always valid, so neither step can fail.
@@ -574,12 +613,17 @@ impl Link {
         } else {
             None
         };
+        let closing_mode = self.floor.mode(self.core.speed_level());
         self.reset_session_state();
         self.session = None;
+        self.floor = FloorController::default();
+        self.tx_mode = None;
+        self.rx_mode = None;
         let event = LinkEvent::Disconnected { remote, reason };
         if let Some(bytes) = frame {
             self.queue.push_back(QueuedFrame {
                 kind: FrameKind::Control,
+                mode: Some(closing_mode),
                 bytes,
             });
             self.phase = Phase::Closing;
@@ -591,6 +635,16 @@ impl Link {
     }
 
     fn established(&mut self) {
+        // A failed OFDM probe may consume a backed-off RTO before an eight-second
+        // retry arrives. Do not key a keepalive across that recovery window.
+        if self.floor_negotiated() {
+            if let Some(s) = self.session.as_mut() {
+                s.keepalive_interval = s
+                    .keepalive_interval
+                    .max(Duration::from_secs(60))
+                    .min(s.session_timeout / 3);
+            }
+        }
         self.phase = Phase::Connected;
         self.start_arq();
         let remote = self.remote_string();
@@ -607,6 +661,7 @@ impl Link {
         self.queue.retain(|f| f.kind != FrameKind::Ack);
         self.queue.push_back(QueuedFrame {
             kind: FrameKind::Ack,
+            mode: None,
             bytes,
         });
     }
@@ -615,16 +670,113 @@ impl Link {
         if rx.is_empty() {
             return;
         }
+        let mut frames = Vec::new();
         for frame in self.core.push_samples(rx) {
-            let Ok(payload) = frame.payload else {
-                continue;
-            };
+            if let Ok(payload) = frame.payload {
+                frames.push((
+                    payload,
+                    LinkPhyMode::Ofdm {
+                        level: frame.speed_level,
+                    },
+                ));
+            }
+        }
+        if self.config.robust_floor {
+            frames.extend(
+                self.core
+                    .push_floor_samples(rx)
+                    .into_iter()
+                    .map(|p| (p, LinkPhyMode::Floor)),
+            );
+        }
+        for (payload, mode) in frames {
             self.frames_rx += 1;
             self.last_decode = Some(now);
             let Ok(pdu) = MacPdu::from_bytes(&payload) else {
                 continue;
             };
+            if pdu.dest != self.local {
+                continue;
+            }
+            if mode == LinkPhyMode::Floor {
+                let bootstrap = matches!(
+                    pdu.frame_type,
+                    MacFrameType::ConnectReq | MacFrameType::ConnectAck
+                ) && LinkCapabilities::from_bytes(&pdu.payload)
+                    .is_ok_and(|c| c.robust_floor);
+                let confirming = pdu.frame_type == MacFrameType::ConnectCfm
+                    && self.phase == Phase::Accepting
+                    && self.is_from_peer(&pdu)
+                    && self.session.as_ref().is_some_and(|s| {
+                        s.local_caps.robust_floor
+                            && s.remote_caps.as_ref().is_some_and(|c| c.robust_floor)
+                    });
+                if !bootstrap && !confirming && !self.floor_negotiated() {
+                    continue;
+                }
+            }
+            let from_peer = self.is_from_peer(&pdu);
+            let connected = matches!(self.phase, Phase::Connected | Phase::Draining);
+            let valid = match pdu.frame_type {
+                MacFrameType::ConnectReq => {
+                    ((self.phase == Phase::Idle && self.listening)
+                        || (from_peer && self.phase == Phase::Accepting)
+                        || (from_peer
+                            && self.phase == Phase::Calling
+                            && self.local.as_str() > pdu.src.as_str()))
+                        && LinkCapabilities::from_bytes(&pdu.payload).is_ok()
+                }
+                MacFrameType::ConnectAck => {
+                    from_peer
+                        && self.phase == Phase::Calling
+                        && LinkCapabilities::from_bytes(&pdu.payload).is_ok()
+                }
+                MacFrameType::ConnectCfm => {
+                    from_peer
+                        && self.phase == Phase::Accepting
+                        && LinkCapabilities::from_bytes(&pdu.payload).is_ok()
+                }
+                MacFrameType::Data | MacFrameType::Ack => {
+                    from_peer
+                        && connected
+                        && TransportPdu::from_bytes(&pdu.payload).is_ok_and(|t| {
+                            t.transport_type
+                                == if pdu.frame_type == MacFrameType::Data {
+                                    TransportType::Reliable
+                                } else {
+                                    TransportType::Ack
+                                }
+                        })
+                }
+                MacFrameType::Keepalive | MacFrameType::Disconnect => from_peer,
+                _ => false,
+            };
+            if !valid {
+                continue;
+            }
+            if matches!(
+                pdu.frame_type,
+                MacFrameType::ConnectReq | MacFrameType::ConnectAck | MacFrameType::ConnectCfm
+            ) {
+                if let Ok(caps) = LinkCapabilities::from_bytes(&pdu.payload) {
+                    if self.config.robust_floor
+                        && caps.robust_floor
+                        && usize::from(caps.max_payload_size)
+                            <= MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE
+                    {
+                        continue;
+                    }
+                }
+            }
+            self.rx_mode = Some(mode);
             self.handle_pdu(pdu, now);
+            // Replies stay on the received waveform, including OFDM probes.
+            for reply in &mut self.queue {
+                if reply.mode.is_none() && matches!(reply.kind, FrameKind::Ack | FrameKind::Control)
+                {
+                    reply.mode = Some(mode);
+                }
+            }
         }
     }
 
@@ -653,8 +805,12 @@ impl Link {
                     self.req_keyed_at = None;
                     self.queue.push_back(QueuedFrame {
                         kind: FrameKind::Control,
+                        mode: None,
                         bytes: cfm.to_bytes(),
                     });
+                    if let Some(mode) = self.rx_mode {
+                        self.floor.received(mode);
+                    }
                     self.established();
                     self.awaiting_first_ack = true;
                 }
@@ -685,6 +841,9 @@ impl Link {
                     .ok()
                     .filter(|t| t.transport_type == TransportType::Reliable);
                 if let (Some(segment), Some(arq)) = (segment, self.arq.as_mut()) {
+                    if let Some(mode) = self.rx_mode {
+                        self.floor.received(mode);
+                    }
                     for (_seq, data) in arq.rx.receive(segment.seq_num, segment.payload) {
                         self.received.extend(data);
                     }
@@ -716,7 +875,9 @@ impl Link {
     }
 
     fn on_connect_req(&mut self, pdu: &MacPdu, from_peer: bool, now: Instant) {
-        let repeat = self.phase == Phase::Accepting && from_peer;
+        let simultaneous =
+            self.phase == Phase::Calling && from_peer && self.local.as_str() > pdu.src.as_str();
+        let repeat = (self.phase == Phase::Accepting && from_peer) || simultaneous;
         if !(repeat || (self.phase == Phase::Idle && self.listening)) {
             return;
         }
@@ -728,9 +889,13 @@ impl Link {
         };
         self.reset_session_state();
         self.session = Some(session);
+        if let Some(mode) = self.rx_mode {
+            self.floor.received(mode);
+        }
         self.phase = Phase::Accepting;
         self.queue.push_back(QueuedFrame {
             kind: FrameKind::Control,
+            mode: None,
             bytes: ack.to_bytes(),
         });
     }
@@ -750,14 +915,21 @@ impl Link {
         if ack.ack_num.wrapping_sub(arq.tx.send_base()) > arq.tx.in_flight() {
             return;
         }
+        let before = arq.tx.in_flight();
+        let seq = arq.tx.send_base();
         arq.tx.process_ack(ack.ack_num, ack.ack_bitmap, now);
+        if arq.tx.in_flight() < before {
+            if let Some(mode) = self.rx_mode {
+                self.floor.acknowledged(seq, mode);
+            }
+        }
         if arq.tx.in_flight() == 0 {
             self.data_keyed_at = None;
             // Retransmissions queued behind a turnaround hold are now stale;
             // keying them would only waste half-duplex airtime.
             self.queue.retain(|f| f.kind != FrameKind::Data);
         }
-        if self.awaiting_first_ack {
+        if self.awaiting_first_ack && arq.tx.in_flight() < before {
             self.awaiting_first_ack = false;
             if let Some(s) = self.session.as_mut() {
                 s.confirm_established();
@@ -766,6 +938,20 @@ impl Link {
     }
 
     fn run_timers(&mut self, now: Instant) {
+        let mut handshake_timeout = Duration::from_secs(session::HANDSHAKE_TIMEOUT_SECS);
+        if self.phase == Phase::Accepting
+            && self.floor.mode(self.core.speed_level()) == LinkPhyMode::Floor
+        {
+            let window = FloorController::response_window(
+                LinkPhyMode::Floor,
+                Duration::ZERO,
+                self.config.turnaround,
+            );
+            // From ACK key-up, allow the lost CFM, first data transmission,
+            // its initial RTO and a replayed CFM, including delivery margins.
+            handshake_timeout = handshake_timeout
+                .max(window * 3 + self.config.initial_rto.max(window + Duration::from_secs(1)));
+        }
         if self.phase == Phase::Calling {
             if let Some(keyed) = self.req_keyed_at {
                 // Both handshake frames use this link's fixed level/profile.
@@ -786,12 +972,42 @@ impl Link {
                     })
                     .unwrap_or_default()
                     .max(self.config.initial_rto);
-                if now.saturating_duration_since(keyed) >= retry_interval {
+                let retry_interval = retry_interval.max(FloorController::response_window(
+                    self.tx_mode.unwrap_or(LinkPhyMode::Ofdm { level }),
+                    Duration::ZERO,
+                    self.config.turnaround,
+                ));
+                // The lexical answerer listens through the caller's two OFDM
+                // windows and first complete floor request. Unlike callsign hash
+                // buckets, these complementary roles cannot have equal delays
+                // for distinct callsigns. This matches on_connect_req's tie-break.
+                // Floor retries retain their normal response window.
+                let stagger = if self.config.robust_floor
+                    && self.tx_mode != Some(LinkPhyMode::Floor)
+                    && self.remote().is_some_and(|peer| self.local.as_str() > peer)
+                {
+                    retry_interval
+                        + FloorController::response_window(
+                            LinkPhyMode::Floor,
+                            Duration::ZERO,
+                            self.config.turnaround,
+                        )
+                } else {
+                    Duration::ZERO
+                };
+                // Keep the idle reaper beyond the retry and its turnaround
+                // hold. Retry exhaustion still bounds an unanswered call.
+                handshake_timeout = handshake_timeout.max(
+                    retry_interval + stagger + self.config.turnaround + Duration::from_secs(1),
+                );
+                if now.saturating_duration_since(keyed) >= retry_interval + stagger {
+                    self.floor.timeout(self.config.robust_floor);
                     if self.req_attempts <= self.config.connect_retries {
                         if let Some(req) = self.req_frame.clone() {
                             self.req_keyed_at = None;
                             self.queue.push_back(QueuedFrame {
                                 kind: FrameKind::Req,
+                                mode: None,
                                 bytes: req,
                             });
                         }
@@ -802,7 +1018,13 @@ impl Link {
                 }
             }
         }
-        if self.session.as_ref().is_some_and(|s| s.is_timed_out(now)) {
+        if self.session.as_ref().is_some_and(|s| {
+            if matches!(self.phase, Phase::Calling | Phase::Accepting) {
+                now.saturating_duration_since(s.last_activity) >= handshake_timeout
+            } else {
+                s.is_timed_out(now)
+            }
+        }) {
             let reason = if matches!(self.phase, Phase::Calling | Phase::Accepting) {
                 DisconnectReason::HandshakeFailed
             } else {
@@ -821,6 +1043,7 @@ impl Link {
             if let Some(Ok(pdu)) = self.session.as_mut().map(|s| s.keepalive(now)) {
                 self.queue.push_back(QueuedFrame {
                     kind: FrameKind::Control,
+                    mode: None,
                     bytes: pdu.to_bytes(),
                 });
             }
@@ -845,6 +1068,14 @@ impl Link {
         }
         let seqs = arq.tx.get_retransmits(now);
         if !seqs.is_empty() {
+            let enabled = self
+                .session
+                .as_ref()
+                .and_then(|s| s.negotiated.as_ref())
+                .is_some_and(|c| c.robust_floor);
+            self.floor.timeout(enabled);
+        }
+        if !seqs.is_empty() {
             // The window is one frame, so an older queued copy of the same
             // segment that never got keyed is superseded by this one.
             self.queue.retain(|f| f.kind != FrameKind::Data);
@@ -864,6 +1095,7 @@ impl Link {
                 if let Some(cfm) = session.last_cfm.as_ref() {
                     self.queue.push_back(QueuedFrame {
                         kind: FrameKind::Control,
+                        mode: None,
                         bytes: cfm.to_bytes(),
                     });
                 }
@@ -871,6 +1103,7 @@ impl Link {
             let bytes = session_data_frame(session, seq, &data);
             self.queue.push_back(QueuedFrame {
                 kind: FrameKind::Data,
+                mode: None,
                 bytes,
             });
         }
@@ -909,6 +1142,7 @@ impl Link {
         let Some(seq) = self.arq.as_ref().map(|a| a.tx.next_seq()) else {
             return;
         };
+        self.floor.prepare_data(seq);
         let take = self.fit_chunk_len(seq);
         let chunk: Vec<u8> = self.backlog.iter().take(take).copied().collect();
         let Some(session) = self.session.as_ref() else {
@@ -918,6 +1152,7 @@ impl Link {
         if !self.key(
             QueuedFrame {
                 kind: FrameKind::Data,
+                mode: None,
                 bytes,
             },
             now,
@@ -933,8 +1168,29 @@ impl Link {
 
     /// Encode and start transmitting `frame`. Returns whether it was keyed.
     fn key(&mut self, frame: QueuedFrame, now: Instant) -> bool {
-        match self.core.encode_bytes(&frame.bytes) {
+        let mode = frame
+            .mode
+            .unwrap_or_else(|| self.floor.mode(self.core.speed_level()));
+        let encoded = match mode {
+            LinkPhyMode::Floor => {
+                self.core
+                    .floor()
+                    .encode(&frame.bytes)
+                    .map_err(|_| EngineError::PayloadTooLarge {
+                        len: frame.bytes.len(),
+                        max: 40,
+                    })
+            }
+            LinkPhyMode::Ofdm { level } => self.core.encode_bytes_with_level(&frame.bytes, level),
+            _ => unreachable!("unknown physical mode"),
+        };
+        match encoded {
             Ok(samples) => {
+                // Capture is discontinuous while keyed. Break the floor detector history.
+                self.core.push_floor_samples(&[f32::NAN]);
+                if self.phase != Phase::Closing {
+                    self.tx_mode = Some(mode);
+                }
                 self.tx_samples.extend_from_slice(&samples);
                 self.frames_tx += 1;
                 if let Some(s) = self.session.as_mut() {
@@ -945,7 +1201,19 @@ impl Link {
                         self.req_attempts = self.req_attempts.saturating_add(1);
                         self.req_keyed_at = Some(now);
                     }
-                    FrameKind::Data => self.data_keyed_at = Some(now),
+                    FrameKind::Data => {
+                        self.data_keyed_at = Some(now);
+                        if self.floor_negotiated() {
+                            let floor = FloorController::response_window(
+                                LinkPhyMode::Floor,
+                                Duration::ZERO,
+                                self.config.turnaround,
+                            ) + Duration::from_secs(1);
+                            if let Some(arq) = self.arq.as_mut() {
+                                arq.tx.set_segment_floor(floor);
+                            }
+                        }
+                    }
                     FrameKind::Ack | FrameKind::Control => {}
                 }
                 true
@@ -966,6 +1234,17 @@ impl Link {
     /// algorithm in `coppa_daemon::tx_chunker::next_chunk_len`; unify after
     /// COP-110 (PR #204) lands.
     fn fit_chunk_len(&self, seq: u8) -> usize {
+        if self.floor_negotiated() {
+            let negotiated = self
+                .session
+                .as_ref()
+                .and_then(|s| s.negotiated.as_ref())
+                .map_or(40, |c| usize::from(c.max_payload_size));
+            return self.backlog.len().min(
+                40.min(negotiated)
+                    .saturating_sub(MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE),
+            );
+        }
         let budget =
             coppa_protocol::modem::max_payload_for_level(self.core.speed_level()).unwrap_or(0);
         let header = MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE;
