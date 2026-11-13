@@ -24,7 +24,11 @@ struct Cable {
 }
 
 impl Cable {
-    fn new(a: LinkConfig, b: LinkConfig) -> Self {
+    fn new(mut a: LinkConfig, mut b: LinkConfig) -> Self {
+        // These frozen framing/count/timer regressions exercise the v1-only contract.
+        // Floor-enabled pairs run through production audio in tests/floor_session.rs.
+        a.robust_floor = false;
+        b.robust_floor = false;
         Self {
             a: Link::new(a).expect("station A config"),
             b: Link::new(b).expect("station B config"),
@@ -651,4 +655,195 @@ fn retries_exhausted_is_reported_after_disconnect_frame_finishes() {
     );
     assert_eq!(c.a.state(), LinkState::Idle);
     assert_eq!(c.a.frames_transmitted(), 6);
+}
+
+#[test]
+fn floor_two_window_fallback() {
+    let mut link = Link::new(LinkConfig::new("N0AAA")).unwrap();
+    let base = Instant::now();
+    link.connect("N0BBB", base).unwrap();
+    let mut out = vec![0.0; 8 * 48_000];
+    link.process(base, &[], &mut out);
+    assert_eq!(link.frames_transmitted(), 1);
+    link.process(base + Duration::from_millis(4999), &[], &mut out);
+    assert_eq!(link.frames_transmitted(), 1);
+    link.process(base + Duration::from_secs(5), &[], &mut out);
+    assert_eq!(link.frames_transmitted(), 2);
+    assert!(matches!(link.phy_mode().0, Some(LinkPhyMode::Ofdm { .. })));
+    link.process(base + Duration::from_millis(9999), &[], &mut out);
+    assert_eq!(link.frames_transmitted(), 2);
+    link.process(base + Duration::from_secs(10), &[], &mut out);
+    assert_eq!(link.frames_transmitted(), 3);
+    assert_eq!(link.phy_mode().0, Some(LinkPhyMode::Floor));
+    link.process(base + Duration::from_millis(28999), &[], &mut out);
+    assert_eq!(link.frames_transmitted(), 3);
+    link.process(base + Duration::from_secs(29), &[], &mut out);
+    assert_eq!(link.frames_transmitted(), 4);
+}
+
+#[test]
+fn floor_rto_covers_configured_turnaround() {
+    let mut config = LinkConfig::new("N0AAA");
+    config.turnaround = Duration::from_secs(5);
+    let mut link = Link::new(config).unwrap();
+    let now = Instant::now();
+    let mut session = link.new_session(Callsign::new("N0BBB").unwrap(), 0, now);
+    session.negotiated = Some(LinkCapabilities {
+        robust_floor: true,
+        ..Default::default()
+    });
+    link.session = Some(session);
+    link.established();
+    assert!(link.arq.as_ref().unwrap().tx.rto() >= Duration::from_secs(29));
+    link.floor.received(LinkPhyMode::Floor);
+    assert!(link.key(
+        QueuedFrame {
+            kind: FrameKind::Data,
+            bytes: vec![0; 21],
+            mode: None
+        },
+        now
+    ));
+    assert!(link.arq.as_ref().unwrap().tx.rto() >= Duration::from_secs(29));
+}
+
+#[test]
+fn floor_keepalive_precedes_configured_timeout() {
+    let mut a = LinkConfig::new("N0AAA");
+    a.keepalive_interval = Duration::from_secs(5);
+    a.session_timeout = Duration::from_secs(30);
+    let mut b = a.clone();
+    b.callsign = "N0BBB".to_owned();
+    // Unlike Cable::new's frozen v1 fixtures, exercise default floor negotiation.
+    let mut c = Cable::new(a.clone(), b.clone());
+    c.a = Link::new(a).unwrap();
+    c.b = Link::new(b).unwrap();
+    c.b.set_listening(true);
+    c.connect();
+    c.run_until(Duration::from_secs(90), |_, _| false);
+    assert_eq!(c.a.state(), LinkState::Connected);
+    assert_eq!(c.b.state(), LinkState::Connected);
+}
+
+#[test]
+fn floor_answerer_retries_before_handshake_timeout() {
+    let mut link = Link::new(LinkConfig::new("N0AAD")).unwrap();
+    let base = Instant::now();
+    link.connect("N0AAA", base).unwrap();
+    let mut out = vec![0.0; 8 * 48_000];
+    for seconds in [0, 29, 58] {
+        link.process(base + Duration::from_secs(seconds), &[], &mut out);
+    }
+    assert_eq!(link.frames_transmitted(), 3);
+    assert_eq!(link.phy_mode().0, Some(LinkPhyMode::Floor));
+    link.process(base + Duration::from_secs(77), &[], &mut out);
+    // Stagger discovery, not floor retries: the 19-second floor response
+    // window must expire before the 30-second idle handshake timeout.
+    assert_eq!(link.frames_transmitted(), 4);
+    assert_eq!(link.state(), LinkState::Connecting);
+}
+
+#[test]
+fn floor_lost_confirmation_recovers_before_accepting_timeout() {
+    let a = LinkConfig::new("N0AAA");
+    let b = LinkConfig::new("N0BBB");
+    let mut c = Cable::new(a.clone(), b.clone());
+    c.a = Link::new(a).unwrap();
+    c.b = Link::new(b).unwrap();
+    c.b.set_listening(true);
+    // Erase two OFDM requests and the first floor confirmation.
+    c.drop_a = vec![0, 1, 3];
+    c.a.connect("N0BBB", c.now()).unwrap();
+    assert!(c.run_until(Duration::from_secs(60), |a, _| {
+        a.state() == LinkState::Connected
+    }));
+    c.a.send(b"recover").unwrap();
+    assert!(c.run_until(Duration::from_secs(80), |a, b| {
+        a.pending_tx_bytes() == 0 && b.received_len() == 7
+    }));
+    assert_eq!(Cable::recv_all(&mut c.b), b"recover");
+    assert_eq!(c.a.state(), LinkState::Connected);
+    assert_eq!(c.b.state(), LinkState::Connected);
+}
+
+#[test]
+fn floor_stagger_allows_configured_retry_window() {
+    for (rto, turnaround, first_retry) in [(10, 500, 39), (6, 500, 31), (5, 1000, 30)] {
+        let mut config = LinkConfig::new("N0AAD");
+        config.initial_rto = Duration::from_secs(rto);
+        config.turnaround = Duration::from_millis(turnaround);
+        let mut link = Link::new(config).unwrap();
+        let base = Instant::now();
+        link.connect("N0AAA", base).unwrap();
+        let mut out = vec![0.0; 8 * 48_000];
+        for seconds in 0..=2 * first_retry {
+            link.process(base + Duration::from_secs(seconds), &[], &mut out);
+            assert_eq!(link.state(), LinkState::Connecting, "at {seconds}s");
+            assert!(link.poll_event().is_none(), "premature event at {seconds}s");
+            let expected_frames = if seconds < first_retry {
+                1
+            } else if seconds < 2 * first_retry {
+                2
+            } else {
+                3
+            };
+            assert_eq!(link.frames_transmitted(), expected_frames, "at {seconds}s");
+        }
+        assert_eq!(link.frames_transmitted(), 3);
+        assert_eq!(link.phy_mode().0, Some(LinkPhyMode::Floor));
+    }
+}
+
+#[test]
+fn floor_stagger_exhausts_configured_retries() {
+    for (rto, turnaround, first_retry, floor_window) in [(6, 500, 31, 19), (5, 1000, 30, 20)] {
+        for retries in [3, 0] {
+            let mut config = LinkConfig::new("N0AAD");
+            config.initial_rto = Duration::from_secs(rto);
+            config.turnaround = Duration::from_millis(turnaround);
+            config.connect_retries = retries;
+            let mut link = Link::new(config).unwrap();
+            let base = Instant::now();
+            link.connect("N0AAA", base).unwrap();
+            let mut out = vec![0.0; 8 * 48_000];
+            let failure_at = if retries == 0 {
+                first_retry
+            } else {
+                2 * first_retry + 2 * floor_window
+            };
+            let mut observed_events = Vec::new();
+            // Keep ticking after failure to catch extra requests or disconnects.
+            for seconds in 0..=failure_at + 5 {
+                link.process(base + Duration::from_secs(seconds), &[], &mut out);
+                observed_events.extend(events(&mut link));
+                if seconds < failure_at {
+                    assert_eq!(link.state(), LinkState::Connecting, "at {seconds}s");
+                    assert!(observed_events.is_empty(), "premature event at {seconds}s");
+                    let expected_frames = if seconds < first_retry {
+                        1
+                    } else if seconds < 2 * first_retry {
+                        2
+                    } else if seconds < 2 * first_retry + floor_window {
+                        3
+                    } else {
+                        4
+                    };
+                    assert_eq!(link.frames_transmitted(), expected_frames, "at {seconds}s");
+                    let expected_mode = if seconds < 2 * first_retry {
+                        LinkPhyMode::Ofdm { level: 1 }
+                    } else {
+                        LinkPhyMode::Floor
+                    };
+                    assert_eq!(link.phy_mode().0, Some(expected_mode), "at {seconds}s");
+                } else {
+                    assert_eq!(link.state(), LinkState::Idle, "at {seconds}s");
+                    assert_eq!(link.frames_transmitted(), u64::from(retries) + 1);
+                    assert_eq!(
+                        observed_events,
+                        vec![disconnected("N0AAA", DisconnectReason::HandshakeFailed)]
+                    );
+                }
+            }
+        }
+    }
 }

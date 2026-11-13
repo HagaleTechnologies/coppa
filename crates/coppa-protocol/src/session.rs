@@ -65,6 +65,8 @@ pub struct LinkCapabilities {
     /// COP-121: carries stream 1 application records, flags bit 4, SPEC §23.
     /// Negotiated as an AND of both sides; CONNECT_CFM must carry exactly it.
     pub app_messages: bool,
+    /// Supports the separately detected low-rate floor, flags byte bit 6.
+    pub robust_floor: bool,
     /// Modulation/coding scheme index.
     pub mcs_index: u8,
 }
@@ -81,6 +83,7 @@ impl Default for LinkCapabilities {
             outer_code_rx: false,
             outer_code_req: false,
             app_messages: false,
+            robust_floor: false,
             mcs_index: 0,
         }
     }
@@ -95,12 +98,13 @@ impl LinkCapabilities {
         out.push(self.fec_rate_num);
         out.push(self.fec_rate_den);
         out.push(self.arq_window);
-        // Flags byte (byte 5): [compression:1][multi_frame_ack:1][outer_code_rx:1][outer_code_req:1][app_messages:1][reserved:3].
+        // Flags byte (byte 5): [compression:1][multi_frame_ack:1][outer_code_rx:1][outer_code_req:1][app_messages:1][reserved:1][robust_floor:1][reserved:1].
         let flags = (self.compression as u8)
             | ((self.multi_frame_ack as u8) << 1)
             | ((self.outer_code_rx as u8) << 2)
             | ((self.outer_code_req as u8) << 3)
-            | ((self.app_messages as u8) << 4);
+            | ((self.app_messages as u8) << 4)
+            | ((self.robust_floor as u8) << 6);
         out.push(flags);
         out.push(self.mcs_index);
         out
@@ -123,6 +127,7 @@ impl LinkCapabilities {
             outer_code_rx: bytes[5] & 0x04 != 0,
             outer_code_req: bytes[5] & 0x08 != 0,
             app_messages: bytes[5] & 0x10 != 0,
+            robust_floor: bytes[5] & 0x40 != 0,
             mcs_index: bytes[6],
         })
     }
@@ -150,6 +155,7 @@ impl LinkCapabilities {
                 && peer.outer_code_rx
                 && (self.outer_code_req || peer.outer_code_req),
             app_messages: self.app_messages && peer.app_messages,
+            robust_floor: self.robust_floor && peer.robust_floor,
             mcs_index: self.mcs_index.min(peer.mcs_index),
         }
     }
@@ -379,6 +385,9 @@ impl Session {
             // as host bytes, so CONNECT_CFM must carry exactly the AND.
             if negotiated.app_messages != expected.app_messages {
                 return Err(ProtocolError::AppMessagesMismatch);
+            }
+            if negotiated.robust_floor != expected.robust_floor {
+                return Err(ProtocolError::RobustFloorMismatch);
             }
             // Compression must not be enabled unless both sides support it
             if negotiated.compression && !expected.compression {
@@ -644,6 +653,7 @@ mod tests {
             outer_code_rx: false,
             outer_code_req: false,
             app_messages: false,
+            robust_floor: false,
             mcs_index: 3,
         };
         let bytes = caps.to_bytes();
@@ -680,6 +690,7 @@ mod tests {
             outer_code_rx: false,
             outer_code_req: false,
             app_messages: false,
+            robust_floor: false,
             mcs_index: 5,
         };
         let b = LinkCapabilities {
@@ -692,6 +703,7 @@ mod tests {
             outer_code_rx: false,
             outer_code_req: false,
             app_messages: false,
+            robust_floor: false,
             mcs_index: 3,
         };
         let negotiated = a.negotiate(&b);
@@ -1458,5 +1470,54 @@ mod cop172_tests {
             connect_req_retry_interval(Duration::from_secs(1), Duration::ZERO),
             Duration::from_secs(5)
         );
+    }
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::*;
+
+    #[test]
+    fn floor_capability_serialization_and_intersection() {
+        let old = LinkCapabilities::default();
+        let floor = LinkCapabilities {
+            robust_floor: true,
+            ..old.clone()
+        };
+        assert_eq!(floor.to_bytes().len(), 7);
+        assert_eq!(floor.to_bytes()[5], 0x40);
+        assert_eq!(old.to_bytes(), [0, 200, 1, 2, 8, 0, 0]);
+        assert_eq!(
+            LinkCapabilities::from_bytes(&floor.to_bytes()).unwrap(),
+            floor
+        );
+        assert!(!floor.negotiate(&old).robust_floor);
+        assert!(floor.negotiate(&floor).robust_floor);
+    }
+
+    #[test]
+    fn floor_cfm_disagreement_is_rejected() {
+        let now = Instant::now();
+        for enabled in [false, true] {
+            let caps = LinkCapabilities {
+                robust_floor: enabled,
+                ..Default::default()
+            };
+            let mut responder = Session::new(
+                0,
+                Callsign::new("N0BBB").unwrap(),
+                Callsign::new("N0AAA").unwrap(),
+                0,
+                caps.clone(),
+                now,
+            );
+            responder.handle_connect_req(&caps.to_bytes(), now).unwrap();
+            let bad = LinkCapabilities {
+                robust_floor: !enabled,
+                ..caps.clone()
+            };
+            assert!(responder.handle_connect_cfm(&bad.to_bytes(), now).is_err());
+            responder.handle_connect_cfm(&caps.to_bytes(), now).unwrap();
+        }
     }
 }

@@ -2111,7 +2111,7 @@ complete exchange.
 | 2 | 1 | `fec_rate_num` | 1 | 1 |
 | 3 | 1 | `fec_rate_den` | 2 | 2 |
 | 4 | 1 | `arq_window` | 8 | 8 |
-| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bits 5–7 reserved | `0x00` | `0x06`; `0x16` with the WebSocket API on |
+| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bit 6 `robust_floor`, bits 5 and 7 reserved | `0x00` | `0x06`; `0x16` with the WebSocket API on |
 | 6 | 1 | `mcs_index` | 0 | 0 |
 
 The library default encodes as `00c80102080000` (P24). coppad sets
@@ -2743,3 +2743,35 @@ Informative reference behaviour (COP-172): inbound sessions use the dialled
 MYCALL as their local callsign. A host may set RETRIES n, from 0 to 20, to
 send 1+n ConnectReq frames separated by max twice request airtime plus two
 turnarounds, or five seconds. Repeats stop at 300 s. This changes no wire field.
+
+### Negotiated low-rate floor session policy
+
+Capability flags byte 5 bit 6 advertises `robust_floor`. Its default is false
+and negotiation is the intersection. CONNECT_CFM must carry exactly that
+intersection; disagreement is rejected. The seven-byte layout and all
+previous flag allocations remain unchanged. Bit 5 stays reserved for COP-168.
+
+The library Link enables discovery by default. Disabling
+`LinkConfig.robust_floor` preserves OFDM-only operation. Discovery starts on
+OFDM. After two complete unanswered request windows, an enabled caller may
+send a floor CONNECT_REQ. A listener accepts floor bootstrap only from a
+floor-capable peer. Handshake replies use the received waveform, and data
+requires mutual confirmed support. Both detectors remain available.
+
+Floor-capable library sessions bound plain reliable MAC PDUs to 40 bytes,
+including the 14-byte MAC and seven-byte transport headers. Application
+segments therefore carry at most 19 bytes, also bounded by negotiated payload.
+Sequences remain unchanged through fallback. Five newly acknowledged floor
+exchanges permit one OFDM level-1 data probe bound to its outstanding sequence.
+Only its matching OFDM ACK selects OFDM. Timeout restores the floor and resets
+the count; retries preserve the segment and receivers suppress duplicate delivery.
+
+The library reserves two frame airtimes, two turnarounds and two seconds for
+streaming delivery in a floor handshake response window. Floor-capable ARQ
+uses the floor response window plus one second as its initial and per-segment
+RTO floor. With a 500 ms turnaround this is 20 seconds. Keepalives wait 60 seconds,
+capped at one third of the configured session timeout, to
+leave room for probe timeout and an eight-second recovery frame. Simultaneous
+call retries stagger by the local callsign; the lexically higher station
+accepts the lower station's request. The daemon does not implement this policy
+yet. These deterministic rules do not imply a measured connection probability.

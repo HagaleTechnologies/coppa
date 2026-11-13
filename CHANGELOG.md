@@ -14,6 +14,17 @@ numbers separately, because they move independently:
 Older releases have no entry here. Their on-air breaks are listed in
 `docs/SPEC.md` §0.1.
 
+## Unreleased: 0.15.0
+
+- Add negotiated low-rate floor sessions to the Rust library Link. Discovery
+  starts on OFDM, falls back after two unanswered windows, and probes OFDM
+  after five distinct acknowledged floor exchanges. Set
+  `LinkConfig.robust_floor = false` for the previous OFDM-only behavior.
+- Expose the last transmitted and validated received modes through
+  `Link::phy_mode()`. The daemon and host mode reporting remain open.
+- Allocate capability flags byte bit 6 without changing legacy bytes or
+  capability length. Public Rust struct additions require this minor bump.
+
 ## Unreleased: 0.14.0
 
 COP-190 adds the low-rate floor as a production air format, framed at
