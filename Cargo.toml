@@ -19,7 +19,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.13.0"
+version = "0.15.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85.0"
@@ -66,7 +66,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Root package for workspace-level integration tests
 [package]
 name = "coppa"
-version = "0.13.0"
+version = "0.15.0"
 edition = "2021"
 description = "Open-source ham radio digital communications system"
 license = "MIT OR Apache-2.0"
@@ -78,6 +78,7 @@ coppa-protocol = { path = "crates/coppa-protocol" }
 coppa-dsp = { path = "crates/coppa-dsp" }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 coppa-bench = { path = "crates/coppa-bench" }
 coppa-channel = { path = "crates/coppa-channel" }
 coppa-audio = { path = "crates/coppa-audio" }
@@ -93,6 +94,7 @@ workspace = true
 name = "throughput"
 harness = false
 
+<<<<<<< HEAD
 # COP-47. Fat LTO and one codegen unit: same wall time as the default profile on a
 # 32-core build host and about half the binary size (see
 # docs/DECISIONS/2026-11-09-release-binaries-and-versioning.md).
@@ -102,3 +104,13 @@ harness = false
 lto = "fat"
 codegen-units = 1
 strip = "debuginfo"
+=======
+# Optimize DSP-heavy CI simulations without weakening runtime checks.
+[profile.ci]
+inherits = "test"
+opt-level = 2
+debug = 1
+debug-assertions = true
+overflow-checks = true
+incremental = false
+>>>>>>> 21e94b63deb86db05e6e9fb416173b6032c68bf2

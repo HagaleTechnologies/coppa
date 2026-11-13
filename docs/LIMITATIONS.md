@@ -249,12 +249,12 @@ overshoot production cannot collect**, because `select_ofdm_profile` routes ever
 record to the bit under a controlled re-run (adaptive 326680 / best fixed L4 357424 / oracle 428936 /
 0.762 / 0.914), so the metric swap is provably accounting-only. See `BENCHMARKS.md`'s "Short-CP under
 closed-loop rate adaptation (COP-2)" section and `docs/adr/008-phase3-system-layer.md`'s COP-2
-update.
-- **Connected-session data is ARQ-protected stop-and-wait from COP-38 (0.3.0).** Every session `Data` frame carries a `TransportPdu::Reliable` header, the receiver ACKs each one with a MAC `Ack` frame, and `check_session_retransmits` (on `run()`'s 500 ms tick, whatever `arq_enabled` says) retransmits a lost frame byte-identically; `BUFFER` falls on the ACK, not at PTT release. The single session link means one session at a time: while a session exists, every CONNECT_REQ (the current peer's included) goes unanswered and a host `CONNECT` is answered `DISCONNECTED` to the dialling client only, so a session nobody ends (an idle one never times out) blocks every caller until the host sends `DISCONNECT`; a session frame must match the session's `src`, `dest` and SSID. Costs: clean-link throughput is about 0.57-0.67x of the old fire-and-forget stream (simulated and analytic, `BENCHMARKS.md`'s COP-38 section); a dead link with data in flight is disconnected after the 5-retransmission budget (~3 minutes) plus, since COP-68, a fade hold that keeps retrying at the most robust level whose budget fits the segment and only gives up after 180 s with zero peer evidence (any decoded peer PDU, or a header that decodes while the payload fails, counts as evidence and re-grants the budget), so a completely dead link ends in ~3 + 3 minutes at the worst while a link whose peer stays decodable is held indefinitely; the session wire format broke (ADR-010), so both stations must run 0.3.0. Residuals: no RF or real-Pat test, no block-ACK/window >1, an idle Established session on a dead link still never times out (keepalives refresh it), and a lost CONNECT_CFM is still unhandled. Since COP-111 each session frame's timeout covers the audio it keyed, our own station ID included, but not a station ID the peer prepends to its ACK: the sender cannot see the peer's ID timer, and at level 2 with 8 codewords and coppad's default PTT timing the timeout then expires 0.615 s before that ACK can finish, about once per 540 s (the base RTO floor has the same gap for every frame). RTT samples from multi-codeword frames also feed the RFC 6298 estimator unnormalized, so they inflate the RTO of later short frames until about 40 of those have been ACKed (one 11.9 s sample then 3.6 s samples measured 8.63 s after 20, 4.95 s after 30 and 4.23 s after 40); this errs long, so it costs recovery time on a loss but never keys a duplicate.
+update. The re-measure and redesign of this bar is tracked as COP-183, the successor to the retired COP-159.
+- **Connected-session data is ARQ-protected stop-and-wait from COP-38 (0.3.0).** Every session `Data` frame carries a `TransportPdu::Reliable` header, the receiver ACKs each one with a MAC `Ack` frame, and `check_session_retransmits` (on `run()`'s 500 ms tick, whatever `arq_enabled` says) retransmits a lost frame byte-identically; `BUFFER` falls on the ACK, not at PTT release. The single session link means one session at a time: while a session exists, every CONNECT_REQ (the current peer's included) goes unanswered and a host `CONNECT` is answered `DISCONNECTED` to the dialling client only, so a session nobody ends (an idle one never times out) blocks every caller until the host sends `DISCONNECT`; a session frame must match the session's `src`, `dest` and SSID. Costs: clean-link throughput is about 0.57-0.67x of the old fire-and-forget stream (simulated and analytic, `BENCHMARKS.md`'s COP-38 section); a dead link with data in flight is disconnected after the 5-retransmission budget (~3 minutes) plus, since COP-68, a fade hold that keeps retrying at the most robust level whose budget fits the segment and only gives up after 180 s with zero peer evidence (any decoded peer PDU, or a header that decodes while the payload fails, counts as evidence and re-grants the budget), so a completely dead link ends in ~3 + 3 minutes at the worst while a link whose peer stays decodable is held indefinitely; the session wire format broke (ADR-010), so both stations must run 0.3.0. Residuals: no RF or real-Pat test, no block-ACK/window >1, an idle Established session on a dead link still never times out (keepalives refresh it), and a lost CONNECT_CFM is still unhandled. Since COP-111 each session frame's timeout covers the audio it keyed, our own station ID included, but not a station ID the peer prepends to its ACK: the sender cannot see the peer's ID timer, and at level 2 with 8 codewords and coppad's default PTT timing the timeout then expires 0.615 s before that ACK can finish, about once per 540 s (the base RTO floor has the same gap for every frame). RTT samples from multi-codeword frames also feed the RFC 6298 estimator unnormalized, so they inflate the RTO of later short frames until about 40 of those have been ACKed (one 11.9 s sample then 3.6 s samples measured 8.63 s after 20, 4.95 s after 30 and 4.23 s after 40); this errs long, so it costs recovery time on a loss but never keys a duplicate. **Windowed session ARQ (COP-168) is only partly built.** `coppa-protocol` now defines the CONNECT capability flags bit 5 (`LinkCapabilities::windowed_arq`, negotiated as an AND and checked in CONNECT_CFM), `LinkCapabilities::windowed_window`, the PHY `seq_num` packing (`arq::windowed_phy_seq`), a per-level redundancy-version order (`arq::rv_for_session_attempt`, measured per HF level; see BENCHMARKS.md "COP-168 PHY HARQ schedule") and `ArqTx::unacked`. The receive and encode side of Phase 2 exists too: `modem::HarqPolicy` (`key_mask` keys the soft buffer on `seq_num & key_mask`, `rv0_starts_fresh` drops a key's buffer on an RV0 frame, `multi_codeword` enables per-codeword accumulation; the default is the old behaviour), a soft buffer that restarts when the payload length differs as well as the level, `harq_combined_successes`, `StreamingReceiver::take_failed_headers` (at most 16) and `CoppaCore::encode_bytes_tagged`, with `CoppaCore::set_harq_policy` surviving engine rebuilds. Nothing in coppad calls them yet. coppad does not advertise bit 5 and still runs stop-and-wait with RV0 on every attempt: the burst sender, the per-burst ACK, next-RV retransmissions, session throughput benches and SPEC §24 remain follow-up work under the COP-184 split. The PHY now supports opt-in multi-codeword soft combining via `HarqPolicy::multi_codeword`, bounded to 64 mother-codeword buffers with LRU eviction by frame key; every codeword must pass CRC in one attempt. The `session_harq` diagnostic measures the RV order separately from the deferred daemon integration. Two design points stay open for that work: an ACK carries HARQ key 0, the same key as data segments 0, 16, 32 and so on, so with data flowing both ways the receiver must keep ACK frames out of combining and out of the RV0 reset; and a retransmission never uses RV0, so a segment whose first RV0 frame was lost whole depends on RV1-RV3 frames combining with each other, which the `session_harq` measurement has to cover at levels where a lone RV1-RV3 frame does not decode.
 - **Nothing on the wire tells a MAC frame from a bare transport PDU, so some opt-in sessionless ARQ data is misclassified and dropped (COP-130).** The receiver tries the MAC parser first, then the transport parser, then raw delivery (`docs/SPEC.md` §16.2). A sessionless `Reliable` PDU of 14 bytes or more parses as a MAC frame when its first byte's low nibble is 0-8 and bytes 1-12 decode as two callsigns: `TransportPdu::new_reliable(0, 0, 0, b"ABCDEFGHIJ")` (`010000000000004142434445464748494a`, SPEC §21 vector N03) parses as a MAC `Ack` from `PTICQDUF` with SSID 7 and is dropped because no session matches. Every such PDU passes the MAC type check (its first byte `0x01` reads as MAC type `Ack`); its sequence number gives a valid MAC destination for 118 of the 256 values, and its first six payload bytes decide the rest, so the share lost depends on the traffic. Retransmissions are byte-identical, so an affected PDU fails every time until the retransmit budget runs out. It needs `arq_enabled` and sessionless host data, both off by default; connected-session traffic is always MAC-framed and is not affected. See SPEC §16.3.
 - **Sessionless ARQ data PDUs move the receiving station's own send window once its `send_base` reaches 128 (COP-130).** The sessionless receive path passes every inbound `Reliable` PDU's `ack_num`/`ack_bitmap` to the local `ArqTx::process_ack` (`crates/coppa-daemon/src/event_loop.rs`, `decode_and_dispatch_audio`), but data PDUs always carry `ack=0, bitmap=0`, and `ArqTx::process_ack` treats `ack_num = 0` as cumulatively acknowledging segments 128-255 (SPEC §19.2). Reproduced through `ArqTx` in `sessionless_zero_ack_moves_send_base_from_128` (`crates/coppa-protocol/tests/protocol_vectors.rs`): after 130 acknowledged sends with segment 130 in flight, `process_ack(0, 0)` reports 130 as newly acknowledged, moves `send_base` back to 0 and leaves 131 segments counted in flight, so the window stays full. It needs `arq_enabled`, sessionless data in both directions and at least 128 segments sent; connected sessions ignore the ACK fields of data frames and are not affected. See SPEC §19.5.
-- **Multi-codeword frames (Phase 3 Task 5) do not extend ACK addressing, turbo re-estimation, or persistent IR-HARQ combining to the per-codeword level.** A multi-codeword frame is retransmitted, if at all, as a whole (same `seq`, cycling RV via the existing mechanism) rather than by `(seq, codeword-index)`; turbo re-estimation and IR-HARQ's persistent cross-retransmission LLR accumulator are both scoped to `codewords <= 1` only, taking the exact pre-Task-5 decode path. These are real, deliberate scope cuts (not oversights) — see `docs/adr/007-multi-codeword-frames.md` (decisions 4-5) for the full reasoning
-- **At level 3, an RV2 retransmission never rescues a failed RV0 frame (COP-129).** Probe: an RV0 frame then an RV2 frame of the same payload and `seq`, AWGN, fresh `StreamingReceiver`, 30 seeds per point. At 1, 2 and 3 dB, RV0 alone failed 29, 24 and 11 times and the pair decoded 0 times at every point. At 3 dB, RV1 rescued 6 of 11 failed RV0 frames and RV3 rescued 7 of 11. SPEC §5.3 tells a sender to try RV2 first. Production sends only RV0 (Chase), so no shipped path is affected; it matters to a transmitter that cycles RV. A lone RV2 frame also fails at L2, L3 and L6 (lone RV1-RV3 at L4, L5 and L7-L9), but at L4, L7 and L9 the RV0+RV2 pair combines. L5 and L6 left too few RV0 failures to measure. For these reasons the golden retransmission vectors cover L4 and L9 only. Not root-caused. See `BENCHMARKS.md`'s "COP-129: golden vectors" section.
+- **Multi-codeword frames (Phase 3 Task 5) do not extend ACK addressing or turbo re-estimation to the per-codeword level.** A multi-codeword frame is retransmitted, if at all, as a whole (same `seq`, cycling RV via the existing mechanism) rather than by `(seq, codeword-index)`; turbo re-estimation remains scoped to `codewords <= 1`. Persistent cross-retransmission combining now supports multi-codeword frames when `HarqPolicy::multi_codeword` is enabled. Its default is false, so existing callers retain single-shot multi-codeword decoding. These are real, deliberate scope cuts (not oversights) — see `docs/adr/007-multi-codeword-frames.md` (decisions 4-5) for the full reasoning
+- **At level 3, an RV2 retransmission never rescues a failed RV0 frame (COP-129).** Probe: an RV0 frame then an RV2 frame of the same payload and `seq`, AWGN, fresh `StreamingReceiver`, 30 seeds per point. At 1, 2 and 3 dB, RV0 alone failed 29, 24 and 11 times and the pair decoded 0 times at every point. At 3 dB, RV1 rescued 6 of 11 failed RV0 frames and RV3 rescued 7 of 11. SPEC §5.3 tells a sender to try RV2 first. Production sends only RV0 (Chase), so no shipped path is affected; it matters to a transmitter that cycles RV. A lone RV2 frame also fails at L2, L3 and L6 (lone RV1-RV3 at L4, L5 and L7-L9), but at L4, L7 and L9 the RV0+RV2 pair combines. L5 and L6 left too few RV0 failures to measure. For these reasons the golden retransmission vectors cover L4 and L9 only. Not root-caused. See `BENCHMARKS.md`'s "COP-129: golden vectors" section. **COP-168 reproduced it on the real transceiver** (scratch paired probe in the COP-168 plan, not committed: 120 trials per row, `max_payload - 21` random bytes, 1200-sample tail, an independent channel draw per attempt; failed RV0 frames rescued by Chase / RV1 / RV2 / RV3): L2 Watterson Moderate 12 dB, 9 failures, 7 / 7 / 3 / 7; L3 Moderate 15 dB, 23 failures, 22 / 21 / 16 / 22; L4 Moderate 18 dB, 51 failures, 37 / 43 / 46 / 46; L3 AWGN 3 dB, 36 failures, 21 / 22 / 0 / 22; L4 AWGN 3 dB, 85 failures, 50 / 40 / 42 / 42. On that probe alone, COP-168's provisional `arq::RV_SCHEDULE` put RV2 last on every level; the measured per-level schedule has since replaced it, with RV2 last only at levels 1–2 and second at levels 3–9. COP-168's release diagnostic now measures all six nonzero-RV orders after RV0, with paired Chase repeats and 400 failed initial frames per HF level. Its selected schedules do not beat Chase on first-retry rescue at levels 1 and 2, with margins of -0.25 and -6.75 percentage points. Levels 4 through 8 never reached the requested 25–35% calibration FER in the sampled -10 through 50 dB range; those comparisons use the closest measured operating points. See BENCHMARKS.md "COP-168 PHY HARQ schedule" for calibration, Wilson intervals and discordant pairs. This does not resolve the RV2 root cause or demonstrate session goodput.
 - **Session payload compression has no store-raw fallback, so incompressible data grows on the wire.** Huffman+LZ4 compression runs unconditionally under `HF_STANDARD` and `VHF_FAST`, whatever the session's negotiated `compression` bit says, and it grows incompressible payloads by about 1.8x (518 B of random data become 935 B at level 2). Nothing falls back to sending the bytes raw. Since COP-110 the session link sizes each frame after compression (the fewest codewords that hold the compressed frame), so the cost is the extra wire bytes, not unused codewords.
 - **Decision 4's block-ACK cadence (Phase 3 Task 2) was never implemented.** The plan called for batching ACKs to once per received burst boundary or every 2 frames rather than one ACK per decoded frame; this sub-decision has no corresponding code (confirmed via grep across `arq.rs`/`transport.rs`) — every decoded frame still triggers its own ACK today. Does not compromise correctness (more ACKs than strictly necessary is airtime-inefficient, not incorrect), but is a real, previously-undocumented gap against the plan's literal text. See `docs/adr/008-phase3-system-layer.md` (decision 4)
 - **Engine throughput benchmarks (COP-131) use a fixed 32-byte uncompressed payload and ideal clean loopback.** `cargo bench --bench throughput` covers levels 1–9 with level-derived HF/VHF routing. Its CPU processing latency and throughput depend on the host. Ideal frame goodput divides verified payload bits by encoded audio airtime; it excludes channel losses, ARQ, turnaround and session overhead and is not RF validation or a maximum-capacity figure. The channel benchmark limitations below still apply. See `BENCHMARKS.md`'s “Engine processing and ideal frame goodput” section.
@@ -356,6 +356,87 @@ update.
   protected-mode bound covers two slow HF ACKs, but does not reserve a third
   frame for a peer ID. A lost first ACK during that prepend can cause a retry.
 
+## COP-169 robust low-rate floor (session integration open)
+
+- The OFDM ladder still cannot serve the floor's job: below about +3 dB
+  (3 kHz reference) on AWGN, `hf_narrow` level 1 loses nearly every frame,
+  and the failures are `SyncFailed`. A session cannot connect at −6 dB or
+  hold through a fade to −6 dB. The COP-169 bars (50% FER crossing at or
+  below −8 dB AWGN and −2 dB Watterson Poor, connect within 60 s at −6 dB
+  in 9 of 10 trials, survive a 20 → −6 → 20 dB Poor ramp) are unmet.
+- What exists now is the production floor's physical layer: air-protocol
+  version 2 is allocated (SPEC §0.3.3, ADR-014), the 16-FSK modulation
+  lives in `coppa-codec::floor`, the framing plus a separately detected
+  streaming receiver (`FloorFrame`, `FloorStream`) live in
+  `coppa-protocol::modem::floor` (guarded by `air_v2_conformance.rs` and
+  `floor_receive.rs`), and `CoppaCore` constructs the floor receive path
+  next to its OFDM paths (`CoppaCore::floor`, `push_floor_samples`), with
+  the v1 OFDM paths untouched. No session sends or receives on it: the
+  floor-aware Link/daemon session controller (capability negotiation,
+  connect-on-floor, OFDM fallback after two expired response windows, the
+  five-acknowledged-exchange OFDM probe) is unbuilt, the −6 dB connect bar
+  (9 of 10 within 60 s) is unmet. Production development sweeps now
+  cover batch and streaming reception on AWGN and Poor. COP-191 records
+  final-seed 200-trial sweeps and adds `--waveform floor`; the Poor ramp,
+  `connect` and `ramp` drivers still need the session controller.
+- What exists for judgement is the measurement contract the floor will be
+  judged by: `coppa_bench::floor_sweep` (nine-point −12…+4 dB grid, locked
+  seed bases `0x00C0FFEE`, `0x16900000` and `0x16910000`, conservative
+  `SyncFailed` with diagnostic subcounts, Wilson intervals, the
+  interpolated 50% crossing and the sync-share clause) and the `floor_mode`
+  diagnostic, which measures the production receiver through the new
+  persistent channel. COP-191 adds `--waveform floor` through production
+  batch and continuous receivers on one capture per attempt; omitting it
+  preserves the `ofdm:1` baseline. See BENCHMARKS,
+  "COP-191 production floor sweeps".
+- `coppa_channel::persistent` is the session channel: one continuous
+  Watterson process per direction, carried across calls and turnarounds,
+  with noise set from a fixed clean power and an SNR schedule (including the
+  COP-169 ramp). Its fading is generated at 100 Hz and linearly interpolated,
+  and its streaming Hilbert FIR adds a fixed 511-sample (10.6 ms) latency on
+  faded paths. No endpoint (Link or daemon) drives it yet.
+- The 16-FSK design now exists twice: COP-190 moved it into the production
+  crates, while the measurement-only bench copy (`floor_candidate.rs`)
+  retains its historical measurements. The production floor has no
+  Link or daemon caller yet. The design's development Poor sweep, measured
+  on the frozen bench copy, fails the conservative sync-share clause:
+  header sync dominates near the crossing. Production development sweeps
+  also fail sync share, at −12 dB AWGN and −8/−6 dB Poor for both paths.
+  Production 50% crossings are at or below −12 dB AWGN and −9 dB Poor.
+  These ten-trial development points do not establish final acceptance.
+  See BENCHMARKS, "COP-190 production floor development measurements".
+- COP-187 repairs the experimental candidate's independent hard header
+  decisions by jointly decoding legal length/CRC combinations. Paired Poor
+  development runs reduce frame errors from 24/90 to 20/90, but header
+  failures still dominate above the crossing.
+- The `floor_mode sweep` diagnostic accepts `--rx batch|streaming|both` and
+  measures the production batch (`CoppaTransceiver::receive`) and streaming
+  (`StreamingReceiver`) receive paths over the same grid, seeds and channel
+  realizations; `connect` and `ramp` remain unimplemented (COP-191).
+- COP-189's separate continuous experimental receiver
+  (`floor_candidate --streaming`) retains at most 480,000 samples, attempts
+  one window decode per second and tries at most 16 sync candidates per CFO
+  hypothesis, with 13 hypotheses from −150 to +150 Hz in 25 Hz steps, or at
+  most 208 per window; the production `FloorStream` carries the same joint
+  header decode and the same CFO and sync-candidate search bounds. Chunk,
+  corrupt/truncated-header, nonfinite-input and duplicate-delivery
+  regressions pass, and an explicit release test delivers nothing during
+  300 seconds each of seeded white noise, block-filtered SSB noise and
+  1 kHz tone plus noise. These checks are not a production acquisition or
+  FER claim. Batch and chunked regressions recover noiseless frames at CFO
+  −150, −75, +75 and +150 Hz without an offset oracle. This fixed grid does
+  not track intra-frame drift or guarantee reception between grid points.
+  BPSK comparison, fading tracking, session integration and final
+  acceptance measurements remain open.
+- COP-190 allocates the candidate's header version value 2 as production
+  air-protocol version 2 (SPEC §0.3.3, ADR-014), freezing the tone
+  alphabet, header layout, FEC envelope, 40-byte capacity, 8.0 s airtime
+  and receiver search bounds. Frozen v1 formats, host fields and C ABI are
+  unchanged.
+- See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for
+  raw development evidence. COP-191 records final-seed sweeps below; no
+  production session result is claimed.
+
 ## COP-178 versioned wire contract
 
 - There is no in-band air-protocol version negotiation and no automatic
@@ -405,3 +486,56 @@ after its last request, and in the COP-172 lab a new dial on that coppad
 in that window was refused with `another session is active`. A host that
 drops its connection mid-dial should send `ABORT` first; the BPQ lab's
 stall scenario does (`docs/testing/bpq-session.md`).
+
+## COP-169 robust low-rate floor (session integration open)
+
+- COP-190 builds the production floor framing: air-protocol version 2 is
+  allocated (SPEC §0.3.3, ADR-014), the 16-FSK modulation lives in
+  `coppa-codec::floor`, and the framing plus a separately detected
+  streaming receiver (`FloorFrame`, `FloorStream`) live in
+  `coppa-protocol::modem::floor`, guarded by `air_v2_conformance.rs` and
+  `floor_receive.rs`. CoppaCore constructs a floor codec and continuous receive path, but
+  Link and daemon have no floor-aware session controller: capability
+  negotiation, connect-on-floor, OFDM fallback and the −6 dB connect bar
+  (9 of 10 within 60 s) remain unmet, as does Poor ramp acceptance. COP-191 adds the
+  production sweep driver; `connect` and `ramp` remain blocked on the
+  COP-190 production session controller.
+- COP-187 repairs the experimental 16-FSK candidate's independent hard header
+  decisions by jointly decoding legal length/CRC combinations. Paired Poor
+  development runs reduce frame errors from 24/90 to 20/90, but header failures
+  still dominate above the crossing. The candidate remains unselected.
+- The `floor_mode sweep` diagnostic accepts `--rx batch|streaming|both` and
+  measures the production batch (`CoppaTransceiver::receive`) and streaming
+  (`StreamingReceiver`) receive paths over the same grid, seeds and channel
+  realizations. COP-191 adds `--waveform floor` through `FloorFrame` and
+  `FloorStream`. Floor non-delivery without trusted-header diagnostics is
+  SyncFailed. The floor capture includes a 1.25 s noisy tail for its
+  one-second decode schedule. `connect` and `ramp` remain unimplemented.
+  See BENCHMARKS, "COP-191 production floor sweeps", for final-seed results.
+- The capture adapter still decodes only when asked. COP-189 adds a separate
+  continuous experimental receiver, available with `floor_candidate --streaming`.
+  It retains at most 480,000 samples, attempts one window decode per second and
+  tries at most 16 sync candidates per CFO hypothesis, with 13 hypotheses
+  from -150 to +150 Hz in 25 Hz steps, or at most 208 per window.
+  Chunk, corrupt/truncated header,
+  nonfinite-input and duplicate-delivery regressions pass. An explicit release
+  test delivers nothing during 300 seconds each of seeded white noise,
+  block-filtered SSB noise and 1 kHz tone plus noise. These checks are not a
+  production acquisition or FER claim. Batch and chunked regressions recover
+  noiseless frames at CFO -150, -75, +75 and +150 Hz without an offset oracle.
+  This fixed grid does not track intra-frame drift or guarantee reception
+  between grid points. BPSK comparison, fading tracking, production integration
+  and final acceptance measurements remain open.
+- COP-190 allocates the candidate's header version value 2 as production
+  air-protocol version 2 (SPEC §0.3.3, ADR-014), freezing the tone
+  alphabet, header layout, FEC envelope, 40-byte capacity, 8.0 s airtime
+  and receiver search bounds. Frozen v1 formats, host fields and C ABI are
+  unchanged.
+- See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for raw
+  development evidence. COP-191's production final-seed sweeps are in
+  [BENCHMARKS](../BENCHMARKS.md#cop-191-production-floor-sweeps): both receivers
+  cross at or below -12 dB AWGN and at -10.148936 dB Poor, with zero wrong
+  payloads, but both fail the sync-share clause on both channels. No
+  production session result is claimed.
+
+- **Full-CI hosted verdict budget (COP-200).** Local optimized groups pass below 25 minutes, but three same-revision hosted workflow verdicts below 30 minutes remain unverified. Other required jobs, runner queue time and cold caches can affect the complete result. See [full-CI measurements](testing/full-ci.md).

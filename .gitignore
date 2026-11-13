@@ -89,7 +89,29 @@ vara.local.toml
 docs/superpowers/
 
 # Raw benchmark/measurement output (regenerable; curated summary goes in BENCHMARKS.md)
-/results/
+/results/*
+!/results/cop-187/
+/results/cop-187/**
+# COP-187 curated development evidence used by floor_results.rs.
+!/results/cop-187/dev-header-before-poor/
+!/results/cop-187/dev-header-before-poor/metadata.txt
+!/results/cop-187/dev-header-before-poor/sweep.csv
+!/results/cop-187/dev-header-poor/
+!/results/cop-187/dev-header-poor/metadata.txt
+!/results/cop-187/dev-header-poor/sweep.csv
+!/results/cop-187/dev-header-awgn/
+!/results/cop-187/dev-header-awgn/metadata.txt
+!/results/cop-187/dev-header-awgn/sweep.csv
+# COP-187 integer-tone CFO development evidence.
+!/results/cop-187/dev-cfo-zero-poor/
+!/results/cop-187/dev-cfo-zero-poor/metadata.txt
+!/results/cop-187/dev-cfo-zero-poor/sweep.csv
+!/results/cop-187/dev-cfo-minus150-poor/
+!/results/cop-187/dev-cfo-minus150-poor/metadata.txt
+!/results/cop-187/dev-cfo-minus150-poor/sweep.csv
+!/results/cop-187/dev-cfo-plus150-poor/
+!/results/cop-187/dev-cfo-plus150-poor/metadata.txt
+!/results/cop-187/dev-cfo-plus150-poor/sweep.csv
 # Catalyst orchestrator runtime state (worktree-local; never committed — see
 # catalyst's execution-core/worktree-safety.mjs MACHINE_LOCAL_NOISE list)
 .catalyst/.workflow-context.json
@@ -104,3 +126,23 @@ thoughts/
 
 # COP-114 independent FX.25 audio regression fixtures.
 !crates/coppa-codec/tests/fixtures/fx25/*.wav
+
+# COP-191 locked production floor sweeps, audited by floor_results.rs.
+!/results/cop-191/
+/results/cop-191/**
+!/results/cop-191/final-awgn/
+!/results/cop-191/final-awgn/metadata.txt
+!/results/cop-191/final-awgn/sweep.csv
+!/results/cop-191/final-poor/
+!/results/cop-191/final-poor/metadata.txt
+!/results/cop-191/final-poor/sweep.csv
+
+# COP-190 production-floor development evidence.
+!/results/cop-190/
+/results/cop-190/**
+!/results/cop-190/dev-awgn/
+!/results/cop-190/dev-awgn/sweep.csv
+!/results/cop-190/dev-awgn/metadata.txt
+!/results/cop-190/dev-poor/
+!/results/cop-190/dev-poor/sweep.csv
+!/results/cop-190/dev-poor/metadata.txt

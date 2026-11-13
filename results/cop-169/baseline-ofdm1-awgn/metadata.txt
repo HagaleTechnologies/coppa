@@ -1,0 +1,22 @@
+waveform=ofdm:1
+profile=hf_narrow
+level=1
+payload_bytes=56
+rx_path=batch
+channel=awgn
+snr_grid_db=[-12, -10, -8, -6, -4, -2, 0, 2, 4]
+trials_per_point=200
+seed_base=0xc0ffee
+seed_rule=attempt_seed(base, point, trials, trial) = base + point*trials + trial; channel streams = coppa_channel::persistent::derive_seed(attempt_seed, direction, stream)
+lead_in_s=0.35 (+ uniform 0-0.05 s)
+tail_s=0.25
+snr_reference=clean frame mean power, 3 kHz
+crossing=Some(At { db: 3.0384615384615383, all: [3.0384615384615383] })
+bar_db=-8
+sync_share_violations=[4.0]
+wrong_payloads=0
+passes=false
+acceptance_run=false
+final_sweep_seed_base=0x16900000
+final_session_seed_base=0x16910000
+session_ramp=SnrProfile { points: [(0.0, 20.0), (20.0, 20.0), (50.0, -6.0), (80.0, -6.0), (110.0, 20.0), (170.0, 20.0)] } (170 s)
