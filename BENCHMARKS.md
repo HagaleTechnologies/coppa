@@ -400,6 +400,104 @@ Unit tests separately cover clean SSB filtering with its FIR tail flushed and
 one seeded -6 dB AWGN capture at 0 and +/-150 Hz. They do not establish a filtered
 FER curve or a noisy SSB compatibility envelope.
 
+## COP-189 continuous candidate acquisition slice
+
+`floor_candidate --streaming` exercises continuous acquisition of the existing
+experimental 16-FSK candidate. It ingests arbitrary chunks, decodes overlapping
+windows on a one-second cadence, and keeps at most 480,000 audio samples. Each
+window originally attempted at most 16 separated sync candidates at zero CFO.
+The CFO search described below increases that bound. Decode work is independent
+of caller chunk sizes and stream duration. Tone energies and candidate lists
+remain bounded by the ten-second window; this implementation recomputes them
+for each window rather than claiming an incremental matched-filter receiver.
+Metadata records decode attempts and peak retained samples at chunk boundaries.
+A missing streaming delivery counts conservatively as SyncFailed because this
+adapter does not expose a validated failure-stage trace.
+
+The release regression
+`cargo test --release -p coppa-bench --lib continuous_acquisition_300_seconds_noise -- --ignored`
+passed with zero deliveries for 300 seconds each of seeded white noise,
+SSB-filtered one-second noise blocks and a 1 kHz tone plus noise. Each stream
+attempted 293 decodes and retained at most 480,000 samples. This is synthetic
+noise rejection evidence only. It does not select a production waveform or
+resolve the floor FER, connection or fade-ramp acceptance requirements. No
+final-seed production results are published for this slice.
+
+
+### COP-189 CFO acquisition repair
+
+The experimental batch and continuous receivers now share a matched-filter bank
+covering 450..1500 Hz in 25 Hz steps. Thirteen views select the sixteen nominal
+tones shifted by -150..+150 Hz. Each view may try sixteen separated candidates,
+so a window attempts at most 208 candidate decodes. Only one sixteen-tone view
+is allocated at a time. Audio retention and the one-second window cadence are
+unchanged. Templates repeat after two symbols, including the half-bin offsets.
+Transmit tones, framing, eight-second airtime and CRC checks are unchanged.
+
+`cargo test --release -p coppa-bench --lib cfo_search_decodes_unknown_offset_in_batch_and_chunks`
+requires exact payload delivery at -150, -75, +75 and +150 Hz, with an unknown
+137-sample prefix, in batch and 317-sample chunks. It failed at -150 Hz before
+the repair. This is a noiseless acquisition regression, not a fading FER curve.
+Diagnostic metadata now records the grid and expanded work bound. Historical
+COP-169 and COP-187 CSVs remain measurements of their original receivers.
+
+The search holds CFO constant over the frame. It does not implement fading
+tracking or prove reception between grid points. The BPSK comparison, production
+selection and integration, session support and final sweep/connect/ramp evidence
+remain unbuilt. No acceptance criterion is declared complete by this repair.
+
+## COP-191 production floor sweeps
+
+These simulated audio-channel measurements use the production air-v2
+`FloorFrame` and continuous `FloorStream`, not the experimental bench codec.
+Each channel has nine points from -12 to +4 dB in 2 dB steps and 200 trials
+per point. The final base is `0x16900000`; each seed is
+`base + point*200 + trial`. Both receivers consume the same captured audio
+per attempt, with a randomized noise lead-in, an 8 s transmitted frame and
+a 1.25 s noisy tail. Streaming chunks contain 4,800 samples.
+
+| Channel | Receiver | Frame errors / trials | 50% FER crossing | Sync-share violations, dB | Passes |
+| --- | --- | --- | --- | --- | --- |
+| AWGN | batch | 22 / 1800 | at or below -12 dB | -12, -10 | false |
+| AWGN | streaming | 22 / 1800 | at or below -12 dB | -12, -10 | false |
+| Poor | batch | 329 / 1800 | -10.148936 dB | -10, -8, -6, -4, +2 | false |
+| Poor | streaming | 329 / 1800 | -10.148936 dB | -10, -8, -6, -4, +2 | false |
+
+All four receiver/channel combinations delivered zero wrong payloads.
+Poor has one interpolated crossing and no recrossings. AWGN is below 50%
+throughout the grid, so its crossing is a bound rather than an interpolation.
+The crossings meet their respective -8 and -2 dB bars, but all four verdicts
+fail the separate `2 * sync_failed < frame_errors` clause above the crossing.
+Zero-failure points satisfy that clause.
+
+Batch failures retain their observed stages. Streaming exposes no trusted-header
+failure diagnostics, so every non-delivery is conservatively SyncFailed.
+Its counters do not establish that all those failures occurred in acquisition.
+
+The [AWGN CSV](results/cop-191/final-awgn/sweep.csv) and
+[Poor CSV](results/cop-191/final-poor/sweep.csv) retain all attempts in the
+unchanged sweep schema, including failed protected headers. Adjacent
+`metadata.txt` files record the invocation, seed rule, power reference,
+completion and independent verdicts. `cop191_final_sweeps_recompute` checks
+both receiver grids, counts, Wilson 95% intervals, airtime, goodput,
+crossings and metadata. Airtime excludes noise lead-in and tail; goodput is
+correct payload bits divided by transmitted airtime.
+
+Reproduce with:
+
+```sh
+cargo run --release -p coppa-bench --example floor_mode -- sweep --waveform floor --rx both --channel awgn --snr-min -12 --snr-max 4 --snr-step 2 --trials 200 --seed 378535936 --out-dir results/cop-191/final-awgn
+cargo run --release -p coppa-bench --example floor_mode -- sweep --waveform floor --rx both --channel poor --snr-min -12 --snr-max 4 --snr-step 2 --trials 200 --seed 378535936 --out-dir results/cop-191/final-poor
+```
+
+Both commands exited 1 because the measured verdicts fail. `acceptance_run=true`
+identifies the locked experiment configuration, not a passing result.
+Omitting `--waveform` still selects the `ofdm:1` baseline. There is no overall
+floor acceptance claim: `connect` and `ramp` remain unavailable until COP-190
+provides the negotiated Link/daemon controller. No session trials, ACK traces
+or OFDM recovery evidence are claimed here. These are simulated channel
+measurements, not RF certification.
+
 
 ## COP-190 production floor development measurements
 

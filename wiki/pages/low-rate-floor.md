@@ -8,6 +8,7 @@ sources:
   - BENCHMARKS.md
   - docs/LIMITATIONS.md
   - crates/coppa-bench/src/floor_candidate.rs
+  - crates/coppa-bench/src/floor_sweep.rs
   - crates/coppa-protocol/src/modem/floor.rs
 verified:
   commit: 19948e9f8eb8e8139fb86b9237112cc83ed6095a
@@ -50,10 +51,14 @@ and a 1 kHz tone plus noise. It does not establish RF false-alarm probability
 or a fading FER crossing.
 
 `floor_mode sweep --rx batch|streaming|both` measures the production batch and
-streaming receive paths on the same seeds, but only for the `ofdm:1`
-baseline; sweeping the production floor waveform through the diagnostic is
-COP-191's driver work. `connect` and `ramp` need the production floor
-session and do not exist yet.
+streaming receive paths. COP-191 adds `--waveform floor` using the production
+`FloorFrame` and `FloorStream`, with one impaired capture per seed fed to both.
+The noisy tail must cover the continuous receiver's next scheduled decode.
+See [production sweep results](../../BENCHMARKS.md#cop-191-production-floor-sweeps)
+for measured verdicts. Both receivers fail the sync-share bar on both channels,
+with zero wrong payloads. `connect` and `ramp` still need COP-190's deferred
+production session controller. A codec receive test does not prove session
+establishment, floor ACKs or OFDM recovery.
 
 
 CFO search in the experimental batch and continuous receiver uses thirteen
