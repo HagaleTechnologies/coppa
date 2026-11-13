@@ -742,3 +742,45 @@ fn floor_answerer_retries_before_handshake_timeout() {
     assert_eq!(link.frames_transmitted(), 4);
     assert_eq!(link.state(), LinkState::Connecting);
 }
+
+#[test]
+fn floor_lost_confirmation_recovers_before_accepting_timeout() {
+    let a = LinkConfig::new("N0AAA");
+    let b = LinkConfig::new("N0BBB");
+    let mut c = Cable::new(a.clone(), b.clone());
+    c.a = Link::new(a).unwrap();
+    c.b = Link::new(b).unwrap();
+    c.b.set_listening(true);
+    // Erase two OFDM requests and the first floor confirmation.
+    c.drop_a = vec![0, 1, 3];
+    c.a.connect("N0BBB", c.now()).unwrap();
+    assert!(c.run_until(Duration::from_secs(60), |a, _| {
+        a.state() == LinkState::Connected
+    }));
+    c.a.send(b"recover").unwrap();
+    assert!(c.run_until(Duration::from_secs(80), |a, b| {
+        a.pending_tx_bytes() == 0 && b.received_len() == 7
+    }));
+    assert_eq!(Cable::recv_all(&mut c.b), b"recover");
+    assert_eq!(c.a.state(), LinkState::Connected);
+    assert_eq!(c.b.state(), LinkState::Connected);
+}
+
+#[test]
+fn floor_stagger_allows_configured_retry_window() {
+    for (rto, turnaround, first_retry) in [(10, 500, 39), (5, 1000, 30)] {
+        let mut config = LinkConfig::new("N0AAD");
+        config.initial_rto = Duration::from_secs(rto);
+        config.turnaround = Duration::from_millis(turnaround);
+        let mut link = Link::new(config).unwrap();
+        let base = Instant::now();
+        link.connect("N0AAA", base).unwrap();
+        let mut out = vec![0.0; 8 * 48_000];
+        for seconds in 0..=2 * first_retry {
+            link.process(base + Duration::from_secs(seconds), &[], &mut out);
+            assert_eq!(link.state(), LinkState::Connecting, "at {seconds}s");
+        }
+        assert_eq!(link.frames_transmitted(), 3);
+        assert_eq!(link.phy_mode().0, Some(LinkPhyMode::Floor));
+    }
+}

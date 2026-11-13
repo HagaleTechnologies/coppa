@@ -938,6 +938,20 @@ impl Link {
     }
 
     fn run_timers(&mut self, now: Instant) {
+        let mut handshake_timeout = Duration::from_secs(session::HANDSHAKE_TIMEOUT_SECS);
+        if self.phase == Phase::Accepting
+            && self.floor.mode(self.core.speed_level()) == LinkPhyMode::Floor
+        {
+            let window = FloorController::response_window(
+                LinkPhyMode::Floor,
+                Duration::ZERO,
+                self.config.turnaround,
+            );
+            // From ACK key-up, allow the lost CFM, first data transmission,
+            // its initial RTO and a replayed CFM, including delivery margins.
+            handshake_timeout = handshake_timeout
+                .max(window * 3 + self.config.initial_rto.max(window + Duration::from_secs(1)));
+        }
         if self.phase == Phase::Calling {
             if let Some(keyed) = self.req_keyed_at {
                 // Both handshake frames use this link's fixed level/profile.
@@ -967,8 +981,7 @@ impl Link {
                 // windows and first complete floor request. Unlike callsign hash
                 // buckets, these complementary roles cannot have equal delays
                 // for distinct callsigns. This matches on_connect_req's tie-break.
-                // Floor retries retain their normal window so they still occur
-                // before the idle handshake timeout.
+                // Floor retries retain their normal response window.
                 let stagger = if self.config.robust_floor
                     && self.tx_mode != Some(LinkPhyMode::Floor)
                     && self.remote().is_some_and(|peer| self.local.as_str() > peer)
@@ -982,6 +995,11 @@ impl Link {
                 } else {
                     Duration::ZERO
                 };
+                // Keep the idle reaper beyond the retry and its turnaround
+                // hold. Retry exhaustion still bounds an unanswered call.
+                handshake_timeout = handshake_timeout.max(
+                    retry_interval + stagger + self.config.turnaround + Duration::from_secs(1),
+                );
                 if now.saturating_duration_since(keyed) >= retry_interval + stagger {
                     self.floor.timeout(self.config.robust_floor);
                     if self.req_attempts <= self.config.connect_retries {
@@ -1000,7 +1018,13 @@ impl Link {
                 }
             }
         }
-        if self.session.as_ref().is_some_and(|s| s.is_timed_out(now)) {
+        if self.session.as_ref().is_some_and(|s| {
+            if matches!(self.phase, Phase::Calling | Phase::Accepting) {
+                now.saturating_duration_since(s.last_activity) >= handshake_timeout
+            } else {
+                s.is_timed_out(now)
+            }
+        }) {
             let reason = if matches!(self.phase, Phase::Calling | Phase::Accepting) {
                 DisconnectReason::HandshakeFailed
             } else {
