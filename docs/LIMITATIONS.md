@@ -375,18 +375,19 @@ update.
   connect-on-floor, OFDM fallback after two expired response windows, the
   five-acknowledged-exchange OFDM probe) is unbuilt, the −6 dB connect bar
   (9 of 10 within 60 s) is unmet. Production development sweeps now
-  cover batch and streaming reception on AWGN and Poor; final-seed
-  production sweeps remain unrecorded. The Poor ramp acceptance,
-  the final-seed 200-trial sweeps and the `--waveform floor`, `connect`
-  and `ramp` drivers belong to COP-191.
+  cover batch and streaming reception on AWGN and Poor. COP-191 records
+  final-seed 200-trial sweeps and adds `--waveform floor`; the Poor ramp,
+  `connect` and `ramp` drivers still need the session controller.
 - What exists for judgement is the measurement contract the floor will be
   judged by: `coppa_bench::floor_sweep` (nine-point −12…+4 dB grid, locked
   seed bases `0x00C0FFEE`, `0x16900000` and `0x16910000`, conservative
   `SyncFailed` with diagnostic subcounts, Wilson intervals, the
   interpolated 50% crossing and the sync-share clause) and the `floor_mode`
   diagnostic, which measures the production receiver through the new
-  persistent channel. Its only waveform today is the `ofdm:1` baseline; see
-  BENCHMARKS, "COP-169".
+  persistent channel. COP-191 adds `--waveform floor` through production
+  batch and continuous receivers on one capture per attempt; omitting it
+  preserves the `ofdm:1` baseline. See BENCHMARKS,
+  "COP-191 production floor sweeps".
 - `coppa_channel::persistent` is the session channel: one continuous
   Watterson process per direction, carried across calls and turnarounds,
   with noise set from a fixed clean power and an SNR schedule (including the
@@ -432,8 +433,8 @@ update.
   and receiver search bounds. Frozen v1 formats, host fields and C ABI are
   unchanged.
 - See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for
-  raw development evidence. No final-seed sweep or production session
-  result is claimed.
+  raw development evidence. COP-191 records final-seed sweeps below; no
+  production session result is claimed.
 
 ## COP-178 versioned wire contract
 
@@ -485,11 +486,19 @@ in that window was refused with `another session is active`. A host that
 drops its connection mid-dial should send `ABORT` first; the BPQ lab's
 stall scenario does (`docs/testing/bpq-session.md`).
 
-## COP-169 robust low-rate floor not built yet
+## COP-169 robust low-rate floor (session integration open)
 
-- The production modem still has no separately detected low-rate floor, v2
-  floor framing, or floor-aware Link/daemon session controller. COP-187's
-  connection at -6 dB and fade-ramp requirements remain unmet.
+- COP-190 builds the production floor framing: air-protocol version 2 is
+  allocated (SPEC §0.3.3, ADR-014), the 16-FSK modulation lives in
+  `coppa-codec::floor`, and the framing plus a separately detected
+  streaming receiver (`FloorFrame`, `FloorStream`) live in
+  `coppa-protocol::modem::floor`, guarded by `air_v2_conformance.rs` and
+  `floor_receive.rs`. CoppaCore constructs a floor codec and continuous receive path, but
+  Link and daemon have no floor-aware session controller: capability
+  negotiation, connect-on-floor, OFDM fallback and the −6 dB connect bar
+  (9 of 10 within 60 s) remain unmet, as does Poor ramp acceptance. COP-191 adds the
+  production sweep driver; `connect` and `ramp` remain blocked on the
+  COP-190 production session controller.
 - COP-187 repairs the experimental 16-FSK candidate's independent hard header
   decisions by jointly decoding legal length/CRC combinations. Paired Poor
   development runs reduce frame errors from 24/90 to 20/90, but header failures
@@ -497,18 +506,33 @@ stall scenario does (`docs/testing/bpq-session.md`).
 - The `floor_mode sweep` diagnostic accepts `--rx batch|streaming|both` and
   measures the production batch (`CoppaTransceiver::receive`) and streaming
   (`StreamingReceiver`) receive paths over the same grid, seeds and channel
-  realizations. The measured waveform is still only the `ofdm:1` baseline: the
-  production floor those sweeps must select is unbuilt, `connect` and `ramp`
-  remain unimplemented, and no final-seed sweep has been recorded.
-- The capture adapter bounds retained history but decodes only when asked.
-  It is not a continuous streaming detector. The 300-second noise tests,
-  BPSK challenger and production integration remain open. The batch candidate
-  now searches seven integer-tone CFO hypotheses from -150 to +150 Hz in 50 Hz
-  steps with at most 16 timing/frequency decode attempts per capture. Tests
-  cover clean unknown timing at each hypothesis, and -6 dB AWGN, flushed SSB
-  filtering and corrupted payload rejection at 0 and +/-150 Hz. This is not
-  evidence for arbitrary CFO between hypotheses or continuous acquisition.
-- The candidate's literal header value 2 is experimental, not an allocation of
-  production air version 2. Frozen v1 formats, host fields and C ABI are unchanged.
+  realizations. COP-191 adds `--waveform floor` through `FloorFrame` and
+  `FloorStream`. Floor non-delivery without trusted-header diagnostics is
+  SyncFailed. The floor capture includes a 1.25 s noisy tail for its
+  one-second decode schedule. `connect` and `ramp` remain unimplemented.
+  See BENCHMARKS, "COP-191 production floor sweeps", for final-seed results.
+- The capture adapter still decodes only when asked. COP-189 adds a separate
+  continuous experimental receiver, available with `floor_candidate --streaming`.
+  It retains at most 480,000 samples, attempts one window decode per second and
+  tries at most 16 sync candidates per CFO hypothesis, with 13 hypotheses
+  from -150 to +150 Hz in 25 Hz steps, or at most 208 per window.
+  Chunk, corrupt/truncated header,
+  nonfinite-input and duplicate-delivery regressions pass. An explicit release
+  test delivers nothing during 300 seconds each of seeded white noise,
+  block-filtered SSB noise and 1 kHz tone plus noise. These checks are not a
+  production acquisition or FER claim. Batch and chunked regressions recover
+  noiseless frames at CFO -150, -75, +75 and +150 Hz without an offset oracle.
+  This fixed grid does not track intra-frame drift or guarantee reception
+  between grid points. BPSK comparison, fading tracking, production integration
+  and final acceptance measurements remain open.
+- COP-190 allocates the candidate's header version value 2 as production
+  air-protocol version 2 (SPEC §0.3.3, ADR-014), freezing the tone
+  alphabet, header layout, FEC envelope, 40-byte capacity, 8.0 s airtime
+  and receiver search bounds. Frozen v1 formats, host fields and C ABI are
+  unchanged.
 - See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for raw
-  development evidence. No final-seed sweep or production session result is claimed.
+  development evidence. COP-191's production final-seed sweeps are in
+  [BENCHMARKS](../BENCHMARKS.md#cop-191-production-floor-sweeps): both receivers
+  cross at or below -12 dB AWGN and at -10.148936 dB Poor, with zero wrong
+  payloads, but both fail the sync-share clause on both channels. No
+  production session result is claimed.
