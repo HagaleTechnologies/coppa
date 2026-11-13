@@ -15,7 +15,8 @@ Steps that depend on the Pi's hardware are marked as not verified.
 
 ## 1. What you need
 
-- A Raspberry Pi 4. A native build is easiest with 4 GB of RAM or more.
+- A Raspberry Pi 4. The release binary (option A in step 2) needs no compiler;
+  building from source (option B) is easiest with 4 GB of RAM or more.
 - Raspberry Pi OS Lite (64-bit). Trixie is current; Bookworm also works.
 - A USB sound-card interface to the radio (a SignaLink, a rig's built-in USB
   codec, or similar).
@@ -26,13 +27,68 @@ Use the Lite image. On the desktop image, a logged-in user's PipeWire session
 can hold the USB sound card and keep coppad from opening it. This is reasoned
 from how PipeWire claims ALSA devices, not tested.
 
-## 2. Build coppa on the Pi
+## 2. Install coppa
 
-There are no release binaries yet, so build from source on the Pi:
+There are two ways to get `coppa` and `coppad` onto the Pi. Option A, the
+release binary, needs no compiler and takes a minute. Option B builds from
+source on the Pi.
+
+Both options need the ALSA runtime for live audio, and rigctld PTT needs
+`libhamlib-utils` (which provides `rigctld`):
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential pkg-config git curl libasound2-dev libudev-dev libhamlib-utils
+sudo apt-get install -y libasound2 libhamlib-utils
+```
+
+On Raspberry Pi OS Trixie and other newer distributions the ALSA runtime
+package is called `libasound2t64`; install that name if apt cannot find
+`libasound2`.
+
+### Option A: release binary
+
+Pick the archive by the architecture of the operating system, not of the CPU:
+
+```bash
+dpkg --print-architecture
+```
+
+| `dpkg --print-architecture` prints | Use `t=` |
+|---|---|
+| `arm64` (64-bit Raspberry Pi OS) | `aarch64-unknown-linux-gnu` |
+| `armhf` (32-bit Raspberry Pi OS) | `armv7-unknown-linux-gnueabihf` |
+
+Do not go by `uname -m`. A 32-bit Raspberry Pi OS on a Pi 4 runs a 64-bit
+kernel, so `uname -m` prints `aarch64` even though the programs it can run are
+32-bit `armhf` ones.
+
+The release binaries do not run on ARMv6 boards (Raspberry Pi 1, Zero and
+Zero W). On those, use option B.
+
+Download, check and unpack (shown for a 64-bit OS):
+
+```bash
+v=0.13.0; t=aarch64-unknown-linux-gnu
+curl -fLO https://github.com/HagaleTechnologies/coppa/releases/download/v$v/coppa-$v-$t.tar.gz
+curl -fLO https://github.com/HagaleTechnologies/coppa/releases/download/v$v/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+tar -xzf coppa-$v-$t.tar.gz
+cd coppa-$v-$t
+```
+
+`sha256sum` should print `coppa-0.13.0-aarch64-unknown-linux-gnu.tar.gz: OK`.
+The unpacked directory holds `coppa`, `coppad`, `coppad.toml.example` and the
+`contrib/` service files, so the rest of this guide runs from inside it.
+
+The release `coppad` is built with `cpal-backend`, `websocket`, `serial-ptt`,
+`gpio-ptt`, `kiss-tnc`, `ardop` and `mdns`, so every PTT method and host
+interface in this guide is available. Each one stays off until you enable it
+in `coppad.toml`.
+
+### Option B: build from source
+
+```bash
+sudo apt-get install -y build-essential pkg-config git curl libasound2-dev
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 . "$HOME/.cargo/env"
 git clone https://github.com/HagaleTechnologies/coppa.git && cd coppa
@@ -40,9 +96,8 @@ cargo build --release -p coppa-daemon --features cpal-backend,websocket,gpio-ptt
 cargo build --release -p coppa-cli --features cpal-backend
 ```
 
-- `libasound2-dev` is needed for live audio. `libudev-dev` is needed only for
-  the `serial-ptt` feature, and `libhamlib-utils` (which provides `rigctld`)
-  only for rigctld PTT.
+- `libasound2-dev` is needed for live audio. The `serial-ptt` feature needs no
+  extra system package.
 - The repository's `rust-toolchain.toml` pins Rust 1.98.0 with clippy and
   rustfmt. rustup installs that toolchain on the first `cargo` run inside the
   checkout.
@@ -53,7 +108,7 @@ Pick the `coppad` features for the way you will run it:
 |---|---|
 | `cpal-backend` | Always. Without it coppad runs but moves no audio. |
 | `gpio-ptt` | `ptt_method = "gpio:<chip>:<line>"` |
-| `serial-ptt` | `ptt_method = "serial:<port>:<dtr\|rts>"` (needs `libudev-dev`) |
+| `serial-ptt` | `ptt_method = "serial:<port>:<dtr\|rts>"` |
 | `websocket` | The WebSocket JSON API (`[host] websocket_enabled`) |
 | `mdns` | Finding the Pi as `coppad.local` (`[host] mdns_enabled`); turns on `websocket` |
 
@@ -67,14 +122,25 @@ is outside the scope of this guide.
 
 ## 3. Install the binaries
 
-From the checkout:
+From the unpacked release directory (option A):
+
+```bash
+sudo install -m 0755 coppad coppa /usr/local/bin/
+```
+
+Or from the checkout (option B):
 
 ```bash
 sudo install -m 0755 target/release/coppad target/release/coppa /usr/local/bin/
 ```
 
 The unit runs `/usr/local/bin/coppad`. `coppa` is optional; this guide uses it
-to list sound devices.
+to list sound devices. `coppa --version` prints the version, the commit it was
+built from and its features.
+
+The rest of this guide uses `coppad.toml.example` and `contrib/` by relative
+path. Run those commands from the unpacked release directory or from the
+checkout.
 
 ## 4. Create the service user
 

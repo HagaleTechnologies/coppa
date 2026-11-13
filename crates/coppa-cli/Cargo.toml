@@ -5,6 +5,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+
+# COP-47: `cargo binstall --git https://github.com/HagaleTechnologies/coppa coppa-cli@<version>`
+# installs from the GitHub Release archive. The archive names and layout are a
+# contract with every past release (tools/release/release.py, docs/RELEASING.md).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/coppa-{ version }-{ target }{ archive-suffix }"
+bin-dir = "coppa-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [lints]
 workspace = true

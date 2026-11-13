@@ -44,13 +44,14 @@ jobs:
           toolchain: "1.98.0"
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - name: Install ALSA and libudev dev headers (for cpal and serialport)
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+      # COP-47: no libudev-dev. serialport builds without its libudev feature,
+      # so the --all-features check and rustdoc below prove none is needed.
+      - name: Install ALSA dev headers (for cpal)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo check --workspace
       - run: cargo check --workspace --all-features
       # COP-88: rustdoc must stay warning-free (broken intra-doc links, links
-      # to private items, stray HTML tags). serial-ptt needs the libudev
-      # headers installed above.
+      # to private items, stray HTML tags).
       - name: rustdoc with warnings denied
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
       # COP-90 (H-136): the library crates compile for the browser target.
@@ -70,6 +71,24 @@ jobs:
             cargo tree --target aarch64-unknown-linux-gnu -p coppa-cli -p coppa-daemon -i alsa-sys
             exit 1
           fi
+      # COP-47: the release binaries cross-build for three Linux targets with
+      # no libudev in the sysroot, and coppa never lists serial ports, so
+      # serialport must keep its libudev feature off.
+      - name: serial-ptt does not pull in libudev-sys (COP-47)
+        run: |
+          set -euo pipefail
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf; do
+            tree=$(cargo tree --target "$t" -p coppa-daemon --features serial-ptt --prefix none --format '{p}')
+            if grep -q '^libudev-sys ' <<<"$tree"; then
+              echo "::error::coppa-daemon with serial-ptt pulls in libudev-sys on $t; keep serialport at default-features = false in the workspace Cargo.toml"
+              cargo tree --target "$t" -p coppa-daemon --features serial-ptt -i libudev-sys
+              exit 1
+            fi
+          done
+      # COP-47: tag rules, asset names, archive layout, binstall metadata and
+      # the release workflow's feature list and pins.
+      - name: Release tooling tests (COP-47)
+        run: python3 -m unittest discover -s tools/release -v
       # COP-35: compile and run the getting-started tutorial's C FFI example,
       # as written, against the committed coppa.h, as C and as C++.
       - name: Compile the tutorial's C FFI example against coppa.h
@@ -138,7 +157,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install ALSA dev headers (for cpal)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test --workspace --features cpal-backend,websocket,kiss-tnc,gpio-ptt,ardop,mdns --lib
+      - run: cargo test --workspace --features cpal-backend,websocket,kiss-tnc,serial-ptt,gpio-ptt,ardop,mdns --lib
       - run: cargo check --workspace --no-default-features
 
   fmt:
@@ -174,9 +193,11 @@ jobs:
       - name: Test cpal-backend on macOS/Windows
         if: runner.os != 'Linux'
         run: cargo test -p coppa-audio --lib --features cpal-backend
+      # The feature list mirrors the coppa-daemon/* entries of RELEASE_FEATURES
+      # in .github/workflows/release.yml (COP-47).
       - name: Release build of coppad with the release feature set (COP-85, Windows)
         if: runner.os == 'Windows'
-        run: cargo build --release -p coppa-daemon --features cpal-backend,websocket,kiss-tnc,ardop,mdns,serial-ptt
+        run: cargo build --release -p coppa-daemon --features cpal-backend,websocket,kiss-tnc,ardop,mdns,serial-ptt,gpio-ptt
       - name: Serial PTT unit tests (COP-85, Windows)
         if: runner.os == 'Windows'
         run: cargo test -p coppa-radio --lib --features serial-ptt

@@ -23,6 +23,7 @@ version = "0.15.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85.0"
+repository = "https://github.com/HagaleTechnologies/coppa"
 
 # COP-90 (H-135). Inherited by every package except coppa-audio (five
 # `unsafe impl Send`) and coppa-ffi (the C ABI). Cargo cannot combine
@@ -46,7 +47,9 @@ smallvec = "1.13"
 rtrb = "0.4"
 cpal = "0.18"
 hound = "3.5"
-serialport = "4.9"
+# COP-47: no libudev. coppa only opens a named port (coppa-radio/src/ptt_serial.rs);
+# libudev serves port enumeration, which coppa never calls.
+serialport = { version = "4.9", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "io-util", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -90,6 +93,16 @@ workspace = true
 [[bench]]
 name = "throughput"
 harness = false
+
+# COP-47. Fat LTO and one codegen unit: same wall time as the default profile on a
+# 32-core build host and about half the binary size (see
+# docs/DECISIONS/2026-11-09-release-binaries-and-versioning.md).
+# Symbol names stay so a panic backtrace from the field is readable.
+# panic stays "unwind": coppa-ffi relies on catch_unwind.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
 
 # Optimize DSP-heavy CI simulations without weakening runtime checks.
 [profile.ci]
