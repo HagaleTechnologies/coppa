@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-06T09:21:18Z",
-  "head_commit": "14d87c5",
+  "generated_at": "2026-11-12T14:31:47Z",
+  "head_commit": "67eca7b",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -671,7 +671,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:5f0af1acfa7a3e56172b9ddf44112b09d4c2af3b27927c0641fe3b2a3dd773cc",
+      "hash": "sha256:820d9230b7d64bf20d87da3b702a191254709b39f5e1d77914cbfd23b7c7fc89",
       "id": "session-fade-protection",
       "kind": "gotcha",
       "links": [
@@ -684,12 +684,13 @@
       "sources": [
         "docs/SPEC.md",
         "docs/adr/012-cop119-session-outer-code.md",
-        "crates/coppa-daemon/src/event_loop.rs"
+        "crates/coppa-daemon/src/event_loop.rs",
+        "crates/coppa-protocol/src/modem/transceiver.rs"
       ],
       "status": "current",
       "title": "What will bite you about session fade protection?",
-      "verified_commit": "d837c89",
-      "verified_date": "2026-11-04",
+      "verified_commit": "1ac3273",
+      "verified_date": "2026-11-11",
       "visibility": "public"
     },
     {

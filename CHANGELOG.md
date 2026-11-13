@@ -14,6 +14,34 @@ numbers separately, because they move independently:
 Older releases have no entry here. Their on-air breaks are listed in
 `docs/SPEC.md` §0.1.
 
+## Unreleased: 0.15.0
+
+- **Crate version:** 0.15.0. Minor bump over 0.14.0 (COP-190) because
+  `coppa_protocol::session::LinkCapabilities` gains a public field, `windowed_arq`, which
+  breaks struct-literal callers that do not use `..LinkCapabilities::default()`.
+- **Air-protocol version:** unchanged (1, plus 2 for the floor from 0.14.0). In version 1,
+  CONNECT capability flags bit 5 is now named
+  `windowed_arq` (COP-168, SPEC §20.1). It is negotiated as an AND and CONNECT_CFM must
+  carry exactly the AND (`ProtocolError::WindowedArqMismatch`). No release sets it yet,
+  so every coppad still sends the 0.12.0 bytes.
+- **Host-API version:** 1, unchanged.
+- **C ABI version:** unchanged.
+- **Rust API, additive:** `LinkCapabilities::windowed_window`, `arq::MAX_SESSION_WINDOW`,
+  `arq::windowed_phy_seq`, `arq::windowed_harq_key`, `arq::phy_following`,
+  `arq::RV_SCHEDULE`, `arq::rv_for_session_attempt`, `ArqTx::unacked` and the
+  `ProtocolError::WindowedArqMismatch` variant: the wire
+  primitives for windowed session ARQ. The windowed sender and receiver are not built yet
+  (`docs/LIMITATIONS.md`).
+- **Rust API, additive (receive-side HARQ):** `modem::HarqPolicy`,
+  `CoppaTransceiver::{set_harq_policy, harq_policy, harq_combined_successes}`,
+  `StreamingReceiver::{set_harq_policy, harq_policy, harq_combined_successes,
+  take_failed_headers}`, `streaming::MAX_FAILED_HEADERS` and
+  `CoppaCore::{encode_bytes_tagged, set_harq_policy, take_failed_headers,
+  harq_combined_successes}`. The default policy keeps the old combining.
+- **Behaviour change:** a soft-combining buffer now restarts when a frame under the same
+  key has a different payload length, not only a different level, so two frames of
+  different lengths that share `seq_num` 0 no longer add their soft bits together.
+
 ## Unreleased: 0.14.0
 
 COP-190 adds the low-rate floor as a production air format, framed at
