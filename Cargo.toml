@@ -94,7 +94,6 @@ workspace = true
 name = "throughput"
 harness = false
 
-<<<<<<< HEAD
 # COP-47. Fat LTO and one codegen unit: same wall time as the default profile on a
 # 32-core build host and about half the binary size (see
 # docs/DECISIONS/2026-11-09-release-binaries-and-versioning.md).
@@ -104,7 +103,7 @@ harness = false
 lto = "fat"
 codegen-units = 1
 strip = "debuginfo"
-=======
+
 # Optimize DSP-heavy CI simulations without weakening runtime checks.
 [profile.ci]
 inherits = "test"
@@ -113,4 +112,3 @@ debug = 1
 debug-assertions = true
 overflow-checks = true
 incremental = false
->>>>>>> 21e94b63deb86db05e6e9fb416173b6032c68bf2
