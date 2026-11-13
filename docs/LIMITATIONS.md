@@ -512,3 +512,5 @@ stall scenario does (`docs/testing/bpq-session.md`).
   production air version 2. Frozen v1 formats, host fields and C ABI are unchanged.
 - See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for raw
   development evidence. No final-seed sweep or production session result is claimed.
+
+- **Full-CI hosted verdict budget (COP-200).** Local optimized groups pass below 25 minutes, but three same-revision hosted workflow verdicts below 30 minutes remain unverified. Other required jobs, runner queue time and cold caches can affect the complete result. See [full-CI measurements](testing/full-ci.md).

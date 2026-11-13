@@ -469,6 +469,7 @@ dependencies = [
  "num-complex",
  "proptest",
  "rand 0.10.3",
+ "serde_json",
 ]
 
 [[package]]

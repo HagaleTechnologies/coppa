@@ -75,6 +75,7 @@ coppa-protocol = { path = "crates/coppa-protocol" }
 coppa-dsp = { path = "crates/coppa-dsp" }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 coppa-bench = { path = "crates/coppa-bench" }
 coppa-channel = { path = "crates/coppa-channel" }
 coppa-audio = { path = "crates/coppa-audio" }
@@ -89,3 +90,12 @@ workspace = true
 [[bench]]
 name = "throughput"
 harness = false
+
+# Optimize DSP-heavy CI simulations without weakening runtime checks.
+[profile.ci]
+inherits = "test"
+opt-level = 2
+debug = 1
+debug-assertions = true
+overflow-checks = true
+incremental = false
