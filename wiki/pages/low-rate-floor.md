@@ -82,8 +82,10 @@ for seeds, accounting and remaining acceptance work. Session integration stays
 open; a decoded floor frame does not prove a connection.
 
 The library floor controller reserves streaming delivery time in addition to
-airtime. Keying interrupts capture, so Link breaks floor acquisition history
-at each transmission boundary. Otherwise retained samples from before and
+airtime. Keying interrupts capture, so Link breaks both OFDM and floor
+acquisition history at each transmission boundary. Keeping OFDM history across
+these gaps caused repeated losses in the level-8, 680-byte binary transfer
+regression in `crates/coppa-engine/src/link/tests.rs`. Otherwise retained samples from before and
 after transmission can be mistaken for contiguous audio. Probe recovery also
 needs room before idle keepalives. See the
 [session policy](../../docs/SPEC.md#negotiated-low-rate-floor-session-policy)
