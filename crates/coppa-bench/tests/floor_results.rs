@@ -86,8 +86,6 @@ fn development_awgn_check_is_auditable() {
     assert_eq!(points[0].payload_failed, 1);
     assert!(evaluate(&points, -8.0).passes());
 }
-<<<<<<< HEAD
-=======
 
 #[test]
 fn integer_tone_cfo_development_measurements_are_auditable() {
@@ -276,4 +274,3 @@ fn record_production_floor_development_sweeps() {
         fs::write(root.join("metadata.txt"), metadata).unwrap();
     }
 }
->>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
