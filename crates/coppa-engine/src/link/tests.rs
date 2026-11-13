@@ -847,3 +847,44 @@ fn floor_stagger_exhausts_configured_retries() {
         }
     }
 }
+
+#[test]
+fn floor_chunks_fit_compressed_ofdm_and_recovery_probe() {
+    for level in [1, 2] {
+        for compression in [false, true] {
+            let mut config = LinkConfig::new("N0AAA");
+            config.engine.speed_level = level;
+            config.engine.compression_enabled = compression;
+            let mut link = Link::new(config).unwrap();
+            let now = Instant::now();
+            let mut session = link.new_session(Callsign::new("N0BBB").unwrap(), 0, now);
+            session.negotiated = Some(LinkCapabilities {
+                robust_floor: true,
+                ..Default::default()
+            });
+            link.session = Some(session);
+            link.established();
+            link.backlog.extend(0x80..0x93);
+            let take = link.fit_chunk_len(0);
+            let chunk: Vec<_> = link.backlog.iter().take(take).copied().collect();
+            let frame = session_data_frame(link.session.as_ref().unwrap(), 0, &chunk);
+            assert!(frame.len() <= 40);
+            assert!(
+                link.core.encoded_payload_len(&frame)
+                    <= coppa_protocol::modem::max_payload_for_level(1).unwrap(),
+                "level {level}, compression {compression}, chunk {take} exceeds probe budget"
+            );
+            if !compression {
+                assert_eq!(take, 19);
+            }
+            assert!(link.core.encode_bytes_with_level(&frame, level).is_ok());
+            link.floor.received(LinkPhyMode::Floor);
+            for seq in 0..5 {
+                link.floor.acknowledged(seq, LinkPhyMode::Floor);
+            }
+            link.key_new_chunk(now);
+            assert_eq!(link.tx_mode, Some(LinkPhyMode::Ofdm { level: 1 }));
+            assert_eq!(link.frames_transmitted(), 1);
+        }
+    }
+}
