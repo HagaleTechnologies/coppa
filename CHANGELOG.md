@@ -14,7 +14,6 @@ numbers separately, because they move independently:
 Older releases have no entry here. Their on-air breaks are listed in
 `docs/SPEC.md` §0.1.
 
-<<<<<<< HEAD
 ## Unreleased: 0.15.0
 
 - Add negotiated low-rate floor sessions to the Rust library Link. Discovery
@@ -26,8 +25,6 @@ Older releases have no entry here. Their on-air breaks are listed in
 - Allocate capability flags byte bit 6 without changing legacy bytes or
   capability length. Public Rust struct additions require this minor bump.
 
-=======
->>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
 ## Unreleased: 0.14.0
 
 COP-190 adds the low-rate floor as a production air format, framed at

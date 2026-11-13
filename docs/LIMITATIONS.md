@@ -370,20 +370,12 @@ update.
   `coppa-protocol::modem::floor` (guarded by `air_v2_conformance.rs` and
   `floor_receive.rs`), and `CoppaCore` constructs the floor receive path
   next to its OFDM paths (`CoppaCore::floor`, `push_floor_samples`), with
-<<<<<<< HEAD
   the v1 OFDM paths untouched. The library Link now negotiates bit 6,
   accepts floor handshakes, falls back after two unanswered response windows,
   and probes OFDM after five newly acknowledged floor exchanges. Its
   deterministic audio tests cover delivery and recovery, not connection
   probability. The daemon controller and host mode reporting remain unbuilt.
   The −6 dB connect bar (9 of 10 within 60 s) is unmet. Production development sweeps now
-=======
-  the v1 OFDM paths untouched. No session sends or receives on it: the
-  floor-aware Link/daemon session controller (capability negotiation,
-  connect-on-floor, OFDM fallback after two expired response windows, the
-  five-acknowledged-exchange OFDM probe) is unbuilt, the −6 dB connect bar
-  (9 of 10 within 60 s) is unmet. Production development sweeps now
->>>>>>> 25a7059f41927da63e57daaa780b4391a919db4b
   cover batch and streaming reception on AWGN and Poor; final-seed
   production sweeps remain unrecorded. The Poor ramp acceptance,
   the final-seed 200-trial sweeps and the `--waveform floor`, `connect`
@@ -404,9 +396,9 @@ update.
   faded paths. No endpoint (Link or daemon) drives it yet.
 - The 16-FSK design now exists twice: COP-190 moved it into the production
   crates, while the measurement-only bench copy (`floor_candidate.rs`)
-  retains its historical measurements. The production floor has no
-  Link or daemon caller yet. The design's development Poor sweep, measured
-  on the frozen bench copy, fails the conservative sync-share clause:
+  retains its historical measurements. Link uses the production floor for
+  negotiated sessions; the daemon controller still uses OFDM. The design's
+  development Poor sweep, measured on the frozen bench copy, fails the conservative sync-share clause:
   header sync dominates near the crossing. Production development sweeps
   also fail sync share, at −12 dB AWGN and −8/−6 dB Poor for both paths.
   Production 50% crossings are at or below −12 dB AWGN and −9 dB Poor.

@@ -659,9 +659,9 @@ fn retries_exhausted_is_reported_after_disconnect_frame_finishes() {
 
 #[test]
 fn floor_two_window_fallback() {
-    let mut link = Link::new(LinkConfig::new("N0BBB")).unwrap();
+    let mut link = Link::new(LinkConfig::new("N0AAA")).unwrap();
     let base = Instant::now();
-    link.connect("N0AAA", base).unwrap();
+    link.connect("N0BBB", base).unwrap();
     let mut out = vec![0.0; 8 * 48_000];
     link.process(base, &[], &mut out);
     assert_eq!(link.frames_transmitted(), 1);
@@ -723,4 +723,22 @@ fn floor_keepalive_precedes_configured_timeout() {
     c.run_until(Duration::from_secs(90), |_, _| false);
     assert_eq!(c.a.state(), LinkState::Connected);
     assert_eq!(c.b.state(), LinkState::Connected);
+}
+
+#[test]
+fn floor_answerer_retries_before_handshake_timeout() {
+    let mut link = Link::new(LinkConfig::new("N0AAD")).unwrap();
+    let base = Instant::now();
+    link.connect("N0AAA", base).unwrap();
+    let mut out = vec![0.0; 8 * 48_000];
+    for seconds in [0, 29, 58] {
+        link.process(base + Duration::from_secs(seconds), &[], &mut out);
+    }
+    assert_eq!(link.frames_transmitted(), 3);
+    assert_eq!(link.phy_mode().0, Some(LinkPhyMode::Floor));
+    link.process(base + Duration::from_secs(77), &[], &mut out);
+    // Stagger discovery, not floor retries: the 19-second floor response
+    // window must expire before the 30-second idle handshake timeout.
+    assert_eq!(link.frames_transmitted(), 4);
+    assert_eq!(link.state(), LinkState::Connecting);
 }

@@ -963,11 +963,22 @@ impl Link {
                     Duration::ZERO,
                     self.config.turnaround,
                 ));
-                // Callsign-dependent retry staggering breaks symmetric half-duplex calls.
-                let stagger = if self.config.robust_floor {
-                    Duration::from_secs(
-                        u64::from(self.local.as_str().bytes().last().unwrap_or(0) % 3) * 2,
-                    )
+                // The lexical answerer listens through the caller's two OFDM
+                // windows and first complete floor request. Unlike callsign hash
+                // buckets, these complementary roles cannot have equal delays
+                // for distinct callsigns. This matches on_connect_req's tie-break.
+                // Floor retries retain their normal window so they still occur
+                // before the idle handshake timeout.
+                let stagger = if self.config.robust_floor
+                    && self.tx_mode != Some(LinkPhyMode::Floor)
+                    && self.remote().is_some_and(|peer| self.local.as_str() > peer)
+                {
+                    retry_interval
+                        + FloorController::response_window(
+                            LinkPhyMode::Floor,
+                            Duration::ZERO,
+                            self.config.turnaround,
+                        )
                 } else {
                     Duration::ZERO
                 };
