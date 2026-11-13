@@ -888,3 +888,24 @@ fn floor_chunks_fit_compressed_ofdm_and_recovery_probe() {
         }
     }
 }
+
+#[test]
+fn floor_capable_high_speed_binary_transfer() {
+    let mut cable = Cable::pair();
+    for link in [&mut cable.a, &mut cable.b] {
+        let mut config = link.config().clone();
+        config.engine.speed_level = 8;
+        config.robust_floor = true;
+        *link = Link::new(config).unwrap();
+    }
+    cable.b.set_listening(true);
+    cable.connect();
+    let payload: Vec<u8> = (0..680).map(|i| (i % 251) as u8).collect();
+    cable.a.send(&payload).unwrap();
+    // Match the Python concurrent-recv fixture's payload and time budget.
+    assert!(cable.run_until(Duration::from_secs(600), |a, _| {
+        a.pending_tx_bytes() == 0
+    }));
+    assert_eq!(Cable::recv_all(&mut cable.b), payload);
+    assert_eq!(cable.a.phy_mode().0, Some(LinkPhyMode::Ofdm { level: 8 }));
+}

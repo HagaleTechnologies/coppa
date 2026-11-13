@@ -1186,7 +1186,9 @@ impl Link {
         };
         match encoded {
             Ok(samples) => {
-                // Capture is discontinuous while keyed. Break the floor detector history.
+                // Capture is discontinuous while keyed. Discard both receive
+                // histories so samples across a transmission are not joined.
+                self.core.reconfigure(self.config.engine.clone());
                 self.core.push_floor_samples(&[f32::NAN]);
                 if self.phase != Phase::Closing {
                     self.tx_mode = Some(mode);

@@ -535,7 +535,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:254f5ba03e5b1362433d0dc99958afde5d1a45ec7dd30b7ac9eedcdbcf2c79f1",
+      "hash": "sha256:ea365d47d94ef69ddb33b6e0a67e692c7f79e6dab0a22d49d9816ad6e7ce45d8",
       "id": "low-rate-floor",
       "kind": "gotcha",
       "links": [
