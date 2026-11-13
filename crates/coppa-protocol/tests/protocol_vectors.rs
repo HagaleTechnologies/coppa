@@ -882,7 +882,11 @@ fn capabilities_are_p23_to_p27() {
         outer_code_rx: false,
         outer_code_req: false,
         app_messages: false,
+<<<<<<< HEAD
         robust_floor: false,
+=======
+        windowed_arq: false,
+>>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
         mcs_index: 5,
     };
     let b = LinkCapabilities {
@@ -895,7 +899,11 @@ fn capabilities_are_p23_to_p27() {
         outer_code_rx: false,
         outer_code_req: false,
         app_messages: false,
+<<<<<<< HEAD
         robust_floor: false,
+=======
+        windowed_arq: false,
+>>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
         mcs_index: 3,
     };
     assert_eq!(
@@ -929,11 +937,20 @@ fn capabilities_are_p23_to_p27() {
         "air protocol v1: split_caps(&bytes_of(\"P27\"))"
     );
 
+<<<<<<< HEAD
     // Reserved flag bits (5 and 7; bits 2–3 are the outer-code capability of
     // §22.1 and bit 4 is COP-121's `app_messages`, §23) and trailing bytes
     // are ignored on read; fewer than 7 bytes is an error.
     let mut lenient = bytes_of("P23");
     lenient[5] |= 0xA0;
+=======
+    // Reserved flag bits (6–7; bits 2–3 are the outer-code capability of
+    // §22.1, bit 4 is COP-121's `app_messages`, §23, and bit 5 is COP-168's
+    // `windowed_arq`, §24) and trailing bytes are ignored on read; fewer
+    // than 7 bytes is an error.
+    let mut lenient = bytes_of("P23");
+    lenient[5] |= 0xC0;
+>>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
     lenient.push(0xAA);
     assert_eq!(
         LinkCapabilities::from_bytes(&lenient).unwrap(),
@@ -957,6 +974,24 @@ fn capabilities_are_p23_to_p27() {
         ),
         "air protocol v1: a 6-byte capabilities blob is too short"
     );
+}
+
+/// COP-168 W01: the capabilities blob a windowed-ARQ coppad would send with
+/// a window of 4 (`arq_window` 4, flags 0x26: bit 1 `multi_frame_ack`, bit 2
+/// `outer_code_rx`, bit 5 `windowed_arq`). No release sends it yet: SPEC
+/// §20.1 keeps bit 5 at 0 on send until the windowed rules are specified, and
+/// the vector joins SPEC §21 with them. This pins how bit 5 parses today.
+#[test]
+fn capabilities_with_windowed_bit_are_w01() {
+    const W01: &str = "00c80102042600";
+    let caps = LinkCapabilities::from_bytes(&unhex(W01)).unwrap();
+    assert!(caps.windowed_arq, "W01: flags bit 5");
+    assert_eq!(caps.arq_window, 4, "W01: arq_window");
+    assert!(caps.multi_frame_ack, "W01: flags bit 1");
+    assert!(caps.outer_code_rx, "W01: flags bit 2");
+    assert!(!caps.outer_code_req && !caps.app_messages && !caps.compression);
+    assert_eq!(hex(&caps.to_bytes()), W01, "W01 round trip");
+    assert_eq!(caps.windowed_window(), Some(4));
 }
 
 // ── P28/P29: the layers below MAC ──

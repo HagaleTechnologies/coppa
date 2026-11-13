@@ -10,7 +10,7 @@ use coppa_protocol::compression::lz4::{lz4_compress, lz4_decompress};
 use coppa_protocol::cp_negotiator::CpMode;
 use coppa_protocol::modem::floor::{FloorFrame, FloorStream};
 use coppa_protocol::modem::streaming::StreamingReceiver;
-use coppa_protocol::modem::transceiver::{CoppaTransceiver, MAX_CODEWORDS};
+use coppa_protocol::modem::transceiver::{CoppaTransceiver, HarqPolicy, MAX_CODEWORDS};
 
 use crate::config::{EngineConfig, OfdmBand, HF_MAX_SPEED_LEVEL};
 use crate::profiles::Profile;
@@ -380,7 +380,7 @@ impl CoppaCore {
         codewords: u8,
     ) -> Result<Vec<f32>, EngineError> {
         Self::check_codewords(codewords)?;
-        self.transmit_data_packet(data, self.config.speed_level, codewords, 0)
+        self.transmit_data_packet(data, self.config.speed_level, codewords, 0, 0)
     }
 
     /// COP-69: shared codeword-count validation for the codeword-aware
@@ -471,7 +471,50 @@ impl CoppaCore {
         codewords: u8,
     ) -> Result<Vec<f32>, EngineError> {
         let payload = self.compress_payload(data);
-        self.transmit_data_packet(&payload, level, codewords, 0)
+        self.transmit_data_packet(&payload, level, codewords, 0, 0)
+    }
+
+    /// COP-168: [`Self::encode_bytes_with_level_and_codewords`] with an
+    /// explicit PHY `seq_num` and redundancy version, for a windowed session
+    /// frame (COP-168 design rule 2: `phy_seq` packs the frames remaining in the
+    /// keying and the HARQ key; a retransmission carries the next RV).
+    ///
+    /// The payload is compressed exactly as `encode_bytes_at` compresses it,
+    /// so every attempt of one segment carries identical information bits
+    /// and the receiver can combine them. Only `rv & 0x03` goes on the wire
+    /// (the low two bits of `fec_type`); the high bits stay reserved.
+    pub fn encode_bytes_tagged(
+        &self,
+        data: &[u8],
+        level: u8,
+        codewords: u8,
+        phy_seq: u8,
+        rv: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        Self::check_codewords(codewords)?;
+        self.check_level(level, self.on_vhf_profile())?;
+        let payload = self.compress_payload(data);
+        self.transmit_data_packet(&payload, level, codewords, phy_seq, rv & 0x03)
+    }
+
+    /// COP-168: set the streaming receiver's IR-HARQ combining policy. It
+    /// survives [`Self::reconfigure`] and every rebuild that goes through it.
+    pub fn set_harq_policy(&mut self, policy: HarqPolicy) {
+        self.streaming.set_harq_policy(policy);
+    }
+
+    /// COP-168: pass-through of [`StreamingReceiver::take_failed_headers`],
+    /// the headers of frames whose header decoded and payload failed since
+    /// the last call. A rebuild drops the backlog.
+    pub fn take_failed_headers(&mut self) -> Vec<CoppaHeader> {
+        self.streaming.take_failed_headers()
+    }
+
+    /// COP-168: pass-through of
+    /// [`StreamingReceiver::harq_combined_successes`], counted since this
+    /// engine's streaming receiver was last built.
+    pub fn harq_combined_successes(&self) -> u64 {
+        self.streaming.harq_combined_successes()
     }
 
     /// Encode one uncompressed session packet with a distinct PHY HARQ key.
@@ -484,18 +527,20 @@ impl CoppaCore {
         seq_num: u8,
     ) -> Result<Vec<f32>, EngineError> {
         self.check_level(level, self.on_vhf_profile())?;
-        self.transmit_data_packet(data, level, 1, seq_num)
+        self.transmit_data_packet(data, level, 1, seq_num, 0)
     }
 
     /// Build and transmit a Data frame from an already prepared payload,
     /// with an explicit PHY `seq_num` (the HARQ key; every pre-COP-119
-    /// caller passes `0`).
+    /// caller passes `0`) and `fec_type` (the redundancy version in its low
+    /// two bits; every caller before COP-168 passes `0`).
     fn transmit_data_packet(
         &self,
         payload: &[u8],
         level: u8,
         codewords: u8,
         seq_num: u8,
+        fec_type: u8,
     ) -> Result<Vec<f32>, EngineError> {
         let payload_len =
             u16::try_from(payload.len()).map_err(|_| EngineError::PayloadTooLarge {
@@ -507,7 +552,7 @@ impl CoppaCore {
             phy_mode: 0,
             frame_type: CoppaFrameType::Data,
             bandwidth: self.transceiver.profile().bandwidth_id,
-            fec_type: 0,
+            fec_type,
             speed_level: level,
             seq_num,
             payload_len,
@@ -749,11 +794,16 @@ impl CoppaCore {
     }
 
     /// Rebuild the engine with a new configuration.
+    ///
+    /// COP-168: the streaming receiver's [`HarqPolicy`] carries over to the
+    /// rebuilt receiver; its soft buffers and counters do not.
     pub fn reconfigure(&mut self, config: EngineConfig) {
+        let policy = self.streaming.harq_policy();
         let new = Self::build(config);
         self.transceiver = new.transceiver;
         self.config = new.config;
         self.streaming = new.streaming;
+        self.streaming.set_harq_policy(policy);
     }
 
     /// Change this engine's configured speed level in place (Phase 4 Task 6,
@@ -892,6 +942,27 @@ impl Default for CoppaCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// COP-168: the HARQ policy set on the engine survives every rebuild,
+    /// since a windowed session must not silently fall back to the default
+    /// keying when the speed level changes mid-session.
+    #[test]
+    fn harq_policy_survives_reconfigure() {
+        let mut core = CoppaCore::new();
+        assert_eq!(core.streaming.harq_policy(), HarqPolicy::default());
+        let windowed = HarqPolicy {
+            key_mask: 0x0F,
+            rv0_starts_fresh: true,
+            multi_codeword: true,
+        };
+        core.set_harq_policy(windowed);
+        core.set_speed_level(3).unwrap();
+        assert_eq!(core.streaming.harq_policy(), windowed);
+        core.reconfigure(core.config().clone());
+        assert_eq!(core.streaming.harq_policy(), windowed);
+        assert_eq!(core.harq_combined_successes(), 0);
+        assert!(core.take_failed_headers().is_empty());
+    }
 
     fn datagram_test_payload() -> Vec<u8> {
         let mut state = 0x1380_abcd_u32;

@@ -278,6 +278,11 @@ fn local_link_caps(config: &DaemonConfig) -> LinkCapabilities {
         // COP-121 (D3): chat is advertised only when a WebSocket client can
         // see it, so "Delivered" always means a dashboard can show it.
         app_messages: cfg!(feature = "websocket") && config.host.websocket_enabled,
+        // COP-168: flags bit 5 stays clear. This session link still runs
+        // stop-and-wait (`SESSION_ARQ_WINDOW`); advertising windowed ARQ
+        // before the burst sender, per-burst ACK and next-RV retransmissions
+        // exist would promise a peer a protocol coppad does not speak.
+        windowed_arq: false,
         ..LinkCapabilities::default()
     }
 }

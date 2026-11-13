@@ -10,6 +10,7 @@ PHY header (§4.2) and the MAC header (§17.1).
 | 4 (adds §23, COP-121) | 2026-11-08 | 0.11.0 | COP-121 branch, based on `f6e9951` |
 | 5 (adds §0.3 air-protocol v1 contract, COP-178) | 2026-11-09 | 0.12.0 | COP-178 branch, based on `4237273` |
 | 6 (registers air-protocol version 2, the low-rate floor, COP-190) | 2026-11-12 | 0.14.0 | COP-190 branch, based on `cddfc25` + COP-189 `84f0d5e` |
+| 7 (names capability flag bit 5 `windowed_arq` in §20.1, COP-168) | 2026-11-12 | 0.15.0 | COP-168 branch, based on `28d4c9a`, merged over revision 6 |
 
 There is no in-band version negotiation. §0.1 records the wire-break
 history; §0.3 states what air-protocol version 1 freezes from crate 0.12.0
@@ -2111,7 +2112,11 @@ complete exchange.
 | 2 | 1 | `fec_rate_num` | 1 | 1 |
 | 3 | 1 | `fec_rate_den` | 2 | 2 |
 | 4 | 1 | `arq_window` | 8 | 8 |
+<<<<<<< HEAD
 | 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bit 6 `robust_floor`, bits 5 and 7 reserved | `0x00` | `0x06`; `0x16` with the WebSocket API on |
+=======
+| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bit 5 `windowed_arq` (COP-168), bits 6–7 reserved | `0x00` | `0x06`; `0x16` with the WebSocket API on |
+>>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
 | 6 | 1 | `mcs_index` | 0 | 0 |
 
 The library default encodes as `00c80102080000` (P24). coppad sets
@@ -2121,7 +2126,10 @@ station with `[session] fade_protection = "off"`, sends `00c80102080200`
 sends `00c80102080600` (§22.1). A 0.11.0 coppad sets bit 4 as well when it
 was built with the `websocket` feature and `[host] websocket_enabled = true`
 (row A03, §23.7); with the default configuration it still sends the 0.9.0
-bytes. Transmitters MUST send reserved flag bits as 0. Receivers ignore them, ignore bytes after offset 6, and reject fewer
+bytes. Bit 5, `windowed_arq` (COP-168), names the windowed session ARQ
+capability. Its rules are not specified yet, so a transmitter MUST send it
+as 0 until a later revision adds them; no coppad release sets it. A receiver
+parses it and ANDs it like bit 4. Transmitters MUST send reserved flag bits as 0. Receivers ignore them, ignore bytes after offset 6, and reject fewer
 than 7 bytes (`CapabilitiesTooShort`). A zero `fec_rate_den` parses; the
 reference treats that rate as 0 when comparing.
 
@@ -2131,8 +2139,9 @@ the lower of the two FEC rates, taken as the (num, den) pair, with a tie
 keeping the initiator's own pair; and the logical AND of each flag. The
 outer-code bits 2–3 follow §22.1 instead: receive is ANDed, and the
 request bit is set when receive holds and either side requests. Bit 4,
-`app_messages`, is ANDed like the others (§23.1). P25 and P26 negotiate to
-P27 in either order.
+`app_messages`, is ANDed like the others (§23.1), and so is bit 5,
+`windowed_arq`; CONNECT_CFM must carry exactly the AND of bit 5
+(`WindowedArqMismatch`). P25 and P26 negotiate to P27 in either order.
 
 **Responder validation** (`handle_connect_cfm`, `session.rs:314-357`): the
 responder recomputes `negotiate(local, remote)` and rejects the `ConnectCfm`
@@ -2140,7 +2149,8 @@ if its `max_payload_size`, `arq_window`, `mcs_index` or FEC rate exceeds
 that bound, if it sets `compression` when the bound does not, if its
 outer-code bits differ from the bound (`OuterCodeMismatch`, §22.1), or if
 its `app_messages` bit differs from the bound (`AppMessagesMismatch`,
-§23.1). It does not check `multi_frame_ack`. On rejection the reference responder silently
+§23.1), or if its `windowed_arq` bit differs from the bound
+(`WindowedArqMismatch`, COP-168). It does not check `multi_frame_ack`. On rejection the reference responder silently
 drops the session; it sends nothing.
 
 **What the negotiated values do.** The outer-code bits enable §22 and
@@ -2150,7 +2160,8 @@ than one PHY codeword (up to `min(max_codewords_per_frame, 8)`); otherwise
 every session `Data` frame is one codeword (`event_loop.rs:2405-2421`). It
 does not change the ACK format. A receiver decodes a multi-codeword frame
 from the PHY header alone (§4.2, §9). `arq_window` does not change the
-window (§19.4). `max_payload_size`, the FEC rate and `mcs_index` are parsed
+window (§19.4); `windowed_arq` (bit 5), which would make it the session
+window, is sent as 0 until its rules are specified. `max_payload_size`, the FEC rate and `mcs_index` are parsed
 and validated but not used. `compression` is not used: each station
 compresses by its own configuration (§15.5), and coppad advertises
 `compression = false` while it may still compress. There is no capability
