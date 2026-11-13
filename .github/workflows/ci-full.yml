@@ -308,20 +308,26 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # rustsec/audit-check creates a check-run to report its findings (vulnerabilities AND
-      # informational warnings like a yanked crate) -- without checks: write the default
-      # GITHUB_TOKEN can't do that. Safe to grant unconditionally here (unlike the old
-      # pull_request-triggered version, which had to split into a fork/Dependabot-safe branch):
-      # this job only ever runs via workflow_dispatch/push/merge_group, none of which is a
-      # PR-controlled-secret context GitHub itself would silently downgrade.
-      checks: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: "1.98.0"
+      # Update the version, URL and checksum together.
+      - name: Install cargo-audit 0.22.2 (pinned and checksum-verified)
+        run: |
+          set -euo pipefail
+          url=https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz
+          curl -fsSL -o "$RUNNER_TEMP/cargo-audit.tgz" "$url"
+          echo "ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39  $RUNNER_TEMP/cargo-audit.tgz" | sha256sum -c -
+          mkdir -p "$HOME/.cargo/bin"
+          tar -xzf "$RUNNER_TEMP/cargo-audit.tgz" -C "$HOME/.cargo/bin" --strip-components=1 cargo-audit-x86_64-unknown-linux-gnu-v0.22.2/cargo-audit
+          cargo audit --version
+      # Fail on vulnerabilities; keep warnings visible, as before. cargo-deny gates yanked crates.
+      - name: Audit dependencies
+        run: cargo audit --file Cargo.lock
 
   # HAG-81 PR #164 review lesson applied from the start: GHA step boundaries within one job do
   # NOT isolate a secret from PR-controlled code -- only job boundaries do (a PR-controlled step
