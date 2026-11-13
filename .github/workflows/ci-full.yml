@@ -118,13 +118,19 @@ jobs:
           echo "check_run_id=$check_id" >> "$GITHUB_OUTPUT"
 
   test-full:
-    name: Full test suite
+    name: Full test suite (${{ matrix.group }})
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [workspace, daemon-unit, daemon-integration, no-audio]
     runs-on: ubuntu-latest
     # COP-122: crates/coppa-daemon/tests/dashboard_touch.rs skips when no
     # Chrome or Chromium is found; here a missing browser fails it instead.
-    # The first step below runs it (websocket feature on).
+    # The daemon-integration group runs it (websocket feature on).
     env:
       COPPA_REQUIRE_BROWSER: "1"
+      RUST_TEST_THREADS: "2"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -133,15 +139,11 @@ jobs:
         with:
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ci-${{ matrix.group }}
       - name: Install ALSA dev headers (for cpal)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test --workspace --features cpal-backend,websocket,ardop,mdns,kiss-tnc
-      # cpal-backend compiles the daemon's WebSocket, /health and mDNS CLI
-      # tests out of the step above; this step runs them (COP-140).
-      - name: Connectionless AGW CLI tests without audio
-        run: cargo test -p coppa-cli --features kiss-tnc --test tnc_agw
-      - name: Daemon tests without audio (CLI, PTT release, reload, smoke)
-        run: cargo test -p coppa-daemon --features websocket,mdns,kiss-tnc --test cli --test ptt_release --test reload --test runtime_smoke
+      - run: bash tools/ci/run-full-tests.sh ${{ matrix.group }}
 
   bench-fuzz:
     name: Bench & Fuzz Compilation
@@ -443,7 +445,7 @@ jobs:
             wait_for_all "Create CI check-run on the reviewed SHA"
           fi
           SECONDS=0
-          wait_for_all "Full test suite" "Bench & Fuzz Compilation" Clippy "MSRV Check" "Supply-chain check (cargo-deny)" "Semver check (cargo-semver-checks)" "C ABI compatibility" "Security Audit" "Wiki lint"
+          wait_for_all "Full test suite (workspace)" "Full test suite (daemon-unit)" "Full test suite (daemon-integration)" "Full test suite (no-audio)" "Bench & Fuzz Compilation" Clippy "MSRV Check" "Supply-chain check (cargo-deny)" "Semver check (cargo-semver-checks)" "C ABI compatibility" "Security Audit" "Wiki lint"
 
       - name: Mint a hagale-agent installation token for the CI check-run
         id: app-token

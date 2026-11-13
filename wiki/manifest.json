@@ -488,6 +488,29 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:997c40b71957491a63891faf189b547aae02fbfedf41bb4ec231c72b18176299",
+      "id": "full-ci-tests",
+      "kind": "gotcha",
+      "links": [
+        "paused-clock-timers",
+        "cpal-feature-gate"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/full-ci-tests.md",
+      "sources": [
+        "docs/testing/full-ci.md",
+        "tools/ci/run-full-tests.sh",
+        ".github/workflows/ci-full.yml",
+        "crates/coppa-host/src/vara/command.rs"
+      ],
+      "status": "current",
+      "title": "What keeps full CI coverage intact when splitting optimized tests?",
+      "verified_commit": "fa4de8e",
+      "verified_date": "2026-11-13",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:7163a3fc6b088923b3e2d9392c8d2f4215b3f120c2b85a81327a1019f8afa56f",
       "id": "ldpc-non-convergence",
       "kind": "gotcha",

@@ -80,6 +80,9 @@ impl VaraCommandPort {
         event_tx: mpsc::Sender<HostEvent>,
         mut response_rx: mpsc::Receiver<VaraResponse>,
     ) -> Result<(), HostError> {
+        // Command replies are latency-sensitive, including pipelined startup
+        // bursts. Do not hold a reply behind a delayed TCP acknowledgement.
+        stream.set_nodelay(true)?;
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
 
