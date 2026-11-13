@@ -2112,11 +2112,7 @@ complete exchange.
 | 2 | 1 | `fec_rate_num` | 1 | 1 |
 | 3 | 1 | `fec_rate_den` | 2 | 2 |
 | 4 | 1 | `arq_window` | 8 | 8 |
-<<<<<<< HEAD
-| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bit 6 `robust_floor`, bits 5 and 7 reserved | `0x00` | `0x06`; `0x16` with the WebSocket API on |
-=======
-| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bit 5 `windowed_arq` (COP-168), bits 6–7 reserved | `0x00` | `0x06`; `0x16` with the WebSocket API on |
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
+| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bit 5 `windowed_arq` (COP-168), bit 6 `robust_floor`, bit 7 reserved | `0x00` | `0x06`; `0x16` with the WebSocket API on |
 | 6 | 1 | `mcs_index` | 0 | 0 |
 
 The library default encodes as `00c80102080000` (P24). coppad sets

@@ -16,7 +16,6 @@ Older releases have no entry here. Their on-air breaks are listed in
 
 ## Unreleased: 0.15.0
 
-<<<<<<< HEAD
 - Add negotiated low-rate floor sessions to the Rust library Link. Discovery
   starts on OFDM, falls back after two unanswered windows, and probes OFDM
   after five distinct acknowledged floor exchanges. Set
@@ -25,7 +24,6 @@ Older releases have no entry here. Their on-air breaks are listed in
   `Link::phy_mode()`. The daemon and host mode reporting remain open.
 - Allocate capability flags byte bit 6 without changing legacy bytes or
   capability length. Public Rust struct additions require this minor bump.
-=======
 - **Crate version:** 0.15.0. Minor bump over 0.14.0 (COP-190) because
   `coppa_protocol::session::LinkCapabilities` gains a public field, `windowed_arq`, which
   breaks struct-literal callers that do not use `..LinkCapabilities::default()`.
@@ -51,7 +49,6 @@ Older releases have no entry here. Their on-air breaks are listed in
 - **Behaviour change:** a soft-combining buffer now restarts when a frame under the same
   key has a different payload length, not only a different level, so two frames of
   different lengths that share `seq_num` 0 no longer add their soft bits together.
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
 
 ## Unreleased: 0.14.0
 

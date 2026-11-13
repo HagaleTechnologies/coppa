@@ -65,16 +65,13 @@ pub struct LinkCapabilities {
     /// COP-121: carries stream 1 application records, flags bit 4, SPEC §23.
     /// Negotiated as an AND of both sides; CONNECT_CFM must carry exactly it.
     pub app_messages: bool,
-<<<<<<< HEAD
-    /// Supports the separately detected low-rate floor, flags byte bit 6.
-    pub robust_floor: bool,
-=======
     /// COP-168: windowed session ARQ with IR-HARQ retransmissions, flags
     /// bit 5 (SPEC §20.1). Negotiated as an AND of both sides, like
     /// `app_messages`; CONNECT_CFM must carry exactly the AND. See
     /// [`Self::windowed_window`] for when the negotiated session uses it.
     pub windowed_arq: bool,
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
+    /// Supports the separately detected low-rate floor, flags byte bit 6.
+    pub robust_floor: bool,
     /// Modulation/coding scheme index.
     pub mcs_index: u8,
 }
@@ -91,11 +88,8 @@ impl Default for LinkCapabilities {
             outer_code_rx: false,
             outer_code_req: false,
             app_messages: false,
-<<<<<<< HEAD
-            robust_floor: false,
-=======
             windowed_arq: false,
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
+            robust_floor: false,
             mcs_index: 0,
         }
     }
@@ -110,21 +104,14 @@ impl LinkCapabilities {
         out.push(self.fec_rate_num);
         out.push(self.fec_rate_den);
         out.push(self.arq_window);
-<<<<<<< HEAD
-        // Flags byte (byte 5): [compression:1][multi_frame_ack:1][outer_code_rx:1][outer_code_req:1][app_messages:1][reserved:1][robust_floor:1][reserved:1].
-=======
-        // Flags byte (byte 5): [compression:1][multi_frame_ack:1][outer_code_rx:1][outer_code_req:1][app_messages:1][windowed_arq:1][reserved:2].
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
+        // Flags byte (byte 5): [compression:1][multi_frame_ack:1][outer_code_rx:1][outer_code_req:1][app_messages:1][windowed_arq:1][robust_floor:1][reserved:1].
         let flags = (self.compression as u8)
             | ((self.multi_frame_ack as u8) << 1)
             | ((self.outer_code_rx as u8) << 2)
             | ((self.outer_code_req as u8) << 3)
             | ((self.app_messages as u8) << 4)
-<<<<<<< HEAD
+            | ((self.windowed_arq as u8) << 5)
             | ((self.robust_floor as u8) << 6);
-=======
-            | ((self.windowed_arq as u8) << 5);
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
         out.push(flags);
         out.push(self.mcs_index);
         out
@@ -147,11 +134,8 @@ impl LinkCapabilities {
             outer_code_rx: bytes[5] & 0x04 != 0,
             outer_code_req: bytes[5] & 0x08 != 0,
             app_messages: bytes[5] & 0x10 != 0,
-<<<<<<< HEAD
-            robust_floor: bytes[5] & 0x40 != 0,
-=======
             windowed_arq: bytes[5] & 0x20 != 0,
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
+            robust_floor: bytes[5] & 0x40 != 0,
             mcs_index: bytes[6],
         })
     }
@@ -179,11 +163,8 @@ impl LinkCapabilities {
                 && peer.outer_code_rx
                 && (self.outer_code_req || peer.outer_code_req),
             app_messages: self.app_messages && peer.app_messages,
-<<<<<<< HEAD
-            robust_floor: self.robust_floor && peer.robust_floor,
-=======
             windowed_arq: self.windowed_arq && peer.windowed_arq,
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
+            robust_floor: self.robust_floor && peer.robust_floor,
             mcs_index: self.mcs_index.min(peer.mcs_index),
         }
     }
@@ -427,16 +408,14 @@ impl Session {
             if negotiated.app_messages != expected.app_messages {
                 return Err(ProtocolError::AppMessagesMismatch);
             }
-<<<<<<< HEAD
             if negotiated.robust_floor != expected.robust_floor {
                 return Err(ProtocolError::RobustFloorMismatch);
-=======
+            }
             // COP-168: a mismatch would make one side send bursts with
             // packed PHY `seq_num` bytes and next-RV retransmissions that the
             // other does not expect, so CONNECT_CFM must carry exactly the AND.
             if negotiated.windowed_arq != expected.windowed_arq {
                 return Err(ProtocolError::WindowedArqMismatch);
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
             }
             // Compression must not be enabled unless both sides support it
             if negotiated.compression && !expected.compression {
@@ -702,11 +681,8 @@ mod tests {
             outer_code_rx: false,
             outer_code_req: false,
             app_messages: false,
-<<<<<<< HEAD
-            robust_floor: false,
-=======
             windowed_arq: false,
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
+            robust_floor: false,
             mcs_index: 3,
         };
         let bytes = caps.to_bytes();
@@ -743,11 +719,8 @@ mod tests {
             outer_code_rx: false,
             outer_code_req: false,
             app_messages: false,
-<<<<<<< HEAD
-            robust_floor: false,
-=======
             windowed_arq: false,
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
+            robust_floor: false,
             mcs_index: 5,
         };
         let b = LinkCapabilities {
@@ -760,11 +733,8 @@ mod tests {
             outer_code_rx: false,
             outer_code_req: false,
             app_messages: false,
-<<<<<<< HEAD
-            robust_floor: false,
-=======
             windowed_arq: false,
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
+            robust_floor: false,
             mcs_index: 3,
         };
         let negotiated = a.negotiate(&b);

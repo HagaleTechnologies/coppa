@@ -882,11 +882,8 @@ fn capabilities_are_p23_to_p27() {
         outer_code_rx: false,
         outer_code_req: false,
         app_messages: false,
-<<<<<<< HEAD
-        robust_floor: false,
-=======
         windowed_arq: false,
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
+        robust_floor: false,
         mcs_index: 5,
     };
     let b = LinkCapabilities {
@@ -899,11 +896,8 @@ fn capabilities_are_p23_to_p27() {
         outer_code_rx: false,
         outer_code_req: false,
         app_messages: false,
-<<<<<<< HEAD
-        robust_floor: false,
-=======
         windowed_arq: false,
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
+        robust_floor: false,
         mcs_index: 3,
     };
     assert_eq!(
@@ -937,20 +931,11 @@ fn capabilities_are_p23_to_p27() {
         "air protocol v1: split_caps(&bytes_of(\"P27\"))"
     );
 
-<<<<<<< HEAD
-    // Reserved flag bits (5 and 7; bits 2–3 are the outer-code capability of
-    // §22.1 and bit 4 is COP-121's `app_messages`, §23) and trailing bytes
-    // are ignored on read; fewer than 7 bytes is an error.
+    // Reserved flag bit 7 and trailing bytes are ignored on read; fewer
+    // than 7 bytes is an error. Bits 2–3 are outer-code capabilities,
+    // bit 4 is app_messages, bit 5 windowed_arq, and bit 6 robust_floor.
     let mut lenient = bytes_of("P23");
-    lenient[5] |= 0xA0;
-=======
-    // Reserved flag bits (6–7; bits 2–3 are the outer-code capability of
-    // §22.1, bit 4 is COP-121's `app_messages`, §23, and bit 5 is COP-168's
-    // `windowed_arq`, §24) and trailing bytes are ignored on read; fewer
-    // than 7 bytes is an error.
-    let mut lenient = bytes_of("P23");
-    lenient[5] |= 0xC0;
->>>>>>> 6413abe417f98f2bcd4c863c2647715e7510b794
+    lenient[5] |= 0x80;
     lenient.push(0xAA);
     assert_eq!(
         LinkCapabilities::from_bytes(&lenient).unwrap(),
