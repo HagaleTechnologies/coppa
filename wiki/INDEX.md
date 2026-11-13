@@ -34,9 +34,5 @@
 - [What will bite you about session fade protection?](pages/session-fade-protection.md) — HARQ keys, delayed ACKs and the burst-duration guard.
 - [What will bite you about session chat streams?](pages/session-chat-streams.md) — Stream nibble needs app_messages; chat bytes stay out of BUFFER.
 - [What will bite you when LinBPQ drives coppa as a VARA-style TNC?](pages/linbpq-gateway.md) — Callsign lists, retries, scanner holds and the i386 runtime.
-<<<<<<< HEAD
-- [What has the low-rate floor experiment measured?](pages/low-rate-floor.md) — Header redundancy helps the batch candidate; COP-190 moved the design into the production crates, session integration open.
-- [What keeps full CI coverage intact when splitting optimized tests?](pages/full-ci-tests.md) — Profile checks, no-audio coverage and virtual-time measurement traps.
-=======
 - [What has the low-rate floor experiment measured?](pages/low-rate-floor.md) — Production batch and continuous floor sweeps; session integration remains open.
->>>>>>> 30694879933348c2e82559d9860cef1229ead370
+- [What keeps full CI coverage intact when splitting optimized tests?](pages/full-ci-tests.md) — Profile checks, no-audio coverage and virtual-time measurement traps.

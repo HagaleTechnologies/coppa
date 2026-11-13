@@ -45,7 +45,9 @@ cargo test --locked --profile ci -p coppa-daemon --features websocket,mdns,kiss-
 These cover process tests compiled out with CPAL. They run in separate
 Cargo invocations so full-feature selection cannot unify audio into them.
 Existing ignored/manual tests remain ignored. No test assertions, payloads,
-seeds, retry budgets, clocks or production code were changed.
+seeds, retry budgets or clocks were changed. The production VARA command
+server now enables TCP_NODELAY for command replies, as described in the
+local execution record below.
 
 `tests/full_ci_contract.rs` checks runner arguments against Cargo target
 metadata and rejects an intentionally incomplete selection. It also
