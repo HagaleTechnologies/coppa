@@ -14,34 +14,18 @@ numbers separately, because they move independently:
 Older releases have no entry here. Their on-air breaks are listed in
 `docs/SPEC.md` §0.1.
 
-## Unreleased: 0.14.0
+## Unreleased: 0.15.0
 
-COP-190 adds the low-rate floor as a production air format, framed at
-air-protocol version 2. It is a separate format from the OFDM speed
-ladder: nothing a version-1 station sends or parses changes. COP-168 adds
-the wire primitives and receive-side HARQ for windowed session ARQ.
-
-- **Crate version:** 0.14.0. Minor bump over 0.13.0 for two reasons: COP-190 adds
-  new public modules, and COP-168 gives `coppa_protocol::session::LinkCapabilities`
-  a public field, `windowed_arq`, which breaks struct-literal callers that do not use
-  `..LinkCapabilities::default()`.
-- **Air-protocol version:** 2 allocated for the floor, in addition to the
-  unchanged version 1. SPEC §0.3.3 registers the allocation and
-  `docs/adr/014-cop190-low-rate-floor.md` freezes the framing: 16-FSK, 50
-  baud, 600–1350 Hz, 4-byte header (version, length, CRC16) repeated four
-  times and decoded jointly, NR BG2 LDPC payload with CRC32, 40-byte PDU
-  in a fixed 8.0 s airtime. New `coppa_codec::floor` (modulation) and
-  `coppa_protocol::modem::floor` (`FloorFrame`, `FloorStream`,
-  `FloorError`, `FLOOR_AIR_PROTOCOL_VERSION`), guarded by
-  `air_v2_conformance.rs` and `floor_receive.rs`.
-- **Air-protocol version 1, capability flag:** CONNECT capability flags bit 5 is now
-  named `windowed_arq` (COP-168, SPEC §20.1). It is negotiated as an AND and CONNECT_CFM
-  must carry exactly the AND (`ProtocolError::WindowedArqMismatch`). No release sets it
-  yet, so every coppad still sends the 0.12.0 bytes.
-- **Host-API version:** 1, unchanged. The `phy_mode` status field and the
-  floor-aware session controller are not built yet; see
-  `docs/LIMITATIONS.md`, COP-169 section.
-- **C ABI version:** unchanged; no exported symbol or layout change.
+- **Crate version:** 0.15.0. Minor bump over 0.14.0 (COP-190) because
+  `coppa_protocol::session::LinkCapabilities` gains a public field, `windowed_arq`, which
+  breaks struct-literal callers that do not use `..LinkCapabilities::default()`.
+- **Air-protocol version:** unchanged (1, plus 2 for the floor from 0.14.0). In version 1,
+  CONNECT capability flags bit 5 is now named
+  `windowed_arq` (COP-168, SPEC §20.1). It is negotiated as an AND and CONNECT_CFM must
+  carry exactly the AND (`ProtocolError::WindowedArqMismatch`). No release sets it yet,
+  so every coppad still sends the 0.12.0 bytes.
+- **Host-API version:** 1, unchanged.
+- **C ABI version:** unchanged.
 - **Rust API, additive:** `LinkCapabilities::windowed_window`, `arq::MAX_SESSION_WINDOW`,
   `arq::windowed_phy_seq`, `arq::windowed_harq_key`, `arq::phy_following`,
   `arq::RV_SCHEDULE`, `arq::rv_for_session_attempt`, `ArqTx::unacked` and the
@@ -57,6 +41,27 @@ the wire primitives and receive-side HARQ for windowed session ARQ.
 - **Behaviour change:** a soft-combining buffer now restarts when a frame under the same
   key has a different payload length, not only a different level, so two frames of
   different lengths that share `seq_num` 0 no longer add their soft bits together.
+
+## Unreleased: 0.14.0
+
+COP-190 adds the low-rate floor as a production air format, framed at
+air-protocol version 2. It is a separate format from the OFDM speed
+ladder: nothing a version-1 station sends or parses changes.
+
+- **Crate version:** 0.14.0 (minor: new public modules).
+- **Air-protocol version:** 2 allocated for the floor, in addition to the
+  unchanged version 1. SPEC §0.3.3 registers the allocation and
+  `docs/adr/014-cop190-low-rate-floor.md` freezes the framing: 16-FSK, 50
+  baud, 600–1350 Hz, 4-byte header (version, length, CRC16) repeated four
+  times and decoded jointly, NR BG2 LDPC payload with CRC32, 40-byte PDU
+  in a fixed 8.0 s airtime. New `coppa_codec::floor` (modulation) and
+  `coppa_protocol::modem::floor` (`FloorFrame`, `FloorStream`,
+  `FloorError`, `FLOOR_AIR_PROTOCOL_VERSION`), guarded by
+  `air_v2_conformance.rs` and `floor_receive.rs`.
+- **Host-API version:** 1, unchanged. The `phy_mode` status field and the
+  floor-aware session controller are not built yet; see
+  `docs/LIMITATIONS.md`, COP-169 section.
+- **C ABI version:** unchanged; no exported symbol or layout change.
 
 ## Unreleased: 0.12.0
 

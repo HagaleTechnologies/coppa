@@ -74,8 +74,8 @@ Then send a few commands. The `sleep`s give coppad time to answer each one:
 $ { echo VERSION; sleep 1; echo "MYCALL N1CALL"; sleep 1; echo "LISTEN ON"; sleep 1;
     echo FOOBAR; sleep 1; echo "CONNECT N1CALL N0CALL"; sleep 35; } \
     | nc -q 1 127.0.0.1 8300 | tr '\r' '\n'
-VERSION Coppa 0.14.0
-VERSION Coppa 0.14.0
+VERSION Coppa 0.15.0
+VERSION Coppa 0.15.0
 OK
 OK
 WRONG
@@ -112,7 +112,7 @@ either data port. The [two-station example](#a-two-station-session) shows what b
 
 **Framing.** Send one command per line, ended by `\r`, `\n` or `\r\n`. Empty lines are ignored.
 coppad ends every line it sends with a bare `\r`, as VARA does. On connect coppad speaks first,
-with `VERSION Coppa 0.14.0`. A line longer than 4096 bytes, or one that is not valid UTF-8,
+with `VERSION Coppa 0.15.0`. A line longer than 4096 bytes, or one that is not valid UTF-8,
 closes the connection.
 
 **Replies and pushed lines.** Each command gets exactly one reply, sent only to the client that
@@ -126,8 +126,8 @@ on a fixed delay.
 
 | You send | coppad replies | Effect |
 |---|---|---|
-| `VERSION` | `VERSION Coppa 0.14.0` | none |
-| `VERSIONINFO` (coppa extension) | `VERSIONINFO crate_version=0.14.0 air_protocol_version=1 host_api_version=1`; `WRONG` with any argument | none; see [Version discovery](#version-discovery) |
+| `VERSION` | `VERSION Coppa 0.15.0` | none |
+| `VERSIONINFO` (coppa extension) | `VERSIONINFO crate_version=0.15.0 air_protocol_version=1 host_api_version=1`; `WRONG` with any argument | none; see [Version discovery](#version-discovery) |
 | `MYCALL <call> [<call> ...]` | `OK` for one to five valid callsigns, otherwise `WRONG` | replaces the daemon-wide list; first identifies transmissions, all answer inbound calls; CONNECTED names the dialled call |
 | `RETRIES <n>` or `RETRIES=<n>` | `OK` for 0-20, otherwise `WRONG` | per-client count of additional connect requests on later dials; resets on client disconnect |
 | `BUSY` | `BUSY ON` or `BUSY OFF` | reliable reply with the current channel state |
@@ -172,11 +172,11 @@ On the command port the greeting and `VERSION` keep their old shape; `VERSIONINF
 query with no arguments. Each line below ends with a bare `\r`:
 
 ```text
-server greeting: VERSION Coppa 0.14.0\r
+server greeting: VERSION Coppa 0.15.0\r
 client: VERSION\r
-server: VERSION Coppa 0.14.0\r
+server: VERSION Coppa 0.15.0\r
 client: VERSIONINFO\r
-server: VERSIONINFO crate_version=0.14.0 air_protocol_version=1 host_api_version=1\r
+server: VERSIONINFO crate_version=0.15.0 air_protocol_version=1 host_api_version=1\r
 client: VERSIONINFO extra\r
 server: WRONG\r
 ```

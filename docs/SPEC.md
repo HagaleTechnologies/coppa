@@ -10,7 +10,7 @@ PHY header (§4.2) and the MAC header (§17.1).
 | 4 (adds §23, COP-121) | 2026-11-08 | 0.11.0 | COP-121 branch, based on `f6e9951` |
 | 5 (adds §0.3 air-protocol v1 contract, COP-178) | 2026-11-09 | 0.12.0 | COP-178 branch, based on `4237273` |
 | 6 (registers air-protocol version 2, the low-rate floor, COP-190) | 2026-11-12 | 0.14.0 | COP-190 branch, based on `cddfc25` + COP-189 `84f0d5e` |
-| 7 (names capability flag bit 5 `windowed_arq` in §20.1, COP-168) | 2026-11-12 | 0.14.0 | COP-168 branch, based on `28d4c9a`, merged over revision 6 |
+| 7 (names capability flag bit 5 `windowed_arq` in §20.1, COP-168) | 2026-11-12 | 0.15.0 | COP-168 branch, based on `28d4c9a`, merged over revision 6 |
 
 There is no in-band version negotiation. §0.1 records the wire-break
 history; §0.3 states what air-protocol version 1 freezes from crate 0.12.0
