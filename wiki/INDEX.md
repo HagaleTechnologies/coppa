@@ -35,3 +35,4 @@
 - [What will bite you about session chat streams?](pages/session-chat-streams.md) — Stream nibble needs app_messages; chat bytes stay out of BUFFER.
 - [What will bite you when LinBPQ drives coppa as a VARA-style TNC?](pages/linbpq-gateway.md) — Callsign lists, retries, scanner holds and the i386 runtime.
 - [What has the low-rate floor experiment measured?](pages/low-rate-floor.md) — Production batch and continuous floor sweeps; session integration remains open.
+- [What keeps full CI coverage intact when splitting optimized tests?](pages/full-ci-tests.md) — Profile checks, no-audio coverage and virtual-time measurement traps.

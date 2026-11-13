@@ -537,3 +537,5 @@ stall scenario does (`docs/testing/bpq-session.md`).
   cross at or below -12 dB AWGN and at -10.148936 dB Poor, with zero wrong
   payloads, but both fail the sync-share clause on both channels. No
   production session result is claimed.
+
+- **Full-CI hosted verdict budget (COP-200).** Local optimized groups pass below 25 minutes, but three same-revision hosted workflow verdicts below 30 minutes remain unverified. Other required jobs, runner queue time and cold caches can affect the complete result. See [full-CI measurements](testing/full-ci.md).
