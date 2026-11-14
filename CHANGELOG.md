@@ -30,7 +30,7 @@ Older releases have no entry here. Their on-air breaks are listed in
 - An unset VARA `RETRIES` now means 3 additional connect requests while the
   speed level is automatic (none with a pinned level). An explicit
   `RETRIES n` is honoured exactly.
-- **Rust API, additive:** `FloorController::floor_active` and the shared
+- **Rust API, additive:** the shared
   floor policy functions `admits_floor_pdu`, `floor_caps_unusable`,
   `floor_segment_limit`, `floor_rto_floor`, `floor_keepalive_interval` and
   `calling_handshake_timeout` in `coppa_protocol::floor_controller`.

@@ -46,13 +46,6 @@ impl FloorController {
         }
     }
 
-    /// True while the controller sends on the floor or has a recovery probe
-    /// bound (the probe rides a level-1 OFDM frame but its segment was cut
-    /// for the floor).
-    pub fn floor_active(&self) -> bool {
-        self.floor
-    }
-
     /// Select the waveform for the next transmission.
     pub fn mode(&self, level: u8) -> LinkPhyMode {
         if self.floor && self.probe.is_none() {
@@ -295,25 +288,6 @@ mod tests {
         assert_eq!(floor_keepalive_interval(s(30), s(600)), s(60));
         assert_eq!(calling_handshake_timeout(s(20), ms(500)), s(30));
         assert_eq!(calling_handshake_timeout(s(31), ms(500)), ms(32_500));
-    }
-
-    #[test]
-    fn floor_active_tracks_floor_and_probe() {
-        let mut c = FloorController::default();
-        assert!(!c.floor_active());
-        c.timeout(true);
-        c.timeout(true);
-        assert!(c.floor_active());
-        for seq in 0..5 {
-            c.prepare_data(seq);
-            c.acknowledged(seq, LinkPhyMode::Floor);
-        }
-        c.prepare_data(5);
-        assert_eq!(c.mode(2), LinkPhyMode::Ofdm { level: 1 });
-        assert!(c.floor_active());
-        c.acknowledged(5, LinkPhyMode::Ofdm { level: 1 });
-        assert!(!c.floor_active());
-        assert_eq!(c.mode(2), LinkPhyMode::Ofdm { level: 2 });
     }
     #[test]
     fn floor_two_window_fallback() {

@@ -8,7 +8,7 @@ inputs and outputs, not facts about the commit carrying them.
 
 COP-202 re-recorded both adapters: **link 10 of 10** connected (every
 trial at 35.5 s) and **daemon 10 of 10** connected (every trial at
-36.0 s). Both adapters run COP-195's shared floor controller
+42.0 s). Both adapters run COP-195's shared floor controller
 (`coppa_protocol::floor_controller`): two unanswered OFDM request windows,
 then floor-carried CONNECT_REQ, CONNECT_ACK and CONNECT_CFM legs. The bar
 is met in the recorded direction (the lexically lower caller VK3ABC dials
@@ -100,7 +100,7 @@ report connection success from local intent alone.
 ## Separate pass counts
 
 - `link.csv`: 10/10 connected (seeds 0x16910000–0x16910009), each at 35.5 s.
-- `daemon.csv`: 10/10 connected (same seeds), each at 36.0 s.
+- `daemon.csv`: 10/10 connected (same seeds), each at 42.0 s.
 
 All ten outcomes per adapter are retained. These files supersede
 COP-196's 0/10 recordings, which predate the controller.

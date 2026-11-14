@@ -4995,9 +4995,21 @@ impl EventLoop {
                                                 .map(|t| t.into_std())
                                                 .unwrap_or_else(clock_now);
                                             if retries > 0 && sent > 0 {
-                                                let interval = coppa_protocol::session::connect_req_retry_interval(
-                                                    Duration::from_secs_f64(samples.len() as f64 / self.engine.config().sample_rate as f64),
+                                                let sr = self.engine.config().sample_rate as f64;
+                                                let mut interval = coppa_protocol::session::connect_req_retry_interval(
+                                                    Duration::from_secs_f64(samples.len() as f64 / sr),
                                                     Duration::from_millis(self.config.radio.turnaround_ms));
+                                                // COP-202 Decision 8: a floor-enabled dial's
+                                                // windows cover our prepended ID and the
+                                                // peer's, so a clean-channel ACK lands
+                                                // before the first repeat. A pinned dial
+                                                // keeps COP-172's schedule.
+                                                if floor {
+                                                    interval += Duration::from_secs_f64(
+                                                        sent.saturating_sub(samples.len()) as f64
+                                                            / sr,
+                                                    ) + self.station_id_allowance();
+                                                }
                                                 self.pending_dial = Some(PendingDial {
                                                     session_id: id,
                                                     request: pdu_bytes.clone(),
@@ -5972,12 +5984,13 @@ impl EventLoop {
             let session = self
                 .session_id_for_frame(&pdu)
                 .and_then(|id| self.session_mgr.get(id));
-            if !floor_policy::admits_floor_pdu(
-                pdu.frame_type,
-                &pdu.payload,
-                session,
-                self.floor_enabled(),
-            ) {
+            // A session that already advertised bit 6 keeps hearing the
+            // floor if a speed level is pinned mid-session; a pin only stops
+            // new floor bootstraps.
+            let local_enabled =
+                self.floor_enabled() || session.is_some_and(|s| s.local_caps.robust_floor);
+            if !floor_policy::admits_floor_pdu(pdu.frame_type, &pdu.payload, session, local_enabled)
+            {
                 continue;
             }
             if matches!(
@@ -27333,8 +27346,12 @@ mod tests {
                     station.engine.encode_bytes(&req).unwrap().len() as f64 / SAMPLE_RATE as f64,
                 )
             };
+            // A floor-enabled dial's OFDM window also covers A's prepended
+            // first station ID and the peer's (Decision 8); both are the same
+            // level-1 ID frame.
             let ofdm_interval =
-                coppa_protocol::session::connect_req_retry_interval(pdu_airtime, turnaround);
+                coppa_protocol::session::connect_req_retry_interval(pdu_airtime, turnaround)
+                    + allowance * 2;
             let gap = |i: usize| keys[i].0 - keys[i - 1].0;
             // Repeats run on the 500 ms poll, so each lands within one poll.
             assert!(
@@ -27487,6 +27504,91 @@ mod tests {
                 assert!(!negotiated.robust_floor);
             }
             assert_eq!(delivered, payload, "delivered once, in order");
+        }
+
+        /// COP-202 AC9: two floor-enabled daemons on a clean channel connect
+        /// on the first OFDM exchange, key no floor frame, and a 500-byte
+        /// write still leaves A in one multi-codeword OFDM frame.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_clean_channel_keeps_ofdm_segments() {
+            let reference_power = floor_reference_power();
+            let mut a = FloorStation::with_snr("VK3ABC", SEED_BASE, 0, reference_power, 60.0);
+            let mut b = FloorStation::with_snr("W1AW", SEED_BASE, 1, reference_power, 60.0);
+            assert!(a.station.floor_enabled() && b.station.floor_enabled());
+            dial(&mut a.station).await;
+            let initial_left = a.station.pending_dial.as_ref().map(|d| d.left);
+            assert!(
+                initial_left.is_some(),
+                "an unset-RETRIES Auto dial schedules repeats"
+            );
+            let mut repeated = false;
+            let start = tokio::time::Instant::now();
+            let mut clock = PairClock::new(start);
+            let (mut tx_a, mut tx_b) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+            let mut connected_at = None;
+            let mut floor_keyed = false;
+            let mut first_data_codewords = None;
+            while start.elapsed() < Duration::from_secs(20) {
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, false).await;
+                for station in [&a.station, &b.station] {
+                    floor_keyed |= station.phy_tx == Some(LinkPhyMode::Floor);
+                }
+                if connected_at.is_none() {
+                    repeated |= a
+                        .station
+                        .pending_dial
+                        .as_ref()
+                        .is_some_and(|d| Some(d.left) != initial_left);
+                }
+                if connected_at.is_none()
+                    && both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC")
+                {
+                    connected_at = Some(start.elapsed());
+                    a.station
+                        .handle_host_event(HostEvent::DataReceived {
+                            client_id: 1,
+                            // Incompressible bytes, so compression cannot
+                            // shrink the write into a single codeword.
+                            data: {
+                                let mut x = 0x2545_f491_u32;
+                                (0..500)
+                                    .map(|_| {
+                                        x ^= x << 13;
+                                        x ^= x >> 17;
+                                        x ^= x << 5;
+                                        x as u8
+                                    })
+                                    .collect()
+                            },
+                        })
+                        .await;
+                }
+                if connected_at.is_some() && first_data_codewords.is_none() {
+                    first_data_codewords = a
+                        .station
+                        .session_link
+                        .as_ref()
+                        .filter(|l| l.tx.in_flight() > 0)
+                        .map(|l| (l.tx_codewords, l.has_backlog()));
+                }
+                if first_data_codewords.is_some() {
+                    break;
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            connected_at.expect("connected on a clean channel");
+            assert!(
+                !repeated,
+                "connected on the first OFDM request, with no repeat"
+            );
+            assert!(!floor_keyed, "no floor frame on a clean channel");
+            let (codewords, backlog_left) = first_data_codewords.expect("A keyed data");
+            assert!(
+                codewords > 1,
+                "one multi-codeword OFDM frame, not floor segments"
+            );
+            assert!(!backlog_left, "the 500-byte write left in one frame");
         }
     }
 }

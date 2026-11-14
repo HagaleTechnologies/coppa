@@ -2788,9 +2788,9 @@ Reference daemon behaviour (COP-202, informative): coppad advertises
 robust_floor while its speed level is automatic and runs the same
 FloorController policy as the library Link for the handshake. It starts
 discovery on OFDM, sends a floor CONNECT_REQ after two unanswered request
-windows, and answers each handshake frame in the waveform it arrived on. Its
-floor request window adds one level-1 OFDM station-ID frame for the peer's
-reply. It accepts floor session frames once both sides confirm bit 6, but it
+windows, and answers each handshake frame in the waveform it arrived on. In
+Auto its request windows add the airtime of any station ID it prepended and of
+one level-1 OFDM station-ID frame for the peer's reply. It accepts floor session frames once both sides confirm bit 6, but it
 still keys session data, ACKs, keepalives and DISCONNECT on OFDM. It does not
 stagger discovery by callsign, keeps the 30 s inbound handshake timeout and does
 not replay a lost CONNECT_CFM.

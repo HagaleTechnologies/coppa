@@ -383,7 +383,9 @@ update. The re-measure and redesign of this bar is tracked as COP-183, the succe
   segment sizing, OFDM probe or floor RTO; COP-202's plan Phase 3); no
   `phy_mode` host reporting, so the dashboard shows the OFDM level while the
   floor carries the handshake; no lost-CONNECT_CFM replay; no
-  simultaneous-call tie break or discovery stagger. Link records 0/10 in the
+  simultaneous-call tie break or discovery stagger. With a turnaround above
+  about 5.5 s, the last floor request's reply window and the inbound floor
+  handshake can outlast the flat 30 s handshake timeout. Link records 0/10 in the
   reversed direction (lexically higher caller). Production development sweeps now
   cover batch and streaming reception on AWGN and Poor. COP-191 records
   final-seed 200-trial sweeps and adds `--waveform floor`; the Poor ramp,
