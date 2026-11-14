@@ -14,6 +14,28 @@ numbers separately, because they move independently:
 Older releases have no entry here. Their on-air breaks are listed in
 `docs/SPEC.md` §0.1.
 
+## Unreleased: 0.16.0
+
+- Add negotiated low-rate floor sessions to the Rust library Link. Discovery
+  starts on OFDM, falls back after two unanswered windows, and probes OFDM
+  after five distinct acknowledged floor exchanges. Set
+  `LinkConfig.robust_floor = false` for the previous OFDM-only behavior.
+- Expose the last transmitted and validated received modes through
+  `Link::phy_mode()`. The daemon and host mode reporting remain open.
+- Allocate capability flags byte bit 6 without changing legacy bytes or
+  capability length.
+- **Crate version:** 0.16.0. Minor bump over 0.15.0 because
+  `coppa_engine::LinkConfig` and `coppa_protocol::session::LinkCapabilities` each gain a
+  public field, `robust_floor`, which breaks struct-literal callers that do not end with
+  `..LinkConfig::new(callsign)` or `..LinkCapabilities::default()`.
+- **Air-protocol version:** unchanged (1, plus 2 for the floor from 0.14.0). In version 1,
+  CONNECT capability flags bit 6 is now named `robust_floor` (SPEC §20.1). It is negotiated
+  as an AND and CONNECT_CFM must carry exactly the AND
+  (`ProtocolError::RobustFloorMismatch`). The library Link sets it by default; coppad does
+  not set it.
+- **Host-API version:** 1, unchanged.
+- **C ABI version:** unchanged.
+
 ## Unreleased: 0.15.0
 
 - **Crate version:** 0.15.0. Minor bump over 0.14.0 (COP-190) because

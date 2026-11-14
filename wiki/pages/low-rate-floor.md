@@ -21,7 +21,8 @@ links:
 
 COP-187's batch header repair reduces experimental candidate errors on paired
 development seeds. COP-190 then moved the measured 16-FSK design into the
-production crates as air-protocol version 2; no session uses it yet. The
+production crates as air-protocol version 2. The library Link now uses it
+for negotiated sessions; the daemon controller remains open. The
 remaining Poor failures on the frozen bench copy still violate the separate
 acquisition bar, despite a favorable FER crossing. See
 [measurements](../../BENCHMARKS.md#cop-187-experimental-header-repair)
@@ -79,3 +80,29 @@ on identical persistent-channel captures. Favorable crossings still fail the
 sync-share clause. See [the production measurements](../../BENCHMARKS.md#cop-190-production-floor-development-measurements)
 for seeds, accounting and remaining acceptance work. Session integration stays
 open; a decoded floor frame does not prove a connection.
+
+The library floor controller reserves streaming delivery time in addition to
+airtime. Keying interrupts capture, so Link breaks both OFDM and floor
+acquisition history at each transmission boundary. Keeping OFDM history across
+these gaps caused repeated losses in the level-8, 680-byte binary transfer
+regression in `crates/coppa-engine/src/link/tests.rs`. Otherwise retained samples from before and
+after transmission can be mistaken for contiguous audio. Probe recovery also
+needs room before idle keepalives. See the
+[session policy](../../docs/SPEC.md#negotiated-low-rate-floor-session-policy)
+and `crates/coppa-engine/tests/floor_session.rs` for deterministic regressions.
+
+Floor-enabled caller retry delays use the complete callsign ordering that also
+chooses the answerer during simultaneous calls. A three-bucket delay based on
+the last callsign byte left N0AAA and N0AAD synchronized until retries ran out.
+The lexical answerer now waits through two OFDM windows and a floor response
+window before retrying OFDM. Floor retries keep their normal response window. The paired-audio regression
+covers these formerly equal delays; it does not establish the numerical
+connection bar.
+
+Discovery staggering can exceed the shared 30-second handshake expiry. For
+N0AAD calling N0AAA, a six-second RTO and 500 ms turnaround delay the first
+retry until 31 seconds. Link extends its local Calling timeout beyond that
+retry and turnaround; retry exhaustion still ends silent calls. Keep these
+bounds together when changing discovery timing. See `Link::run_timers` in
+[link.rs](../../crates/coppa-engine/src/link.rs) and the boundary and exhaustion
+tests in [link/tests.rs](../../crates/coppa-engine/src/link/tests.rs).
