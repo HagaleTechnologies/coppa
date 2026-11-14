@@ -129,7 +129,7 @@ on a fixed delay.
 | `VERSION` | `VERSION Coppa 0.16.0` | none |
 | `VERSIONINFO` (coppa extension) | `VERSIONINFO crate_version=0.16.0 air_protocol_version=1 host_api_version=1`; `WRONG` with any argument | none; see [Version discovery](#version-discovery) |
 | `MYCALL <call> [<call> ...]` | `OK` for one to five valid callsigns, otherwise `WRONG` | replaces the daemon-wide list; first identifies transmissions, all answer inbound calls; CONNECTED names the dialled call |
-| `RETRIES <n>` or `RETRIES=<n>` | `OK` for 0-20, otherwise `WRONG` | per-client count of additional connect requests on later dials; resets on client disconnect |
+| `RETRIES <n>` or `RETRIES=<n>` | `OK` for 0-20, otherwise `WRONG` | per-client count of additional connect requests on later dials; resets on client disconnect. Unset, a dial makes 3 additional requests while the speed level is automatic, so it can fall back to the low-rate floor; with a pinned speed level it makes none |
 | `BUSY` | `BUSY ON` or `BUSY OFF` | reliable reply with the current channel state |
 | `LISTEN ON` / `LISTEN OFF` | `OK`; `WRONG` for any other argument | answer inbound calls, or stop; coppad starts with listening off |
 | `CONNECT <me> <target> [via ...]` | `OK`, then `CONNECTED <caller> <callee> <bw>` or `DISCONNECTED` | dials `<target>`; `<me>` and `via` are ignored, the daemon's own callsign is used; one argument gets `WRONG` |
@@ -585,6 +585,8 @@ UI-View interoperability and monitor formatting remain unverified with those cli
 COP-172: `LISTEN OFF` cancels an inbound PENDING attempt with CANCELPENDING.
 RETRIES repeats requests at max twice request airtime plus two turnarounds,
 or five seconds. Repeats stop at 300 s; timeout follows the last request.
+COP-202: in Auto, the third and later requests go on the low-rate floor, each
+at least 19 s plus one station-ID frame apart at a 500 ms turnaround.
 See [BPQ.md](BPQ.md) for scanning gateways and measured limits.
 
 Unknown-command log deduplication remembers at most 64 words per client,

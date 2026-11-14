@@ -6,24 +6,35 @@ inputs and outputs, not facts about the commit carrying them.
 
 ## Outcome
 
-Both adapters recorded **0 of 10** connected trials. Every trial timed out
-at the 60 s deadline with both stations IDLE (the caller's dial exhausted
-its retries after nothing decoded) and zero decoded frames at either end.
-The root cause is the missing negotiated floor session controller tracked
-by COP-195: at −6 dB the OFDM handshake legs do not decode, and no
-floor-carried session path exists yet to carry them. These trials are the
-recorded proof of that gap; they are expected to turn green once COP-195's
-controller is incorporated. No seeds, thresholds, gains or deadlines were
-changed to alter the outcome.
+COP-202 re-recorded both adapters: **link 10 of 10** connected (every
+trial at 35.5 s) and **daemon 10 of 10** connected (every trial at
+36.0 s). Both adapters run COP-195's shared floor controller
+(`coppa_protocol::floor_controller`): two unanswered OFDM request windows,
+then floor-carried CONNECT_REQ, CONNECT_ACK and CONNECT_CFM legs. The bar
+is met in the recorded direction (the lexically lower caller VK3ABC dials
+the listener W1AW). No seeds, thresholds, gains or deadlines were changed
+to alter the outcome.
+
+Harness correction (COP-202): the daemon trial now moves one full
+960-sample block through each direction's channel every tick. Before, it
+passed only the samples a station played that tick, so a station that was
+idle sent no audio at all, and the peer's floor detector heard no channel
+noise between transmissions. That contradicted the trial's own stated
+contract ("both directions processed every block including noisy
+silence") and the library Link trial, which always passes the whole
+zero-filled block. `floor_daemon_trial_carries_noisy_silence` guards it.
+
+COP-196's first recordings (0 of 10 for both adapters, before the
+controller existed in either adapter) are superseded by these files.
 
 ## Replay commands
 
 ```sh
-mkdir -p /tmp/cop196-connect
-COPPA_FLOOR_CONNECT_OUT=/tmp/cop196-connect \
+mkdir -p /tmp/cop202-connect
+COPPA_FLOOR_CONNECT_OUT=/tmp/cop202-connect \
   cargo test --release -p coppa-engine --test floor_session \
   floor_link_connect_minus6 -- --ignored --nocapture
-COPPA_FLOOR_CONNECT_OUT=/tmp/cop196-connect \
+COPPA_FLOOR_CONNECT_OUT=/tmp/cop202-connect \
   cargo test --release -p coppa-daemon --lib \
   floor_daemon_connect_minus6 -- --ignored --nocapture
 ```
@@ -51,9 +62,11 @@ report connection success from local intent alone.
 
 ## Configuration
 
-- Dependency revision tested: COP-190 head `355805ccc999803fbdffc6a9bbe5bca17604c2e8`
-  merged onto main `cdc4ae5f852634dda4f289744a8050ffc8d61179` (COP-196
-  branch). COP-195's controller is absent at this revision.
+- Dependency revision tested (COP-202): main
+  `21e94b63deb86db05e6e9fb416173b6032c68bf2` with COP-198 head
+  `d1ee7d1575977ff0a9ab35e535aa90700410ef94` (which contains COP-195) and
+  COP-196 head `55763d07d486964a5051236c30c9354756204ecd` merged, plus the
+  COP-202 daemon floor path.
 - Rust: rustc 1.98.0 (88d9e12ae 2026-08-18), cargo 1.98.0
   (797e8a9bc 2026-08-05), Linux.
 - Adapters: engine library `Link` pairs (caller VK3ABC, listener W1AW,
@@ -86,9 +99,8 @@ report connection success from local intent alone.
 
 ## Separate pass counts
 
-- `link.csv`: 0/10 connected (seeds 0x16910000–0x16910009).
-- `daemon.csv`: 0/10 connected (same seeds).
+- `link.csv`: 10/10 connected (seeds 0x16910000–0x16910009), each at 35.5 s.
+- `daemon.csv`: 10/10 connected (same seeds), each at 36.0 s.
 
-All ten outcomes per adapter are retained, failures included; there are
-no superseded runs to record (these are the first recorded runs under
-this contract).
+All ten outcomes per adapter are retained. These files supersede
+COP-196's 0/10 recordings, which predate the controller.

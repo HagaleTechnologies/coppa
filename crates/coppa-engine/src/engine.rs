@@ -196,7 +196,7 @@ impl CoppaCore {
     /// The engine's separately detected low-rate floor codec
     /// (air-protocol version 2, COP-190). Encode and receive floor frames
     /// through it directly. Link selects it for negotiated floor sessions;
-    /// the daemon session controller still uses OFDM.
+    /// coppad's event loop selects it for floor handshakes (COP-202).
     #[must_use]
     pub fn floor(&self) -> &FloorFrame {
         &self.floor

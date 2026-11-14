@@ -282,19 +282,71 @@ fn floor_link_muted_peers_never_connect() {
 #[test]
 fn floor_connection_recordings_are_complete() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for adapter in ["link", "daemon"] {
-        let path = root
-            .join("results/cop-190/connect")
-            .join(format!("{adapter}.csv"));
-        let csv = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let connected = audit_connect_csv(&path.display().to_string(), &csv)
-            .unwrap_or_else(|e| panic!("{adapter} evidence rejected: {e}"));
-        assert!(
-            connected >= 9,
-            "{adapter} connect bar not met: {connected}/{TRIALS} recorded trials connected"
-        );
+    if let Err(e) = audit_connect_dir(&root.join("results/cop-190/connect")) {
+        panic!("{e}");
     }
+}
+
+/// Every adapter the connect bar covers: the library Link and, since
+/// COP-202, coppad's event loop.
+const ADAPTERS: [&str; 2] = ["link", "daemon"];
+
+/// Audit one recording set: each adapter's CSV must exist, pass
+/// `audit_connect_csv` and record at least nine connected trials. The error
+/// names the first adapter that fails.
+fn audit_connect_dir(dir: &std::path::Path) -> Result<(), String> {
+    for adapter in ADAPTERS {
+        let path = dir.join(format!("{adapter}.csv"));
+        let csv = std::fs::read_to_string(&path)
+            .map_err(|e| format!("{adapter} evidence missing: read {}: {e}", path.display()))?;
+        let connected = audit_connect_csv(&path.display().to_string(), &csv)
+            .map_err(|e| format!("{adapter} evidence rejected: {e}"))?;
+        if connected < 9 {
+            return Err(format!(
+                "{adapter} connect bar not met: {connected}/{TRIALS} recorded trials connected"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// COP-202 AC3: a recording set whose daemon CSV is missing or below nine of
+/// ten fails the audit, even when the link CSV passes.
+#[test]
+fn floor_connection_audit_requires_the_daemon_recording() {
+    let header = "trial,seed,snr_db,connected,elapsed_s,a_state,b_state,failure_reason\n";
+    let csv = |connected: usize| {
+        let mut csv = String::from(header);
+        for index in 0..TRIALS {
+            let seed = SEED_BASE + index as u64;
+            if index < connected {
+                csv.push_str(&format!(
+                    "{index},{seed:#x},-6,true,36.0,CONNECTED,CONNECTED,-\n"
+                ));
+            } else {
+                csv.push_str(&format!(
+                    "{index},{seed:#x},-6,false,60.0,IDLE,IDLE,timeout\n"
+                ));
+            }
+        }
+        csv
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "cop202-audit-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("link.csv"), csv(10)).unwrap();
+    let missing = audit_connect_dir(&dir).expect_err("a missing daemon CSV must fail");
+    std::fs::write(dir.join("daemon.csv"), csv(8)).unwrap();
+    let short = audit_connect_dir(&dir).expect_err("8/10 daemon trials must fail");
+    std::fs::write(dir.join("daemon.csv"), csv(9)).unwrap();
+    let passing = audit_connect_dir(&dir);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(missing.contains("daemon"), "{missing}");
+    assert!(short.contains("daemon connect bar not met"), "{short}");
+    assert_eq!(passing, Ok(()));
 }
 
 /// The audit core, shared with the malformed-record case: returns the

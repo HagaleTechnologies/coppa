@@ -63,8 +63,8 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use coppa_protocol::floor_controller::FloorController;
 pub use coppa_protocol::floor_controller::LinkPhyMode;
+use coppa_protocol::floor_controller::{self as floor_policy, FloorController};
 
 use coppa_protocol::arq::{self, ArqConfig, ArqRx, ArqTx};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu};
@@ -574,13 +574,9 @@ impl Link {
             SESSION_ARQ_WINDOW,
             self.config.max_retransmit,
             if self.floor_negotiated() {
-                self.config.initial_rto.max(
-                    FloorController::response_window(
-                        LinkPhyMode::Floor,
-                        Duration::ZERO,
-                        self.config.turnaround,
-                    ) + Duration::from_secs(1),
-                )
+                self.config
+                    .initial_rto
+                    .max(floor_policy::floor_rto_floor(self.config.turnaround))
             } else {
                 self.config.initial_rto
             },
@@ -639,10 +635,8 @@ impl Link {
         // retry arrives. Do not key a keepalive across that recovery window.
         if self.floor_negotiated() {
             if let Some(s) = self.session.as_mut() {
-                s.keepalive_interval = s
-                    .keepalive_interval
-                    .max(Duration::from_secs(60))
-                    .min(s.session_timeout / 3);
+                s.keepalive_interval =
+                    floor_policy::floor_keepalive_interval(s.keepalive_interval, s.session_timeout);
             }
         }
         self.phase = Phase::Connected;
@@ -698,22 +692,15 @@ impl Link {
             if pdu.dest != self.local {
                 continue;
             }
-            if mode == LinkPhyMode::Floor {
-                let bootstrap = matches!(
+            if mode == LinkPhyMode::Floor
+                && !floor_policy::admits_floor_pdu(
                     pdu.frame_type,
-                    MacFrameType::ConnectReq | MacFrameType::ConnectAck
-                ) && LinkCapabilities::from_bytes(&pdu.payload)
-                    .is_ok_and(|c| c.robust_floor);
-                let confirming = pdu.frame_type == MacFrameType::ConnectCfm
-                    && self.phase == Phase::Accepting
-                    && self.is_from_peer(&pdu)
-                    && self.session.as_ref().is_some_and(|s| {
-                        s.local_caps.robust_floor
-                            && s.remote_caps.as_ref().is_some_and(|c| c.robust_floor)
-                    });
-                if !bootstrap && !confirming && !self.floor_negotiated() {
-                    continue;
-                }
+                    &pdu.payload,
+                    self.session.as_ref().filter(|_| self.is_from_peer(&pdu)),
+                    self.config.robust_floor,
+                )
+            {
+                continue;
             }
             let from_peer = self.is_from_peer(&pdu);
             let connected = matches!(self.phase, Phase::Connected | Phase::Draining);
@@ -759,11 +746,7 @@ impl Link {
                 MacFrameType::ConnectReq | MacFrameType::ConnectAck | MacFrameType::ConnectCfm
             ) {
                 if let Ok(caps) = LinkCapabilities::from_bytes(&pdu.payload) {
-                    if self.config.robust_floor
-                        && caps.robust_floor
-                        && usize::from(caps.max_payload_size)
-                            <= MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE
-                    {
+                    if self.config.robust_floor && floor_policy::floor_caps_unusable(&caps) {
                         continue;
                     }
                 }
@@ -997,9 +980,10 @@ impl Link {
                 };
                 // Keep the idle reaper beyond the retry and its turnaround
                 // hold. Retry exhaustion still bounds an unanswered call.
-                handshake_timeout = handshake_timeout.max(
-                    retry_interval + stagger + self.config.turnaround + Duration::from_secs(1),
-                );
+                handshake_timeout = handshake_timeout.max(floor_policy::calling_handshake_timeout(
+                    retry_interval + stagger,
+                    self.config.turnaround,
+                ));
                 if now.saturating_duration_since(keyed) >= retry_interval + stagger {
                     self.floor.timeout(self.config.robust_floor);
                     if self.req_attempts <= self.config.connect_retries {
@@ -1206,11 +1190,7 @@ impl Link {
                     FrameKind::Data => {
                         self.data_keyed_at = Some(now);
                         if self.floor_negotiated() {
-                            let floor = FloorController::response_window(
-                                LinkPhyMode::Floor,
-                                Duration::ZERO,
-                                self.config.turnaround,
-                            ) + Duration::from_secs(1);
+                            let floor = floor_policy::floor_rto_floor(self.config.turnaround);
                             if let Some(arq) = self.arq.as_mut() {
                                 arq.tx.set_segment_floor(floor);
                             }
@@ -1241,9 +1221,8 @@ impl Link {
                 .session
                 .as_ref()
                 .and_then(|s| s.negotiated.as_ref())
-                .map_or(40, |c| usize::from(c.max_payload_size));
-            40.min(negotiated)
-                .saturating_sub(MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE)
+                .map_or(40, |c| c.max_payload_size);
+            floor_policy::floor_segment_limit(negotiated)
         } else {
             usize::MAX
         };

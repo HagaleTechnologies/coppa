@@ -131,7 +131,7 @@ can expire the scanner's six-interval PENDING hold first.
 |---|---|
 | `MYCALL <call> [<call> ...]` | `OK` for one to five valid callsigns; first identifies transmissions, all answer calls. An invalid list gets `WRONG` and keeps the previous list. |
 | `BW2300` | `OK`; accepted but does not change the configured profile. |
-| `RETRIES 20`, `RETRIES=20` | `OK`; this client's next dial keys up to 21 requests. Valid range 0-20; default 0. |
+| `RETRIES 20`, `RETRIES=20` | `OK`; this client's next dial keys up to 21 requests. Valid range 0-20. Unset: 3 additional requests in Auto (floor fallback needs at least 2), none with a pinned speed level. |
 | `LISTEN ON` | `OK`; answer incoming requests. |
 | `LISTEN OFF` | `OK`; stop listening and end a pending inbound attempt with `CANCELPENDING`. Established sessions and outbound dials continue. |
 | `CONNECT <source> <dest>` | `OK`; dial destination using the first MYCALL. |
@@ -204,7 +204,7 @@ for dead-link detection before a later connection succeeds. An idle link
 with no outstanding data may keep sending keepalives indefinitely after
 its peer dies; explicitly ABORT it before redialling. The restart lab
 interrupts an outstanding B2F write.
-RETRIES applies only to VARA-style dials; a Pat caller defaults to one request.
+A caller that never sends RETRIES (Pat, ARDOP `ARQCALL`) gets the unset default above.
 RF, Raspberry Pi, BPQ32, a physical rig and CMS forwarding remain untested.
 
 ## Troubleshooting

@@ -70,6 +70,15 @@ receiver in `coppa-protocol` (`modem/floor.rs`). The frozen parameters:
   starts on OFDM and falls back after two unanswered windows. Five newly
   acknowledged floor exchanges allow one sequence-bound OFDM level-1 probe.
   A failed probe retries the bounded segment on the floor.
-  The daemon controller and the −6 dB connection probability bar remain open.
+- COP-202 amendment: coppad reuses the same `FloorController` and the shared
+  policy helpers in `coppa_protocol::floor_controller` for its handshake; it
+  does not embed Link or keep a second controller. The floor is enabled while
+  the speed level is automatic. An unset VARA `RETRIES` means three repeats in
+  Auto. Floor request windows add one level-1 station-ID frame. The daemon
+  keeps its 30 s inbound handshake timeout, replays no lost CONNECT_CFM and
+  does not stagger discovery. Both adapters meet the −6 dB connect bar in the
+  recorded direction (`results/cop-190/connect/`). Floor-carried daemon
+  session data (segment sizing that follows the controller, the OFDM probe and
+  floor RTO floors) is not built yet; see `docs/LIMITATIONS.md`.
 - Version 2 spends one of the fourteen remaining version values; the next
   incompatible format allocates 3.

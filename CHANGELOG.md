@@ -21,7 +21,19 @@ Older releases have no entry here. Their on-air breaks are listed in
   after five distinct acknowledged floor exchanges. Set
   `LinkConfig.robust_floor = false` for the previous OFDM-only behavior.
 - Expose the last transmitted and validated received modes through
-  `Link::phy_mode()`. The daemon and host mode reporting remain open.
+  `Link::phy_mode()`. Host mode reporting remains open.
+- coppad negotiates the low-rate floor for its handshake (COP-202). In Auto it
+  advertises bit 6, sends a floor CONNECT_REQ after two unanswered OFDM
+  windows and answers in the received waveform, so two daemons connect at
+  −6 dB AWGN (10/10 recorded). It reuses the library's `FloorController`.
+  Session data after a floor handshake still keys on OFDM.
+- An unset VARA `RETRIES` now means 3 additional connect requests while the
+  speed level is automatic (none with a pinned level). An explicit
+  `RETRIES n` is honoured exactly.
+- **Rust API, additive:** `FloorController::floor_active` and the shared
+  floor policy functions `admits_floor_pdu`, `floor_caps_unusable`,
+  `floor_segment_limit`, `floor_rto_floor`, `floor_keepalive_interval` and
+  `calling_handshake_timeout` in `coppa_protocol::floor_controller`.
 - Allocate capability flags byte bit 6 without changing legacy bytes or
   capability length.
 - **Crate version:** 0.16.0. Minor bump over 0.15.0 because
@@ -31,8 +43,9 @@ Older releases have no entry here. Their on-air breaks are listed in
 - **Air-protocol version:** unchanged (1, plus 2 for the floor from 0.14.0). In version 1,
   CONNECT capability flags bit 6 is now named `robust_floor` (SPEC §20.1). It is negotiated
   as an AND and CONNECT_CFM must carry exactly the AND
-  (`ProtocolError::RobustFloorMismatch`). The library Link sets it by default; coppad does
-  not set it.
+  (`ProtocolError::RobustFloorMismatch`). The library Link sets it by default; coppad sets
+  it while its speed level is automatic (flags `0x46`, `0x56` with the WebSocket API on,
+  `0x42` with `fade_protection = "off"`).
 - **Host-API version:** 1, unchanged.
 - **C ABI version:** unchanged.
 
