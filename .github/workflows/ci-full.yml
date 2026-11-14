@@ -224,7 +224,11 @@ jobs:
         with:
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - name: Install ALSA and libudev dev headers (for cpal and serialport)
+      # libudev-dev is for the baseline, not HEAD: semver-checks builds rustdoc
+      # for the merge base with each crate's features, and a base from before
+      # COP-47 still has serialport pulling in libudev-sys (coppa-radio's
+      # serial-ptt). Drop it once no open PR can have a pre-COP-47 merge base.
+      - name: Install ALSA and libudev dev headers (cpal; pre-COP-47 baselines)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       - name: Install cargo-semver-checks 0.51.0 (pinned and checksum-verified)
         run: |

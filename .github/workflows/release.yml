@@ -1,0 +1,463 @@
+name: Release
+
+# COP-47: prebuilt coppa and coppad for five targets.
+#
+# - A v0.MINOR.PATCH tag on main builds, smoke-tests and publishes a GitHub
+#   Release (five archives, SHA256SUMS, build-provenance attestations).
+# - A pull request that touches the release machinery, and a manual
+#   workflow_dispatch run, build and smoke-test the same bytes and publish
+#   nothing.
+#
+# Runbook: docs/RELEASING.md. Decisions:
+# docs/DECISIONS/2026-11-09-release-binaries-and-versioning.md.
+#
+# Hardening: every action is pinned by SHA and every downloaded tool or
+# package by sha256; no build cache feeds release bytes; values reach `run:`
+# steps only through `env:`; only `publish` can write, and it re-checks the
+# tag. GitHub runs the release.yml stored in the tagged commit, so a tag
+# ruleset on v* is the real control over who can publish (docs/RELEASING.md).
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/release.yml'
+      - 'tools/release/**'
+      - 'about.toml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.98.0"
+  # One feature list for every OS, package-qualified (decision D4). A unit
+  # test in tools/release/test_release.py fails when coppad gains a feature
+  # that is neither listed here nor excluded on purpose.
+  RELEASE_FEATURES: coppa-cli/cpal-backend,coppa-cli/kiss-tnc,coppa-daemon/cpal-backend,coppa-daemon/websocket,coppa-daemon/serial-ptt,coppa-daemon/gpio-ptt,coppa-daemon/kiss-tnc,coppa-daemon/ardop,coppa-daemon/mdns
+
+jobs:
+  verify:
+    name: Verify version and tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+      first: ${{ steps.version.outputs.first }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Release tooling tests
+        run: python3 -m unittest discover -s tools/release -v
+      - name: Version, tag and main checks
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = push ] && [ "$REF_TYPE" = tag ]; then
+            # fetch-depth 0 fetched origin/main; release.py exits 2 ("cannot
+            # judge") if it is missing, so this fails closed.
+            version=$(python3 tools/release/release.py version --tag "$TAG" --require-on-main origin/main)
+            # A read-only token sees published releases only. Any gh error
+            # other than "release not found" stops the run (fail closed).
+            if gh release view "$TAG" --json isDraft --jq .isDraft > "$RUNNER_TEMP/view.out" 2> "$RUNNER_TEMP/view.err"; then
+              echo "::error::release $TAG already exists ($(cat "$RUNNER_TEMP/view.out")); cut a new version instead"
+              exit 1
+            elif ! grep -q 'release not found' "$RUNNER_TEMP/view.err"; then
+              cat "$RUNNER_TEMP/view.err"
+              echo "::error::could not check whether release $TAG exists"
+              exit 1
+            fi
+            publish=true
+            # "First" means no published release yet, not "no other tag": a
+            # tag whose run failed must not switch on generated notes, which
+            # would then list every merged PR.
+            published=$(gh release list --exclude-drafts --limit 1 --json tagName --jq length)
+            if [ "$published" = 0 ]; then
+              first=true
+            else
+              first=false
+            fi
+          else
+            version=$(python3 tools/release/release.py version)
+            publish=false
+            first=false
+          fi
+          echo "version $version, publish $publish, first release $first"
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "first=$first"
+          } >> "$GITHUB_OUTPUT"
+
+  notices:
+    name: Third-party licence notices
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install cargo-about 0.9.3 (pinned and checksum-verified)
+        env:
+          ABOUT_URL: https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.3/cargo-about-0.9.3-x86_64-unknown-linux-musl.tar.gz
+          ABOUT_SHA256: 3ad1e94ea1e63d69d1961f4fb15ccbbe9575d906111f96d2cb4dce6df48f71b4
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$RUNNER_TEMP/cargo-about.tar.gz" "$ABOUT_URL"
+          echo "$ABOUT_SHA256  $RUNNER_TEMP/cargo-about.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/cargo-about.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/cargo-about-0.9.3-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+      - name: Generate THIRD-PARTY-LICENSES.txt
+        run: |
+          set -euo pipefail
+          mkdir -p notices
+          cargo-about generate --config about.toml --workspace --all-features --locked --fail \
+            -o notices/THIRD-PARTY-LICENSES.txt tools/release/about.hbs
+          # The template must not HTML-escape licence text.
+          if grep -q '&#x' notices/THIRD-PARTY-LICENSES.txt; then
+            echo "::error::THIRD-PARTY-LICENSES.txt contains HTML entities; use {{{text}}} in about.hbs"
+            exit 1
+          fi
+          grep -q '^  - serialport ' notices/THIRD-PARTY-LICENSES.txt
+          wc -c notices/THIRD-PARTY-LICENSES.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: notices
+          path: notices/THIRD-PARTY-LICENSES.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: Build ${{ matrix.target }}
+    needs: [verify, notices]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            deb_arch: amd64
+            triplet: x86_64-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            deb_arch: arm64
+            triplet: aarch64-linux-gnu
+          - target: armv7-unknown-linux-gnueabihf
+            deb_arch: armhf
+            triplet: arm-linux-gnueabihf
+    env:
+      TARGET: ${{ matrix.target }}
+      DEB_ARCH: ${{ matrix.deb_arch }}
+      TRIPLET: ${{ matrix.triplet }}
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - name: Install zig and cargo-zigbuild (pinned and checksum-verified)
+        run: tools/release/install-zigbuild.sh "$RUNNER_TEMP/zigbuild" >> "$GITHUB_PATH"
+      - name: Debian 11 ALSA link sysroot
+        run: tools/release/debian-sysroot.sh "$DEB_ARCH" "$RUNNER_TEMP/sysroot"
+      - name: Build coppa and coppad (glibc 2.31 floor)
+        run: |
+          set -euo pipefail
+          export PKG_CONFIG_ALLOW_CROSS=1
+          export PKG_CONFIG_SYSROOT_DIR="$RUNNER_TEMP/sysroot"
+          export PKG_CONFIG_LIBDIR="$RUNNER_TEMP/sysroot/usr/lib/$TRIPLET/pkgconfig"
+          export PKG_CONFIG_PATH=
+          export COPPA_GIT_SHA="${GITHUB_SHA:0:12}"
+          cargo zigbuild --locked --release --target "$TARGET.2.31" \
+            -p coppa-cli -p coppa-daemon --features "$RELEASE_FEATURES"
+      - name: Inspect the binaries (architecture, glibc floor, linked libraries)
+        run: tools/release/smoke-linux.sh inspect "$TARGET" "target/$TARGET/release"
+      - name: Install qemu-user-static
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - name: Debian 11 runtime root (glibc 2.31, ALSA 1.2.4)
+        run: tools/release/debian-sysroot.sh "$DEB_ARCH" "$RUNNER_TEMP/runtime" --runtime
+      - name: Run the binaries on Debian 11's glibc and ALSA
+        run: tools/release/smoke-linux.sh run "$TARGET" "target/$TARGET/release" "$RUNNER_TEMP/runtime" "$VERSION"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notices
+          path: notices
+      - name: Package
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          python3 tools/release/release.py package --version "$VERSION" --target "$TARGET" \
+            --bin-dir "target/$TARGET/release" --notices notices/THIRD-PARTY-LICENSES.txt --out dist
+          tar -tzvf "dist/$(python3 tools/release/release.py asset-name --version "$VERSION" --target "$TARGET")"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: Build x86_64-pc-windows-msvc
+    needs: [verify, notices]
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      VERSION: ${{ needs.verify.outputs.version }}
+      # Static CRT: no Visual C++ redistributable needed (decision D11). The
+      # target-scoped variable leaves build scripts alone.
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-pc-windows-msvc
+          components: llvm-tools
+      - name: Build coppa and coppad
+        run: |
+          set -euo pipefail
+          export COPPA_GIT_SHA="${GITHUB_SHA:0:12}"
+          cargo build --locked --release --target "$TARGET" -p coppa-cli -p coppa-daemon --features "$RELEASE_FEATURES"
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          bin="$PWD/target/$TARGET/release"
+          out=$("$bin/coppa.exe" --version | tr -d '\r')
+          echo "$out"
+          [ "$(sed -n 1p <<<"$out")" = "coppa $VERSION" ]
+          [ "$(sed -n 3p <<<"$out")" = "features: cpal-backend,file-backend,kiss-tnc" ]
+          tmp=$(mktemp -d)
+          (cd "$tmp" && "$bin/coppa.exe" loopback "Hello from Coppa" 2>&1) | tee "$tmp/loopback.txt"
+          grep -qF 'PASS: Loopback test successful!' "$tmp/loopback.txt"
+          "$bin/coppad.exe" --version | tr -d '\r' | grep -x "coppad $VERSION"
+      - name: No Visual C++ runtime imports
+        run: |
+          set -euo pipefail
+          sysroot=$(rustc --print sysroot)
+          readobj=$(find "$sysroot" -name 'llvm-readobj.exe' | head -n 1)
+          [ -n "$readobj" ] || { echo "::error::llvm-readobj not found under $sysroot"; exit 1; }
+          for exe in coppa.exe coppad.exe; do
+            imports=$("$readobj" --coff-imports "target/$TARGET/release/$exe" | grep -i 'Name: .*\.dll' | tr -d '\r')
+            echo "$exe imports:"; echo "$imports"
+            if grep -qiE 'vcruntime|api-ms-win-crt-|msvcp' <<<"$imports"; then
+              echo "::error::$exe imports the Visual C++ runtime; build with +crt-static"
+              exit 1
+            fi
+          done
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notices
+          path: notices
+      - name: Package
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          python tools/release/release.py package --version "$VERSION" --target "$TARGET" \
+            --bin-dir "target/$TARGET/release" --notices notices/THIRD-PARTY-LICENSES.txt --out dist
+          python -m zipfile -l "dist/$(python tools/release/release.py asset-name --version "$VERSION" --target "$TARGET")"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-x86_64-pc-windows-msvc
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: Build universal-apple-darwin
+    needs: [verify, notices]
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      TARGET: universal-apple-darwin
+      VERSION: ${{ needs.verify.outputs.version }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build both Apple targets
+        run: |
+          set -euo pipefail
+          export COPPA_GIT_SHA="${GITHUB_SHA:0:12}"
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --locked --release --target "$t" -p coppa-cli -p coppa-daemon --features "$RELEASE_FEATURES"
+          done
+      - name: Merge into universal binaries and sign ad hoc
+        run: |
+          set -euo pipefail
+          out="target/$TARGET/release"
+          mkdir -p "$out"
+          for b in coppa coppad; do
+            lipo -create -output "$out/$b" "target/aarch64-apple-darwin/release/$b" "target/x86_64-apple-darwin/release/$b"
+            codesign --force --sign - "$out/$b"
+          done
+      - name: Check architectures, deployment target and signature
+        run: |
+          set -euo pipefail
+          out="target/$TARGET/release"
+          for b in coppa coppad; do
+            archs=$(lipo -archs "$out/$b")
+            echo "$b: $archs"
+            sorted=$(tr ' ' '\n' <<<"$archs" | sort | xargs)
+            [ "$sorted" = "arm64 x86_64" ] || { echo "::error::$b architectures are '$archs'"; exit 1; }
+            for a in arm64 x86_64; do
+              minos=$(vtool -arch "$a" -show-build "$out/$b" | awk '/minos/ {print $2}')
+              echo "$b $a minos $minos"
+              [ "$minos" = "11.0" ] || { echo "::error::$b ($a) minos is '$minos', expected 11.0"; exit 1; }
+            done
+            codesign --verify --strict --verbose=2 "$out/$b"
+          done
+      - name: Smoke test (arm64, and x86_64 under Rosetta if present)
+        run: |
+          set -euo pipefail
+          bin="$PWD/target/$TARGET/release"
+          smoke() {
+            local arch=$1 out tmp
+            out=$(arch "-$arch" "$bin/coppa" --version)
+            echo "$out"
+            [ "$(sed -n 1p <<<"$out")" = "coppa $VERSION" ]
+            [ "$(sed -n 3p <<<"$out")" = "features: cpal-backend,file-backend,kiss-tnc" ]
+            tmp=$(mktemp -d)
+            (cd "$tmp" && arch "-$arch" "$bin/coppa" loopback "Hello from Coppa" 2>&1) | tee "$tmp/loopback.txt"
+            grep -qF 'PASS: Loopback test successful!' "$tmp/loopback.txt"
+            arch "-$arch" "$bin/coppad" --version | grep -x "coppad $VERSION"
+            : > "$tmp/empty.toml"
+            # macOS has no timeout(1): give the daemon 10 s, then stop it.
+            NO_COLOR=1 arch "-$arch" "$bin/coppad" "$tmp/empty.toml" > "$tmp/coppad.log" 2>&1 &
+            pid=$!
+            sleep 10
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            head -n 1 "$tmp/coppad.log"
+            head -n 1 "$tmp/coppad.log" | grep -qF "version=\"$VERSION\""
+            head -n 1 "$tmp/coppad.log" | grep -qF 'features=ardop,cpal-backend,gpio-ptt,kiss-tnc,mdns,serial-ptt,websocket'
+          }
+          smoke arm64
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            smoke x86_64
+          else
+            echo "::notice::Rosetta is not installed on this runner; the x86_64 slice was built and inspected but not run"
+          fi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notices
+          path: notices
+      - name: Package
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          python3 tools/release/release.py package --version "$VERSION" --target "$TARGET" \
+            --bin-dir "target/$TARGET/release" --notices notices/THIRD-PARTY-LICENSES.txt --out dist
+          tar -tzvf "dist/$(python3 tools/release/release.py asset-name --version "$VERSION" --target "$TARGET")"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-universal-apple-darwin
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish the GitHub Release
+    needs: [verify, linux, windows, macos]
+    if: needs.verify.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.verify.outputs.version }}
+      FIRST: ${{ needs.verify.outputs.first }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # checkout v7 errors if the tag moved since the run started.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Re-check the tag
+        run: |
+          set -euo pipefail
+          checked=$(python3 tools/release/release.py version --tag "$TAG" --require-on-main origin/main)
+          [ "$checked" = "$VERSION" ] || { echo "::error::version $checked does not match verify's $VERSION"; exit 1; }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Exactly the five archives
+        run: |
+          set -euo pipefail
+          expected=$(for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf x86_64-pc-windows-msvc universal-apple-darwin; do
+            python3 tools/release/release.py asset-name --version "$VERSION" --target "$t"
+          done | sort)
+          actual=$(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::dist/ does not hold exactly the five release archives"
+            diff <(echo "$expected") <(echo "$actual") || true
+            exit 1
+          fi
+          python3 tools/release/release.py sums dist
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: 'dist/coppa-*'
+      - name: Create the draft release, then publish it
+        run: |
+          set -euo pipefail
+          generate=(--generate-notes)
+          if [ "$FIRST" = true ]; then
+            python3 tools/release/release.py notes --version "$VERSION" --first > "$RUNNER_TEMP/notes.md"
+            # With no earlier tag, generated notes would list every merged PR.
+            generate=()
+          else
+            python3 tools/release/release.py notes --version "$VERSION" > "$RUNNER_TEMP/notes.md"
+          fi
+          gh release create "$TAG" dist/* --draft --verify-tag --title "coppa $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" "${generate[@]}"
+          # Latest only when this is the highest v* tag, so a late patch
+          # release on an older line does not displace a newer one.
+          highest=$(git tag --list 'v[0-9]*' | sort -V | tail -n 1)
+          if [ "$highest" = "$TAG" ]; then latest=--latest; else latest=--latest=false; fi
+          gh release edit "$TAG" --draft=false "$latest"
+          gh release view "$TAG"
