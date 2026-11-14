@@ -26813,6 +26813,16 @@ mod tests {
 
         impl FloorStation {
             fn new(callsign: &str, seed: u64, direction: u8, reference_power: f32) -> Self {
+                Self::with_snr(callsign, seed, direction, reference_power, SNR_DB)
+            }
+
+            fn with_snr(
+                callsign: &str,
+                seed: u64,
+                direction: u8,
+                reference_power: f32,
+                snr_db: f32,
+            ) -> Self {
                 let mut config = DaemonConfig::default();
                 config.engine.callsign = callsign.to_string();
                 config.radio.ptt_pre_delay_ms = 0;
@@ -26826,7 +26836,7 @@ mod tests {
                 let channel = PersistentChannel::new(
                     SAMPLE_RATE,
                     None,
-                    Some(SnrProfile::constant(SNR_DB)),
+                    Some(SnrProfile::constant(snr_db)),
                     reference_power,
                     seed,
                     direction,
@@ -26945,6 +26955,66 @@ mod tests {
             (heard_by_b, heard_by_a)
         }
 
+        /// The production `run` loop's poll cadence on the virtual clock.
+        struct PairClock {
+            start: tokio::time::Instant,
+            next_fast_poll: Duration,
+            next_slow_poll: Duration,
+        }
+
+        impl PairClock {
+            fn new(start: tokio::time::Instant) -> Self {
+                Self {
+                    start,
+                    next_fast_poll: Duration::from_millis(500),
+                    next_slow_poll: Duration::from_secs(5),
+                }
+            }
+        }
+
+        /// One 20 ms block of a paired run, before virtual time advances:
+        /// the production `run` select arms on their own cadence, queued
+        /// self-events, then both stations' decode paths (which may key a
+        /// reply) and one block of played audio through each channel.
+        async fn step_pair(
+            a: &mut FloorStation,
+            b: &mut FloorStation,
+            clock: &mut PairClock,
+            tx_a: &mut [f32],
+            tx_b: &mut [f32],
+            muted: bool,
+        ) {
+            if clock.start.elapsed() >= clock.next_fast_poll {
+                for station in [&mut a.station, &mut b.station] {
+                    station.enforce_ptt_backstop().await;
+                    station.check_arq_retransmits().await;
+                    station.repeat_pending_dial().await;
+                    station.check_session_retransmits().await;
+                    station.retry_held_tx_drain().await;
+                    station.finish_drained_disconnect().await;
+                }
+                clock.next_fast_poll += Duration::from_millis(500);
+            }
+            if clock.start.elapsed() >= clock.next_slow_poll {
+                for station in [&mut a.station, &mut b.station] {
+                    station.reap_timed_out_sessions().await;
+                    station.send_due_keepalives().await;
+                }
+                clock.next_slow_poll += Duration::from_secs(5);
+            }
+            a.dispatch_pending().await;
+            b.dispatch_pending().await;
+            // Both stations run one block on the common sample clock: the
+            // production decode path first (it may key a reply), then this
+            // tick's played audio leaves the speaker ring, through the
+            // station's transmit channel, and into the peer's mic ring.
+            a.station.poll_audio_input().await;
+            b.station.poll_audio_input().await;
+            a.station.flush_pending_audio_out();
+            b.station.flush_pending_audio_out();
+            move_block(a, b, tx_a, tx_b, muted);
+        }
+
         /// Run one trial: fresh stations and channels per trial, persistent
         /// state throughout, the deadline starting at the initial connect
         /// request, audio drained at playback rate (the 960 samples each
@@ -26972,39 +27042,9 @@ mod tests {
             let mut tx_b = vec![0.0f32; BLOCK];
             let mut samples = 0usize;
             let mut connected_at: Option<usize> = None;
-            let mut next_fast_poll = Duration::from_millis(500);
-            let mut next_slow_poll = Duration::from_secs(5);
+            let mut clock = PairClock::new(start);
             while samples < deadline_samples {
-                // The production `run` select arms, on their own cadence.
-                if start.elapsed() >= next_fast_poll {
-                    for station in [&mut a.station, &mut b.station] {
-                        station.enforce_ptt_backstop().await;
-                        station.check_arq_retransmits().await;
-                        station.repeat_pending_dial().await;
-                        station.check_session_retransmits().await;
-                        station.retry_held_tx_drain().await;
-                        station.finish_drained_disconnect().await;
-                    }
-                    next_fast_poll += Duration::from_millis(500);
-                }
-                if start.elapsed() >= next_slow_poll {
-                    for station in [&mut a.station, &mut b.station] {
-                        station.reap_timed_out_sessions().await;
-                        station.send_due_keepalives().await;
-                    }
-                    next_slow_poll += Duration::from_secs(5);
-                }
-                a.dispatch_pending().await;
-                b.dispatch_pending().await;
-                // Both stations run one block on the common sample clock: the
-                // production decode path first (it may key a reply), then this
-                // tick's played audio leaves the speaker ring, through the
-                // station's transmit channel, and into the peer's mic ring.
-                a.station.poll_audio_input().await;
-                b.station.poll_audio_input().await;
-                a.station.flush_pending_audio_out();
-                b.station.flush_pending_audio_out();
-                move_block(&mut a, &mut b, &mut tx_a, &mut tx_b, muted);
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, muted).await;
                 samples += BLOCK;
                 if both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC") {
                     connected_at = Some(samples);
@@ -27382,6 +27422,71 @@ mod tests {
                 vec![LinkPhyMode::Ofdm { level: 2 }]
             );
             assert!(a.station.pending_dial.is_none());
+        }
+
+        /// COP-202 AC6: a floor-enabled daemon (Auto) and a pinned,
+        /// floor-disabled daemon connect on OFDM over a clean channel,
+        /// negotiate `robust_floor = false` at both ends, key no floor frame
+        /// and deliver data on OFDM.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_v1_peer_stays_ofdm() {
+            let reference_power = floor_reference_power();
+            let mut a = FloorStation::with_snr("VK3ABC", SEED_BASE, 0, reference_power, 60.0);
+            let mut b = FloorStation::with_snr("W1AW", SEED_BASE, 1, reference_power, 60.0);
+            b.station
+                .handle_host_event(HostEvent::SetSpeedLevel {
+                    client_id: 1,
+                    level: Some(2),
+                })
+                .await;
+            assert!(a.station.floor_enabled() && !b.station.floor_enabled());
+            dial(&mut a.station).await;
+            let start = tokio::time::Instant::now();
+            let mut clock = PairClock::new(start);
+            let (mut tx_a, mut tx_b) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+            let mut connected = false;
+            let mut floor_keyed = false;
+            let (data_tx, mut data_rx) = mpsc::unbounded_channel();
+            let mut delivered = Vec::new();
+            let payload: Vec<u8> = (0..50).collect();
+            while start.elapsed() < Duration::from_secs(40) {
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, false).await;
+                for station in [&a.station, &b.station] {
+                    floor_keyed |= station.phy_tx == Some(LinkPhyMode::Floor);
+                }
+                if !connected && both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC") {
+                    connected = true;
+                    b.station.set_response_tx(data_tx.clone());
+                    a.station
+                        .handle_host_event(HostEvent::DataReceived {
+                            client_id: 1,
+                            data: payload.clone(),
+                        })
+                        .await;
+                }
+                while let Ok(response) = data_rx.try_recv() {
+                    if let HostResponse::DataOut { data, .. } = response {
+                        delivered.extend(data);
+                    }
+                }
+                if delivered.len() >= payload.len() {
+                    break;
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            assert!(connected, "the OFDM handshake completes on a clean channel");
+            assert!(!floor_keyed, "neither station keys a floor frame");
+            for station in [&a.station, &b.station] {
+                let negotiated = station
+                    .session_mgr
+                    .active_sessions()
+                    .into_iter()
+                    .find_map(|id| station.session_mgr.get(id)?.negotiated.clone())
+                    .expect("negotiated caps");
+                assert!(!negotiated.robust_floor);
+            }
+            assert_eq!(delivered, payload, "delivered once, in order");
         }
     }
 }
