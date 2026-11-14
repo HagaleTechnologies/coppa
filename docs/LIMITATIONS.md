@@ -407,7 +407,7 @@ update. The re-measure and redesign of this bar is tracked as COP-183, the succe
 - The 16-FSK design now exists twice: COP-190 moved it into the production
   crates, while the measurement-only bench copy (`floor_candidate.rs`)
   retains its historical measurements. Link uses the production floor for
-  negotiated sessions; the daemon controller still uses OFDM. The design's
+  negotiated sessions; coppad uses it for floor handshakes (COP-202). The design's
   development Poor sweep, measured on the frozen bench copy, fails the conservative sync-share clause:
   header sync dominates near the crossing. Production development sweeps
   also fail sync share, at −12 dB AWGN and −8/−6 dB Poor for both paths.
