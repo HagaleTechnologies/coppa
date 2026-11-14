@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "coppa"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "coppa-audio",
  "coppa-bench",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-audio"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "coppa-dsp",
@@ -487,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-bench"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-channel"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "approx",
  "coppa-dsp",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-cli"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-codec"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "approx",
  "coppa-channel",
@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-daemon"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-dsp"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "approx",
  "num-complex",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-engine"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "approx",
  "coppa-channel",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-ffi"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "cbindgen",
  "coppa-engine",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-host"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "base64",
  "coppa-engine",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-ml"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "num-complex",
  "rustfft",
@@ -639,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-protocol"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "approx",
  "coppa-bench",
@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-radio"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "gpiocdev",

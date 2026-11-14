@@ -135,9 +135,8 @@ pub struct CoppaCore {
     streaming: StreamingReceiver,
     /// Separately detected low-rate floor receive path (air-protocol
     /// version 2, COP-190/ADR-014), constructed alongside the OFDM paths.
-    /// The session controller does not switch onto it yet; it is the
-    /// engine's floor codec and detector for callers that ask for them
-    /// explicitly.
+    /// Link feeds this detector alongside OFDM and selects the codec through
+    /// negotiated floor policy. Direct callers may also use it explicitly.
     floor: FloorFrame,
     /// Continuous floor detector over [`Self::push_floor_samples`].
     floor_stream: FloorStream,
@@ -196,8 +195,8 @@ impl CoppaCore {
 
     /// The engine's separately detected low-rate floor codec
     /// (air-protocol version 2, COP-190). Encode and receive floor frames
-    /// through it directly; the OFDM paths are untouched by it, and the
-    /// session controller does not switch onto it yet.
+    /// through it directly. Link selects it for negotiated floor sessions;
+    /// the daemon session controller still uses OFDM.
     #[must_use]
     pub fn floor(&self) -> &FloorFrame {
         &self.floor

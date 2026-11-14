@@ -4,6 +4,9 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProtocolError {
+    /// CONNECT_CFM disagrees with mutual floor support.
+    #[error("robust floor capability mismatch")]
+    RobustFloorMismatch,
     /// Invalid outer-code packet header or length.
     #[error("Malformed outer-code packet")]
     MalformedOuterPacket,
