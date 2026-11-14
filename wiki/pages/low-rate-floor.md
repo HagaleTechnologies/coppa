@@ -13,7 +13,7 @@ sources:
   - crates/coppa-daemon/src/event_loop.rs
   - crates/coppa-protocol/src/floor_controller.rs
 verified:
-  commit: 5337f1c318eec759f3b432b50ccf88b6494f5468
+  commit: 032a8752b64a475a863738c734b6be66d6576330
   date: 2026-11-14
 links:
   - coppa-protocol
@@ -24,9 +24,9 @@ links:
 COP-187's batch header repair reduces experimental candidate errors on paired
 development seeds. COP-190 then moved the measured 16-FSK design into the
 production crates as air-protocol version 2. The library Link now uses it
-for negotiated sessions, and coppad uses it for floor handshakes through the
-same shared `FloorController` (COP-202); both meet the -6 dB connect bar in
-the recorded direction, while daemon session data stays on OFDM. The
+for negotiated sessions, and coppad uses it for floor handshakes and floor
+session data through the same shared `FloorController` (COP-202); both meet
+the -6 dB connect bar in the recorded direction. The
 remaining Poor failures on the frozen bench copy still violate the separate
 acquisition bar, despite a favorable FER crossing. See
 [measurements](../../BENCHMARKS.md#cop-187-experimental-header-repair)

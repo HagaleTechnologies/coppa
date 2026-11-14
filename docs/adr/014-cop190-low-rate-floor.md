@@ -77,8 +77,11 @@ receiver in `coppa-protocol` (`modem/floor.rs`). The frozen parameters:
   Auto. Floor request windows add one level-1 station-ID frame. The daemon
   keeps its 30 s inbound handshake timeout, replays no lost CONNECT_CFM and
   does not stagger discovery. Both adapters meet the −6 dB connect bar in the
-  recorded direction (`results/cop-190/connect/`). Floor-carried daemon
-  session data (segment sizing that follows the controller, the OFDM probe and
-  floor RTO floors) is not built yet; see `docs/LIMITATIONS.md`.
+  recorded direction (`results/cop-190/connect/`). A floor-negotiated daemon
+  session carries data on the floor: segments are floor-sized only while the
+  controller is on the floor or probing, so good-channel frames keep their
+  multi-codeword size, and a session established on OFDM keeps the OFDM fade
+  hold rather than moving to the floor mid-session; see
+  `docs/LIMITATIONS.md`.
 - Version 2 spends one of the fourteen remaining version values; the next
   incompatible format allocates 3.

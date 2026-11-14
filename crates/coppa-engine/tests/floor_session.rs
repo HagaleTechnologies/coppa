@@ -227,11 +227,10 @@ fn run_link_trials() -> Vec<TrialOutcome> {
 /// least nine of the ten fixed-seed trials.
 ///
 /// Ignored because a full ten-trial release run is expensive; run
-/// explicitly per `results/cop-190/connect/metadata.md`. While COP-195's
-/// floor session controller is not incorporated, the trials are expected
-/// to fail the nine-of-ten bar; that measured outcome is the recorded
-/// evidence for the missing controller, not a reason to change seeds,
-/// thresholds, gains or deadlines.
+/// explicitly per `results/cop-190/connect/metadata.md`. Link runs
+/// COP-195's floor session controller, so the trials measure it. A missed
+/// bar is a reason to investigate timing, not to change seeds, thresholds,
+/// gains or deadlines.
 #[test]
 #[ignore = "expensive release measurement; see results/cop-190/connect/metadata.md"]
 fn floor_link_connect_minus6() {

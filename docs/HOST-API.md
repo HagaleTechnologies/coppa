@@ -72,7 +72,7 @@ Then send a few commands. The `sleep`s give coppad time to answer each one:
 
 ```text
 $ { echo VERSION; sleep 1; echo "MYCALL N1CALL"; sleep 1; echo "LISTEN ON"; sleep 1;
-    echo FOOBAR; sleep 1; echo "CONNECT N1CALL N0CALL"; sleep 35; } \
+    echo FOOBAR; sleep 1; echo "CONNECT N1CALL N0CALL"; sleep 75; } \
     | nc -q 1 127.0.0.1 8300 | tr '\r' '\n'
 VERSION Coppa 0.16.0
 VERSION Coppa 0.16.0
@@ -82,6 +82,12 @@ WRONG
 OK
 PTT ON
 PTT OFF
+PTT ON
+PTT OFF
+PTT ON
+PTT OFF
+PTT ON
+PTT OFF
 DISCONNECTED
 ```
 
@@ -89,8 +95,11 @@ DISCONNECTED
   `VERSION`.
 - `OK` answers `MYCALL N1CALL` and `LISTEN ON`. `WRONG` answers `FOOBAR`, which coppad does not
   know. `OK` answers `CONNECT`.
-- `PTT ON` and `PTT OFF` bracket the connect request coppad keys. `DISCONNECTED` arrives about
-  30 s later because no station answered.
+- Each `PTT ON` and `PTT OFF` pair brackets one connect request. With `RETRIES` unset and an
+  automatic speed level, coppad keys four: two on OFDM, then two on the low-rate floor.
+  `DISCONNECTED` arrives about 30 s after the last one, about 60-70 s after the first, because
+  no station answered. With `RETRIES 0` or a pinned speed level coppad keys one request and
+  `DISCONNECTED` arrives about 30 s later.
 - `tr '\r' '\n'` is there because coppad ends every line it sends with a bare `\r`. Without it a
   terminal draws each reply over the last one.
 - `-q 1` is the flag of the OpenBSD netcat that Debian, Ubuntu and Raspberry Pi OS install. The
@@ -210,7 +219,9 @@ unavailable", not as a version. The WebSocket `hello` carries the same three fie
   for that client (the next change sends a fresh value). At 1024 it closes the connection
   ([OPERATING.md](OPERATING.md#host-clients-that-stop-reading)). Every other line reaches a
   client or ends its connection.
-- An unanswered `CONNECT` ends in `DISCONNECTED` about 30 s after the connect request is keyed.
+- An unanswered `CONNECT` ends in `DISCONNECTED` about 30 s after the last connect request is
+  keyed. With `RETRIES` unset and an automatic speed level a dial keys four requests, so that is
+  about 60-70 s after the first.
 - On the listening side, `PENDING` arrives first and `CONNECTED` a second or two after the
   dialler's `CONNECTED`. Do not expect `CONNECTED` first.
 

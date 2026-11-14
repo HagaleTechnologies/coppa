@@ -22,11 +22,13 @@ Older releases have no entry here. Their on-air breaks are listed in
   `LinkConfig.robust_floor = false` for the previous OFDM-only behavior.
 - Expose the last transmitted and validated received modes through
   `Link::phy_mode()`. Host mode reporting remains open.
-- coppad negotiates the low-rate floor for its handshake (COP-202). In Auto it
+- coppad negotiates the low-rate floor for its sessions (COP-202). In Auto it
   advertises bit 6, sends a floor CONNECT_REQ after two unanswered OFDM
   windows and answers in the received waveform, so two daemons connect at
   −6 dB AWGN (10/10 recorded). It reuses the library's `FloorController`.
-  Session data after a floor handshake still keys on OFDM.
+  A session established on the floor sends floor-sized data segments on it,
+  probes OFDM level 1 after five acknowledged floor segments, and keys its
+  ACKs, keepalives and DISCONNECT through the same controller.
 - An unset VARA `RETRIES` now means 3 additional connect requests while the
   speed level is automatic (none with a pinned level). An explicit
   `RETRIES n` is honoured exactly.

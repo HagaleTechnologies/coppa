@@ -2630,14 +2630,19 @@ impl EventLoop {
                 .map(|s| s.needs_keepalive(now))
                 .unwrap_or(false);
             if needs {
-                if let Some(session) = self.session_mgr.get_mut(id) {
-                    if let Ok(ka_pdu) = session.keepalive(now) {
-                        let ka_bytes = ka_pdu.to_bytes();
-                        if let Ok(samples) = self.engine.encode_bytes(&ka_bytes) {
-                            // COP-46: `tools/pat-loop` counts these.
-                            tracing::info!(session = id, "Sending session KEEPALIVE");
-                            self.transmit_samples(&samples).await;
-                        }
+                let ka_bytes = self
+                    .session_mgr
+                    .get_mut(id)
+                    .and_then(|session| session.keepalive(now).ok())
+                    .map(|ka_pdu| ka_pdu.to_bytes());
+                // COP-202: keyed in the shared controller's waveform.
+                if let Some(Ok((samples, mode))) =
+                    ka_bytes.map(|ka_bytes| self.encode_session_frame(&ka_bytes, None))
+                {
+                    // COP-46: `tools/pat-loop` counts these.
+                    tracing::info!(session = id, "Sending session KEEPALIVE");
+                    if self.transmit_samples_keyed(&samples).await > 0 {
+                        self.phy_tx = Some(mode);
                     }
                 }
             }
@@ -3108,6 +3113,9 @@ impl EventLoop {
             self.session_tx_held_by_frequency_gate = true;
             return true;
         }
+        if keyed > 0 {
+            self.phy_tx = Some(LinkPhyMode::Ofdm { level });
+        }
         if let Some(link) = self.session_link.as_mut() {
             link.tx_outer = Some(OuterTx {
                 level,
@@ -3115,7 +3123,7 @@ impl EventLoop {
             });
             link.tx_codewords = 1;
         }
-        self.set_session_segment_floor(keyed, packet_len, 1);
+        self.set_session_segment_floor(keyed, packet_len, 1, LinkPhyMode::Ofdm { level });
         if let Some(link) = self.session_link.as_mut() {
             link.stream_backlog_mut(stream).drain(..take);
             link.tx_stream = stream;
@@ -3277,7 +3285,19 @@ impl EventLoop {
         if !ready || self.session_tx_held_by_frequency_gate {
             return;
         }
-        if self.session_fade_mode() == "rs12-6" && self.try_send_outer_block().await {
+        // COP-202: bind the recovery probe to the segment about to be cut,
+        // then cut a floor-sized segment while the controller is on the
+        // floor or probing (Decision 5). Such a segment never takes the
+        // outer code: outer data only travels on OFDM.
+        if let Some(seq) = self.session_link.as_ref().map(|l| l.tx.next_seq()) {
+            self.floor.prepare_data(seq);
+        }
+        let floor_segment =
+            self.session_floor_negotiated() && self.floor.floor_active() && self.floor_enabled();
+        if !floor_segment
+            && self.session_fade_mode() == "rs12-6"
+            && self.try_send_outer_block().await
+        {
             return;
         }
         // COP-69: the per-frame codeword count, gated by the negotiated
@@ -3298,7 +3318,9 @@ impl EventLoop {
             .and_then(|id| self.session_mgr.get(id))
             .and_then(|s| s.negotiated.as_ref())
             .is_some_and(|c| c.multi_frame_ack);
-        let cap = if negotiated_multi {
+        let cap = if floor_segment {
+            1
+        } else if negotiated_multi {
             self.config
                 .session
                 .max_codewords_per_frame
@@ -3308,6 +3330,16 @@ impl EventLoop {
         };
         let cap_budget = max_multi_payload_for_level(level, cap)
             .expect("the engine's speed level is always a valid wire level");
+        // COP-202: a floor segment's raw PDU fits one floor frame and its
+        // encoded payload fits one level-1 codeword, so it can also ride the
+        // level-1 probe. The chunk is bounded by the shared segment limit.
+        let floor_budget = max_payload_for_level(1).unwrap_or(0);
+        let floor_limit = self
+            .session_link
+            .as_ref()
+            .and_then(|l| self.session_mgr.get(l.session_id))
+            .and_then(|s| s.negotiated.as_ref())
+            .map_or(0, |c| floor_policy::floor_segment_limit(c.max_payload_size));
         let (seq, take, frame, codewords, stream) = {
             let Some(link) = self.session_link.as_mut() else {
                 return;
@@ -3325,7 +3357,19 @@ impl EventLoop {
                     cap,
                 ) <= cap_budget
             };
-            let take = if cap == 1 {
+            let take = if floor_segment {
+                let fits_floor = |c: &[u8]| {
+                    let frame = session_stream_frame(link, stream, seq, c);
+                    frame.len() <= FLOOR_MAX_PAYLOAD
+                        && engine.encoded_payload_len(&frame) <= floor_budget
+                };
+                next_chunk_len(
+                    backlog,
+                    header_len,
+                    (floor_limit + header_len + 1).min(floor_budget),
+                    fits_floor,
+                )
+            } else if cap == 1 {
                 next_chunk_len(backlog, header_len, cap_budget, fits)
             } else {
                 next_growing_chunk_len(
@@ -3347,8 +3391,19 @@ impl EventLoop {
             };
             (seq, take, frame, codewords, stream)
         };
-        let samples = match self.engine.encode_bytes_with_codewords(&frame, codewords) {
-            Ok(samples) => samples,
+        // COP-202: a floor segment goes through the shared waveform choice
+        // (the floor, or the level-1 probe); every other segment keeps
+        // today's multi-codeword OFDM encode at the engine level.
+        let encoded = if floor_segment {
+            self.encode_session_frame(&frame, None)
+        } else {
+            self.engine
+                .encode_bytes_with_codewords(&frame, codewords)
+                .map(|samples| (samples, LinkPhyMode::Ofdm { level }))
+                .map_err(|e| e.to_string())
+        };
+        let (samples, mode) = match encoded {
+            Ok(encoded) => encoded,
             Err(e) => {
                 // Unreachable for a chunk sized against `cap_budget`; the bytes
                 // stay in the backlog.
@@ -3363,11 +3418,12 @@ impl EventLoop {
         let generation = self.tx_generation;
         let keyed = Box::pin(self.transmit_samples_keyed(&samples)).await;
         if keyed > 0 {
+            self.phy_tx = Some(mode);
             if let Some(link) = self.session_link.as_mut() {
                 link.tx_outer = None;
             }
         }
-        self.set_session_segment_floor(keyed, samples.len(), codewords);
+        self.set_session_segment_floor(keyed, samples.len(), codewords, mode);
         if self.tx_generation == generation {
             // The gate passed above but refused after the courtesy wait (the
             // one `transmit_samples` path that keys nothing and leaves
@@ -3426,8 +3482,28 @@ impl EventLoop {
     /// the transmission was refused and nothing changes. The full HF long-CP
     /// ACK is a conservative upper bound for the supported HF short-CP and
     /// VHF profiles too; this branch still sends full-frame ACKs.
-    fn set_session_segment_floor(&mut self, keyed: usize, frame_len: usize, codewords: u8) {
+    ///
+    /// COP-202: a floor key-up's floor is the shared floor RTO floor plus
+    /// the peer's station-ID allowance and any ID we prepended (Decision 8).
+    fn set_session_segment_floor(
+        &mut self,
+        keyed: usize,
+        frame_len: usize,
+        codewords: u8,
+        mode: LinkPhyMode,
+    ) {
         if keyed == 0 {
+            return;
+        }
+        if mode == LinkPhyMode::Floor {
+            let sr = self.engine.config().sample_rate as f64;
+            let own_id = Duration::from_secs_f64(keyed.saturating_sub(frame_len) as f64 / sr);
+            let floor = floor_policy::floor_rto_floor(self.turnaround())
+                + self.station_id_allowance()
+                + own_id;
+            if let Some(link) = self.session_link.as_mut() {
+                link.tx.set_segment_floor(floor);
+            }
             return;
         }
         if codewords <= 1 && keyed <= frame_len {
@@ -3624,6 +3700,34 @@ impl EventLoop {
         Duration::from_millis(self.config.radio.turnaround_ms)
     }
 
+    /// COP-202: whether the session link's session negotiated the floor
+    /// (capability bit 6 at both ends).
+    fn session_floor_negotiated(&self) -> bool {
+        self.session_link
+            .as_ref()
+            .and_then(|l| self.session_mgr.get(l.session_id))
+            .and_then(|s| s.negotiated.as_ref())
+            .is_some_and(|c| c.robust_floor)
+    }
+
+    /// COP-202: a session that negotiated the floor and established on it
+    /// keys its keepalives on the shared floor interval, so a keepalive
+    /// never keys across a failed probe's recovery window (as Link does). A
+    /// session established on OFDM keeps today's interval.
+    fn apply_floor_session_timers(&mut self, session_id: u8) {
+        if !self.floor.floor_active() {
+            return;
+        }
+        if let Some(session) = self.session_mgr.get_mut(session_id) {
+            if session.negotiated.as_ref().is_some_and(|c| c.robust_floor) {
+                session.keepalive_interval = floor_policy::floor_keepalive_interval(
+                    session.keepalive_interval,
+                    session.session_timeout,
+                );
+            }
+        }
+    }
+
     /// COP-202 Decision 8: airtime of the level-1 station-ID frame a peer
     /// may prepend to its reply, while automatic ID is on.
     fn station_id_allowance(&self) -> Duration {
@@ -3658,7 +3762,14 @@ impl EventLoop {
             LinkPhyMode::Floor if bytes.len() > FLOOR_MAX_PAYLOAD => LinkPhyMode::Ofdm { level },
             other => other,
         };
-        let samples = match mode {
+        let samples = self.encode_session_mode(bytes, mode)?;
+        Ok((samples, mode))
+    }
+
+    /// COP-202: encode one session frame in an already chosen waveform.
+    fn encode_session_mode(&self, bytes: &[u8], mode: LinkPhyMode) -> Result<Vec<f32>, String> {
+        let level = self.engine.speed_level();
+        match mode {
             LinkPhyMode::Floor => self
                 .engine
                 .floor()
@@ -3672,8 +3783,7 @@ impl EventLoop {
                 .encode_bytes_at_level(bytes, l)
                 .map_err(|e| e.to_string()),
             _ => self.engine.encode_bytes(bytes).map_err(|e| e.to_string()),
-        }?;
-        Ok((samples, mode))
+        }
     }
 
     async fn repeat_pending_dial(&mut self) {
@@ -3817,10 +3927,17 @@ impl EventLoop {
         {
             self.touch_draining_session(session_id);
         }
+        let floor_negotiated = self.session_floor_negotiated();
         let Some(link) = self.session_link.as_mut() else {
             return;
         };
         let seqs = link.tx.get_retransmits(now);
+        // COP-202: one expired response window per retransmit pass, fed to
+        // the shared controller before it picks the retransmission's
+        // waveform. A lost probe returns a floor session to the floor. Data
+        // windows never start the floor: a session established on OFDM keeps
+        // the COP-68 fade hold when it fades.
+        let expired = !seqs.is_empty();
         let link = &*link;
         let frames: Vec<(u8, Vec<u8>)> = seqs
             .into_iter()
@@ -3830,6 +3947,9 @@ impl EventLoop {
                     .map(|data| (seq, session_stream_frame(link, link.tx_stream, seq, data)))
             })
             .collect();
+        if expired {
+            self.floor.timeout(false);
+        }
         for (seq, frame) in frames {
             let attempt = self
                 .session_link
@@ -3865,7 +3985,12 @@ impl EventLoop {
                 ) {
                     Ok((samples, _)) => {
                         let keyed = Box::pin(self.transmit_samples_keyed(&samples)).await;
-                        self.set_session_segment_floor(keyed, outer.packets_len, 1);
+                        self.set_session_segment_floor(
+                            keyed,
+                            outer.packets_len,
+                            1,
+                            LinkPhyMode::Ofdm { level: outer.level },
+                        );
                     }
                     Err(error) => tracing::warn!(%error, "Failed to encode outer retransmission"),
                 }
@@ -3890,19 +4015,45 @@ impl EventLoop {
                 }
                 continue;
             }
-            let encoded = match self.session_link.as_ref().and_then(|l| l.fallback.as_ref()) {
-                Some(fallback) => self.engine.encode_bytes_with_level_and_codewords(
-                    &frame,
-                    fallback.level,
-                    codewords,
-                ),
-                None => self.engine.encode_bytes_with_codewords(&frame, codewords),
+            // COP-202: while the controller is on the floor, a segment whose
+            // frame fits one floor PDU is resent on the floor, whatever the
+            // fade hold's level. Larger segments keep today's OFDM path
+            // (Decision 5: ARQ cannot re-cut an in-flight segment).
+            let level = self.engine.speed_level();
+            let floor_retransmit = floor_negotiated
+                && self.floor_enabled()
+                && frame.len() <= FLOOR_MAX_PAYLOAD
+                && self.floor.mode(level) == LinkPhyMode::Floor;
+            let encoded = if floor_retransmit {
+                self.encode_session_frame(&frame, None)
+            } else {
+                match self.session_link.as_ref().and_then(|l| l.fallback.as_ref()) {
+                    Some(fallback) => self
+                        .engine
+                        .encode_bytes_with_level_and_codewords(&frame, fallback.level, codewords)
+                        .map(|samples| {
+                            (
+                                samples,
+                                LinkPhyMode::Ofdm {
+                                    level: fallback.level,
+                                },
+                            )
+                        }),
+                    None => self
+                        .engine
+                        .encode_bytes_with_codewords(&frame, codewords)
+                        .map(|samples| (samples, LinkPhyMode::Ofdm { level })),
+                }
+                .map_err(|e| e.to_string())
             };
             match encoded {
-                Ok(samples) => {
-                    tracing::debug!(seq, attempt, "Retransmitting session frame");
+                Ok((samples, mode)) => {
+                    tracing::debug!(seq, attempt, ?mode, "Retransmitting session frame");
                     let keyed = Box::pin(self.transmit_samples_keyed(&samples)).await;
-                    self.set_session_segment_floor(keyed, samples.len(), codewords);
+                    if keyed > 0 {
+                        self.phy_tx = Some(mode);
+                    }
+                    self.set_session_segment_floor(keyed, samples.len(), codewords, mode);
                 }
                 Err(e) => tracing::warn!(
                     error = %e,
@@ -4001,8 +4152,9 @@ impl EventLoop {
             match session.disconnect(clock_now()) {
                 Ok(disc_pdu) => {
                     let pdu_bytes = disc_pdu.to_bytes();
-                    match self.engine.encode_bytes(&pdu_bytes) {
-                        Ok(samples) => {
+                    // COP-202: keyed in the shared controller's waveform.
+                    match self.encode_session_frame(&pdu_bytes, None) {
+                        Ok((samples, _)) => {
                             let samples = self.with_closing_cw_id(samples, session_id);
                             Box::pin(self.transmit_samples(&samples)).await
                         }
@@ -4302,11 +4454,13 @@ impl EventLoop {
     /// cannot send the frame twice.
     async fn end_local_disconnect(&mut self, pending: PendingDisconnect) {
         self.discard_session_tx(pending.session_id).await; // Drops the drained link.
-        match self.engine.encode_bytes(&pending.pdu_bytes) {
+
+        // COP-202: keyed in the shared controller's waveform.
+        match self.encode_session_frame(&pending.pdu_bytes, None) {
             // Boxed: `handle_ptt_change` -> `finish_drained_disconnect` ->
             // `transmit_samples` -> `handle_ptt_change` is the same async
             // call cycle `drain_session_link` documents.
-            Ok(samples) => {
+            Ok((samples, _)) => {
                 let samples = self.with_closing_cw_id(samples, pending.session_id);
                 Box::pin(self.transmit_samples(&samples)).await
             }
@@ -7821,6 +7975,7 @@ impl EventLoop {
                     if let Some(mode) = rx_mode {
                         self.floor.received(mode);
                     }
+                    self.apply_floor_session_timers(session_id);
                     let cfm_bytes = cfm_pdu.to_bytes();
                     match self.encode_session_frame(&cfm_bytes, rx_mode) {
                         Ok((samples, mode)) => {
@@ -7856,6 +8011,7 @@ impl EventLoop {
                     // COP-38 (D2): the new session starts at seq 0.
                     let session_id = session.id;
                     self.reset_session_link(session_id);
+                    self.apply_floor_session_timers(session_id);
                     self.notify_session(0, notice).await;
                 }
                 Err(e) => {
@@ -7979,11 +8135,30 @@ impl EventLoop {
             }
             return;
         };
+        // COP-202: the controller follows the waveform the data arrived on.
+        // A level-1 OFDM segment heard while on the floor is the peer's
+        // recovery probe, answered on level 1 so the reply is as robust as
+        // the probe; every other ACK answers in the waveform it heard.
+        let rx_mode = self.phy_rx;
+        let was_floor = self.floor.floor_active();
+        if let Some(mode) = rx_mode {
+            self.floor.received(mode);
+        }
         let Some(ack) = self.deliver_session_segment(segment) else {
             return;
         };
-        match self.engine.encode_bytes(&ack) {
-            Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
+        let probe = LinkPhyMode::Ofdm { level: 1 };
+        let encoded = if was_floor && rx_mode == Some(probe) && self.floor_enabled() {
+            self.encode_session_mode(&ack, probe).map(|s| (s, probe))
+        } else {
+            self.encode_session_frame(&ack, rx_mode)
+        };
+        match encoded {
+            Ok((samples, mode)) => {
+                if Box::pin(self.transmit_samples_keyed(&samples)).await > 0 {
+                    self.phy_tx = Some(mode);
+                }
+            }
             Err(e) => tracing::warn!(error = %e, "Failed to encode session ACK"),
         }
     }
@@ -8157,6 +8332,13 @@ impl EventLoop {
         let acked = link
             .tx
             .process_ack(ack.ack_num, ack.ack_bitmap, clock_now());
+        // COP-202: a newly acknowledged exchange, in the waveform the ACK
+        // arrived on (the stale-ACK guard above already ran).
+        if acked.contains(&base) {
+            if let Some(mode) = self.phy_rx {
+                self.floor.acknowledged(base, mode);
+            }
+        }
         let delivered_chat = if base_stream == APP_STREAM && acked.contains(&base) {
             link.chat_tx.ack(base_len)
         } else {
@@ -18909,13 +19091,23 @@ mod tests {
             let ack = peer.engine.encode_bytes(&session_ack_frame(link)).unwrap();
             let floor =
                 Duration::from_secs_f64((burst.len() + 2 * ack.len()) as f64 / 48000.0 + 1.5);
-            station.set_session_segment_floor(burst.len(), packet_len, 1);
+            station.set_session_segment_floor(
+                burst.len(),
+                packet_len,
+                1,
+                LinkPhyMode::Ofdm { level: 1 },
+            );
             assert!(
                 station.session_link.as_ref().unwrap().tx.rto() >= floor,
                 "RS timeout must cover both level-2 peer ACKs"
             );
             station.engine.set_speed_level(7).unwrap();
-            station.set_session_segment_floor(burst.len(), packet_len, 1);
+            station.set_session_segment_floor(
+                burst.len(),
+                packet_len,
+                1,
+                LinkPhyMode::Ofdm { level: 1 },
+            );
             let link = station.session_link.as_ref().unwrap();
             assert_eq!(link.tx_outer.unwrap().level, 8);
             assert!(
@@ -23341,7 +23533,7 @@ mod tests {
                 }
                 station.apply_reload(file);
                 // Ordinary single-codeword frames clear the segment override.
-                station.set_session_segment_floor(100, 100, 1);
+                station.set_session_segment_floor(100, 100, 1, LinkPhyMode::Ofdm { level: 1 });
                 let level = station.engine.speed_level();
                 let expected = coppa_protocol::arq::rto_floor(
                     SESSION_ARQ_WINDOW,
@@ -26785,10 +26977,9 @@ mod tests {
     // crates/coppa-engine/tests/floor_session.rs; these trials drive the same
     // contract through two daemon EventLoops, their real audio rings and
     // session handlers, paused Tokio time and the production `clock_now()`
-    // timer paths. Until COP-195's floor session controller is incorporated,
-    // the OFDM handshake legs cannot decode at -6 dB, so the trials record
-    // failing outcomes for the missing controller rather than faking
-    // establishment. No `fast_session_rto`, fabricated ACKs, injected state,
+    // timer paths. The daemon runs COP-195's shared floor controller
+    // (COP-202), so the trials measure real floor establishment rather than
+    // faking it. No `fast_session_rto`, fabricated ACKs, injected state,
     // decoder resets or manual PTT releases are used: the dial goes out
     // through `handle_host_event`, PTT keys and releases through the
     // completion task's `TxComplete` dispatch, and both stations decode
@@ -26997,6 +27188,13 @@ mod tests {
             tx_b: &mut [f32],
             muted: bool,
         ) {
+            step_stations(a, b, clock).await;
+            move_block(a, b, tx_a, tx_b, muted);
+        }
+
+        /// The stations' half of `step_pair`: everything before this tick's
+        /// audio moves, so a test can act on what they just keyed.
+        async fn step_stations(a: &mut FloorStation, b: &mut FloorStation, clock: &mut PairClock) {
             if clock.start.elapsed() >= clock.next_fast_poll {
                 for station in [&mut a.station, &mut b.station] {
                     station.enforce_ptt_backstop().await;
@@ -27025,7 +27223,6 @@ mod tests {
             b.station.poll_audio_input().await;
             a.station.flush_pending_audio_out();
             b.station.flush_pending_audio_out();
-            move_block(a, b, tx_a, tx_b, muted);
         }
 
         /// Run one trial: fresh stations and channels per trial, persistent
@@ -27589,6 +27786,246 @@ mod tests {
                 "one multi-codeword OFDM frame, not floor segments"
             );
             assert!(!backlog_left, "the 500-byte write left in one frame");
+        }
+
+        /// One session key-up on A after the connection, with data in
+        /// flight: its waveform, the in-flight segment's sequence number,
+        /// length and MAC frame length, and the link's codeword count and
+        /// outer-code state.
+        #[derive(Debug, Clone, Copy)]
+        struct DataKeyUp {
+            mode: Option<LinkPhyMode>,
+            seq: u8,
+            segment_len: usize,
+            frame_len: usize,
+            codewords: u8,
+            outer: bool,
+        }
+
+        fn data_key_up(station: &EventLoop) -> Option<DataKeyUp> {
+            let link = station.session_link.as_ref()?;
+            if link.tx.in_flight() == 0 {
+                return None;
+            }
+            let seq = link.tx.send_base();
+            let data = link.tx.get_segment_data(seq)?;
+            Some(DataKeyUp {
+                mode: station.phy_tx,
+                seq,
+                segment_len: data.len(),
+                frame_len: session_stream_frame(link, link.tx_stream, seq, data).len(),
+                codewords: link.tx_codewords,
+                outer: link.tx_outer.is_some(),
+            })
+        }
+
+        /// Two stations at -6 dB that both request fade protection, with B's
+        /// host output captured.
+        fn delivery_pair(
+            seed: u64,
+        ) -> (
+            FloorStation,
+            FloorStation,
+            mpsc::UnboundedReceiver<HostResponse>,
+            f32,
+        ) {
+            let reference_power = floor_reference_power();
+            let mut a = FloorStation::new("VK3ABC", seed, 0, reference_power);
+            let mut b = FloorStation::new("W1AW", seed, 1, reference_power);
+            for station in [&mut a.station, &mut b.station] {
+                station.config.session.fade_protection = crate::config::FadeProtection::Request;
+            }
+            let (tx, rx) = mpsc::unbounded_channel();
+            b.station.set_response_tx(tx);
+            (a, b, rx, reference_power)
+        }
+
+        fn drain_host_data(rx: &mut mpsc::UnboundedReceiver<HostResponse>, out: &mut Vec<u8>) {
+            while let Ok(resp) = rx.try_recv() {
+                if let HostResponse::DataOut { data, .. } = resp {
+                    out.extend_from_slice(&data);
+                }
+            }
+        }
+
+        /// COP-202 AC7: two daemons at -6 dB connect over the floor, then a
+        /// 100-byte host write reaches B's host exactly once and in order.
+        /// Every floor key-up carries one floor-sized PDU with one codeword
+        /// and no outer code, although `multi_frame_ack` and
+        /// `fade_protection = "request"` are negotiated. The sixth segment is
+        /// the level-1 OFDM probe; it goes unanswered at -6 dB and is resent
+        /// on the floor.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_pair_connects_and_delivers() {
+            let (mut a, mut b, mut b_host, _) = delivery_pair(SEED_BASE);
+            let payload: Vec<u8> = (0..100).collect();
+            dial(&mut a.station).await;
+            let start = tokio::time::Instant::now();
+            let mut clock = PairClock::new(start);
+            let (mut tx_a, mut tx_b) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+            let mut connected = false;
+            let mut a_keyed = false;
+            let mut key_ups = Vec::new();
+            let mut delivered = Vec::new();
+            while start.elapsed() < Duration::from_secs(240) {
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, false).await;
+                if connected && a.station.is_transmitting && !a_keyed {
+                    key_ups.extend(data_key_up(&a.station));
+                }
+                a_keyed = a.station.is_transmitting;
+                if !connected && both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC") {
+                    connected = true;
+                    assert!(
+                        a.station.session_floor_negotiated(),
+                        "both stations negotiated the floor"
+                    );
+                    a.station
+                        .handle_host_event(HostEvent::DataReceived {
+                            client_id: 1,
+                            data: payload.clone(),
+                        })
+                        .await;
+                }
+                drain_host_data(&mut b_host, &mut delivered);
+                if delivered.len() >= payload.len()
+                    && a.station
+                        .session_link
+                        .as_ref()
+                        .is_some_and(|l| l.tx.in_flight() == 0 && !l.has_backlog())
+                {
+                    break;
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            assert!(connected, "connected at -6 dB");
+            assert_eq!(
+                delivered, payload,
+                "B's host got the write exactly once and in order; key-ups: {key_ups:?}"
+            );
+            for k in key_ups
+                .iter()
+                .filter(|k| k.mode == Some(LinkPhyMode::Floor))
+            {
+                assert!(
+                    k.frame_len <= FLOOR_MAX_PAYLOAD && k.codewords == 1 && !k.outer,
+                    "a floor key-up carries one floor PDU, one codeword, no outer code: {k:?}"
+                );
+            }
+            let probes: Vec<usize> = key_ups
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| k.mode == Some(LinkPhyMode::Ofdm { level: 1 }))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(probes.len(), 1, "exactly one probe: {key_ups:?}");
+            let probe = key_ups[probes[0]];
+            assert_eq!(probe.seq, 5, "the sixth segment is the probe: {key_ups:?}");
+            let resent = key_ups
+                .get(probes[0] + 1)
+                .expect("the unanswered probe is resent");
+            assert_eq!(
+                (resent.mode, resent.seq),
+                (Some(LinkPhyMode::Floor), probe.seq),
+                "the unanswered probe is resent on the floor: {key_ups:?}"
+            );
+        }
+
+        /// COP-202 AC8: after five newly acknowledged floor exchanges, the
+        /// probe's matching OFDM ACK returns the sender to OFDM. Both
+        /// directions turn noiseless on the tick A keys the probe; B answers
+        /// it on level 1, A's next segment is cut at the OFDM budget, and the
+        /// whole write arrives once.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_five_ack_probe() {
+            let (mut a, mut b, mut b_host, reference_power) = delivery_pair(SEED_BASE);
+            let payload: Vec<u8> = (0..300).map(|i| i as u8).collect();
+            dial(&mut a.station).await;
+            let start = tokio::time::Instant::now();
+            let mut clock = PairClock::new(start);
+            let (mut tx_a, mut tx_b) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+            let mut connected = false;
+            let (mut a_keyed, mut b_keyed) = (false, false);
+            let mut key_ups = Vec::new();
+            let mut delivered = Vec::new();
+            let mut floor_data = false;
+            let mut swapped = false;
+            let mut probe_ack = None;
+            while start.elapsed() < Duration::from_secs(240) {
+                step_stations(&mut a, &mut b, &mut clock).await;
+                if connected && a.station.is_transmitting && !a_keyed {
+                    key_ups.extend(data_key_up(&a.station));
+                }
+                a_keyed = a.station.is_transmitting;
+                floor_data |= connected && a.station.phy_tx == Some(LinkPhyMode::Floor);
+                if swapped && probe_ack.is_none() && b.station.is_transmitting && !b_keyed {
+                    probe_ack = Some(b.station.phy_tx);
+                }
+                b_keyed = b.station.is_transmitting;
+                if !swapped
+                    && floor_data
+                    && a.station.phy_tx == Some(LinkPhyMode::Ofdm { level: 1 })
+                {
+                    // Before this tick's audio moves.
+                    swapped = true;
+                    for (station, direction) in [(&mut a, 0u8), (&mut b, 1u8)] {
+                        station.channel = PersistentChannel::new(
+                            SAMPLE_RATE,
+                            None,
+                            Some(SnrProfile::constant(60.0)),
+                            reference_power,
+                            SEED_BASE,
+                            direction,
+                        );
+                    }
+                }
+                move_block(&mut a, &mut b, &mut tx_a, &mut tx_b, false);
+                if !connected && both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC") {
+                    connected = true;
+                    a.station
+                        .handle_host_event(HostEvent::DataReceived {
+                            client_id: 1,
+                            data: payload.clone(),
+                        })
+                        .await;
+                }
+                drain_host_data(&mut b_host, &mut delivered);
+                if delivered.len() >= payload.len()
+                    && a.station
+                        .session_link
+                        .as_ref()
+                        .is_some_and(|l| l.tx.in_flight() == 0 && !l.has_backlog())
+                {
+                    break;
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            assert!(connected, "connected at -6 dB");
+            assert!(swapped, "A keyed the probe: {key_ups:?}");
+            assert_eq!(
+                probe_ack,
+                Some(Some(LinkPhyMode::Ofdm { level: 1 })),
+                "B answered the probe on level 1"
+            );
+            let probe = key_ups
+                .iter()
+                .position(|k| k.mode == Some(LinkPhyMode::Ofdm { level: 1 }))
+                .expect("the probe key-up");
+            let next = key_ups
+                .get(probe + 1)
+                .expect("a data key-up after the probe");
+            let level = a.station.engine.speed_level();
+            assert_eq!(
+                next.mode,
+                Some(LinkPhyMode::Ofdm { level }),
+                "A is back on OFDM at the engine level: {key_ups:?}"
+            );
+            assert!(
+                next.segment_len > floor_policy::floor_segment_limit(u16::MAX),
+                "the segment after the probe is cut at the OFDM budget: {next:?}"
+            );
+            assert_eq!(delivered, payload, "the whole write arrived once");
         }
     }
 }
