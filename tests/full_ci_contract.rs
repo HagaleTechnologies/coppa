@@ -518,3 +518,24 @@ fn fast_tier_wait_outlasts_its_jobs_time_limit() {
     }
     assert!(WORKFLOW.contains("fast_tier_wait_s=7200"));
 }
+#[test]
+fn relay_token_is_minted_after_the_fast_tier_wait() {
+    // An installation token lives 60 min; the fast-tier wait can run 120 (COP-207).
+    let check = WORKFLOW
+        .find("- name: Check all jobs (including the fast tier's own native results)")
+        .unwrap();
+    // rfind: the watchdog job earlier in the file mints its own token under the same name.
+    let mint = WORKFLOW
+        .rfind("- name: Mint a hagale-agent installation token for check-run writes")
+        .unwrap();
+    let retry = WORKFLOW
+        .rfind("- name: Retry minting a hagale-agent installation token if that failed")
+        .unwrap();
+    let relay = WORKFLOW
+        .find("- name: Relay this result onto the reviewed SHA's CI check-run")
+        .unwrap();
+    assert!(check < mint && mint < retry && retry < relay);
+    for step in [&WORKFLOW[mint..retry], &WORKFLOW[retry..relay]] {
+        assert!(step.contains("if: always() && github.event_name == 'workflow_dispatch'"));
+    }
+}

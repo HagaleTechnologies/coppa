@@ -540,48 +540,6 @@ jobs:
     permissions:
       checks: write
     steps:
-      # Codex P1, this PR's own round-8 review: the relay step below PATCHes the "CI" check-run
-      # create-ci-check made with a hagale-agent token (round-7 fix) -- github.token can never
-      # update a check-run a different run/identity created, so that PATCH was silently failing
-      # on every normal workflow_dispatch. This step only reads check-runs, so github.token
-      # stays fine for it.
-      # Codex P1, this PR's own round-9 review: create-ci-check can succeed (the managed "CI"
-      # check-run exists, hagale-agent-owned) while THIS mint fails transiently -- the watchdog
-      # only watches for jobs that never start and has already finished by the time this step
-      # runs, so nothing else would ever notice or retry. continue-on-error keeps the job going;
-      # the Relay step below falls back to publishing a FRESH check-run with github.token when
-      # this token is unavailable, rather than attempting (and silently failing) a PATCH.
-      - name: Mint a hagale-agent installation token for check-run writes
-        id: app-token
-        # Q-0068: only the workflow_dispatch relay below consumes this token.
-        if: github.event_name == 'workflow_dispatch'
-        continue-on-error: true
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: 4696353
-          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-
-      # Codex P1, this PR's own round-10 review: publishing a FRESH check-run when the mint
-      # above fails does NOT actually recover anything -- create-ci-check's own hagale-agent-
-      # owned "CI" check-run is left stuck in_progress alongside the new one, so the SAME
-      # required-check name now has a stuck check AND a concluded one, and the PR stays
-      # blocked regardless. A single retry (most mint failures are a transient API blip)
-      # covers the ordinary case; if it ALSO fails, the Relay step below now fails loudly
-      # instead of masking the problem with a duplicate (see HAG-90, which already scopes
-      # this exact residual gap for ci-full.yml).
-      - name: Retry minting a hagale-agent installation token if that failed
-        id: app-token-retry
-        if: github.event_name == 'workflow_dispatch' && steps.app-token.outcome == 'failure'
-        continue-on-error: true
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: 4696353
-          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-
       - name: Check all jobs (including the fast tier's own native results)
         id: check
         env:
@@ -683,6 +641,52 @@ jobs:
             exit 1
           fi
           echo "outcome=success" >> "$GITHUB_OUTPUT"
+
+      # COP-207 (Codex P1 on #269): minted AFTER the fast-tier wait, never before it. The
+      # wait can run up to 120 min and an installation token expires after 60, so a token
+      # minted up front would be dead by the time the relay PATCHes the CI check-run.
+      # always(): the check step exits 1 on a failed tier, and the relay still needs it.
+      # Codex P1, this PR's own round-8 review: the relay step below PATCHes the "CI" check-run
+      # create-ci-check made with a hagale-agent token (round-7 fix) -- github.token can never
+      # update a check-run a different run/identity created, so that PATCH was silently failing
+      # on every normal workflow_dispatch. This step only reads check-runs, so github.token
+      # stays fine for it.
+      # Codex P1, this PR's own round-9 review: create-ci-check can succeed (the managed "CI"
+      # check-run exists, hagale-agent-owned) while THIS mint fails transiently -- the watchdog
+      # only watches for jobs that never start and has already finished by the time this step
+      # runs, so nothing else would ever notice or retry. continue-on-error keeps the job going;
+      # the Relay step below falls back to publishing a FRESH check-run with github.token when
+      # this token is unavailable, rather than attempting (and silently failing) a PATCH.
+      - name: Mint a hagale-agent installation token for check-run writes
+        id: app-token
+        # Q-0068: only the workflow_dispatch relay below consumes this token.
+        if: always() && github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      # Codex P1, this PR's own round-10 review: publishing a FRESH check-run when the mint
+      # above fails does NOT actually recover anything -- create-ci-check's own hagale-agent-
+      # owned "CI" check-run is left stuck in_progress alongside the new one, so the SAME
+      # required-check name now has a stuck check AND a concluded one, and the PR stays
+      # blocked regardless. A single retry (most mint failures are a transient API blip)
+      # covers the ordinary case; if it ALSO fails, the Relay step below now fails loudly
+      # instead of masking the problem with a duplicate (see HAG-90, which already scopes
+      # this exact residual gap for ci-full.yml).
+      - name: Retry minting a hagale-agent installation token if that failed
+        id: app-token-retry
+        if: always() && github.event_name == 'workflow_dispatch' && steps.app-token.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
 
       - name: Relay this result onto the reviewed SHA's CI check-run (workflow_dispatch only)
         if: always() && github.event_name == 'workflow_dispatch'
