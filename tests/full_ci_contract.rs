@@ -399,13 +399,21 @@ fn group_time_budget_is_configured() {
 // COP-207: the fan-in waits for a slow-but-passing fast-tier check instead of failing it,
 // and a check that never finishes fails as "still running", not as unsuccessful.
 fn fast_tier(windows_pending_polls: usize, wait_s: &str) -> std::process::Output {
+    fast_tier_with(windows_pending_polls, wait_s, "", "")
+}
+fn fast_tier_with(
+    windows_pending_polls: usize,
+    wait_s: &str,
+    bad: &str,
+    fail: &str,
+) -> std::process::Output {
     let body = shell("- name: Check all jobs (including the fast tier's own native results)")
         .replace("${{ needs.create-ci-check.result }}", "success")
         .replace(
             "fast_tier_wait_s=7200",
             &format!("fast_tier_wait_s={wait_s}"),
         )
-        .replace("sleep 15", "sleep 0.05");
+        .replace("sleep 30", "sleep 0.05");
     let s = Scratch::new();
     let names = [
         "Check",
@@ -446,6 +454,8 @@ fn fast_tier(windows_pending_polls: usize, wait_s: &str) -> std::process::Output
 n=0
 [ ! -f "$MOCK_STATE/polls" ] || n=$(cat "$MOCK_STATE/polls")
 echo $((n+1)) > "$MOCK_STATE/polls"
+case " ${{MOCK_BAD:-}} " in *" $n "*) echo '{{"message":"Server Error"}}'; exit 0;; esac
+case " ${{MOCK_FAIL:-}} " in *" $n "*) echo 'HTTP 502' >&2; exit 1;; esac
 if [ "$n" -lt {windows_pending_polls} ]; then cat "$MOCK_STATE/pending"; else cat "$MOCK_STATE/done"; fi
 "#
         ),
@@ -460,7 +470,9 @@ if [ "$n" -lt {windows_pending_polls} ]; then cat "$MOCK_STATE/pending"; else ca
         .env("REPO", "test/repo")
         .env("HEAD_SHA", "d1ee7d15")
         .env("GITHUB_OUTPUT", s.0.join("out"))
-        .env("TEST_FULL", "success");
+        .env("TEST_FULL", "success")
+        .env("MOCK_BAD", bad)
+        .env("MOCK_FAIL", fail);
     for key in [
         "BENCH_FUZZ",
         "CLIPPY",
@@ -538,4 +550,16 @@ fn relay_token_is_minted_after_the_fast_tier_wait() {
     for step in [&WORKFLOW[mint..retry], &WORKFLOW[retry..relay]] {
         assert!(step.contains("if: always() && github.event_name == 'workflow_dispatch'"));
     }
+}
+#[test]
+fn fanin_retries_a_bad_check_run_response() {
+    // Poll 1 returns an error body without check_runs, poll 2 fails outright; both are retried.
+    let out = fast_tier_with(4, "7200", "1", "2");
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("lookup on d1ee7d15 failed; retrying"));
 }

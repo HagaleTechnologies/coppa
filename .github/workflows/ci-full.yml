@@ -590,9 +590,13 @@ jobs:
           # the raw --paginate output into a SEPARATE `jq -s` (jq's own slurp flag) is the only
           # way to combine pages before filtering.
           fast_tier_names='["Check","Test with Features (fast, lib-only)","Format","Platform Check (ubuntu-latest)","Platform Check (macos-latest)","Platform Check (windows-latest)"]'
+          # COP-207: a long wait polls many times, so one bad response (an API error, or a page
+          # without check_runs) must cost a retry, not the whole required check. Returns nonzero
+          # on any failure and the caller keeps the previous snapshot.
           fetch_fast_tier() {
-            gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-              | jq -s --argjson names "$fast_tier_names" '[.[].check_runs[] | select(.name as $n | $names | index($n))] | group_by(.name) | map(max_by(.started_at))'
+            local raw
+            raw=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs") || return 1
+            jq -se --argjson names "$fast_tier_names" 'if all(.[]; (.check_runs | type) == "array") then [.[].check_runs[] | select(.name as $n | $names | index($n))] | group_by(.name) | map(max_by(.started_at)) else error("no check_runs in response") end' <<<"$raw"
           }
           # Codex P1, round 3 (this PR's own review): ci.yml and ci-full.yml are two SEPARATE
           # workflow files triggered by the SAME event (push/merge_group) with NO ordering
@@ -612,14 +616,19 @@ jobs:
           still_pending=0
           fast_tier_results='[]'
           while [ "$SECONDS" -lt "$fast_tier_deadline" ]; do
-            fast_tier_results=$(fetch_fast_tier)
+            if ! polled=$(fetch_fast_tier 2>/dev/null); then
+              echo "::warning::fast-tier check-run lookup on $HEAD_SHA failed; retrying"
+              sleep 30
+              continue
+            fi
+            fast_tier_results=$polled
             still_pending=$(echo "$fast_tier_results" | jq '[.[] | select(.status != "completed")] | length')
             found=$(echo "$fast_tier_results" | jq 'length')
             if [ "$found" -eq 6 ] && [ "$still_pending" -eq 0 ]; then
               break
             fi
             echo "Waiting for ci.yml's fast tier to finish on $HEAD_SHA ($found/6 found, $still_pending still running)..."
-            sleep 15
+            sleep 30
           done
           wait_min=$((fast_tier_wait_s / 60))
           missing=$(echo "$fast_tier_results" | jq --argjson names "$fast_tier_names" '$names - [.[].name]')
