@@ -72,14 +72,20 @@ Then send a few commands. The `sleep`s give coppad time to answer each one:
 
 ```text
 $ { echo VERSION; sleep 1; echo "MYCALL N1CALL"; sleep 1; echo "LISTEN ON"; sleep 1;
-    echo FOOBAR; sleep 1; echo "CONNECT N1CALL N0CALL"; sleep 35; } \
+    echo FOOBAR; sleep 1; echo "CONNECT N1CALL N0CALL"; sleep 75; } \
     | nc -q 1 127.0.0.1 8300 | tr '\r' '\n'
-VERSION Coppa 0.15.0
-VERSION Coppa 0.15.0
+VERSION Coppa 0.16.0
+VERSION Coppa 0.16.0
 OK
 OK
 WRONG
 OK
+PTT ON
+PTT OFF
+PTT ON
+PTT OFF
+PTT ON
+PTT OFF
 PTT ON
 PTT OFF
 DISCONNECTED
@@ -89,8 +95,11 @@ DISCONNECTED
   `VERSION`.
 - `OK` answers `MYCALL N1CALL` and `LISTEN ON`. `WRONG` answers `FOOBAR`, which coppad does not
   know. `OK` answers `CONNECT`.
-- `PTT ON` and `PTT OFF` bracket the connect request coppad keys. `DISCONNECTED` arrives about
-  30 s later because no station answered.
+- Each `PTT ON` and `PTT OFF` pair brackets one connect request. With `RETRIES` unset and an
+  automatic speed level, coppad keys four: two on OFDM, then two on the low-rate floor.
+  `DISCONNECTED` arrives about 30 s after the last one, about 60-70 s after the first, because
+  no station answered. With `RETRIES 0` or a pinned speed level coppad keys one request and
+  `DISCONNECTED` arrives about 30 s later.
 - `tr '\r' '\n'` is there because coppad ends every line it sends with a bare `\r`. Without it a
   terminal draws each reply over the last one.
 - `-q 1` is the flag of the OpenBSD netcat that Debian, Ubuntu and Raspberry Pi OS install. The
@@ -112,7 +121,7 @@ either data port. The [two-station example](#a-two-station-session) shows what b
 
 **Framing.** Send one command per line, ended by `\r`, `\n` or `\r\n`. Empty lines are ignored.
 coppad ends every line it sends with a bare `\r`, as VARA does. On connect coppad speaks first,
-with `VERSION Coppa 0.15.0`. A line longer than 4096 bytes, or one that is not valid UTF-8,
+with `VERSION Coppa 0.16.0`. A line longer than 4096 bytes, or one that is not valid UTF-8,
 closes the connection.
 
 **Replies and pushed lines.** Each command gets exactly one reply, sent only to the client that
@@ -126,10 +135,10 @@ on a fixed delay.
 
 | You send | coppad replies | Effect |
 |---|---|---|
-| `VERSION` | `VERSION Coppa 0.15.0` | none |
-| `VERSIONINFO` (coppa extension) | `VERSIONINFO crate_version=0.15.0 air_protocol_version=1 host_api_version=1`; `WRONG` with any argument | none; see [Version discovery](#version-discovery) |
+| `VERSION` | `VERSION Coppa 0.16.0` | none |
+| `VERSIONINFO` (coppa extension) | `VERSIONINFO crate_version=0.16.0 air_protocol_version=1 host_api_version=1`; `WRONG` with any argument | none; see [Version discovery](#version-discovery) |
 | `MYCALL <call> [<call> ...]` | `OK` for one to five valid callsigns, otherwise `WRONG` | replaces the daemon-wide list; first identifies transmissions, all answer inbound calls; CONNECTED names the dialled call |
-| `RETRIES <n>` or `RETRIES=<n>` | `OK` for 0-20, otherwise `WRONG` | per-client count of additional connect requests on later dials; resets on client disconnect |
+| `RETRIES <n>` or `RETRIES=<n>` | `OK` for 0-20, otherwise `WRONG` | per-client count of additional connect requests on later dials; resets on client disconnect. Unset, a dial makes 3 additional requests while the speed level is automatic, so it can fall back to the low-rate floor; with a pinned speed level it makes none |
 | `BUSY` | `BUSY ON` or `BUSY OFF` | reliable reply with the current channel state |
 | `LISTEN ON` / `LISTEN OFF` | `OK`; `WRONG` for any other argument | answer inbound calls, or stop; coppad starts with listening off |
 | `CONNECT <me> <target> [via ...]` | `OK`, then `CONNECTED <caller> <callee> <bw>` or `DISCONNECTED` | dials `<target>`; `<me>` and `via` are ignored, the daemon's own callsign is used; one argument gets `WRONG` |
@@ -172,11 +181,11 @@ On the command port the greeting and `VERSION` keep their old shape; `VERSIONINF
 query with no arguments. Each line below ends with a bare `\r`:
 
 ```text
-server greeting: VERSION Coppa 0.15.0\r
+server greeting: VERSION Coppa 0.16.0\r
 client: VERSION\r
-server: VERSION Coppa 0.15.0\r
+server: VERSION Coppa 0.16.0\r
 client: VERSIONINFO\r
-server: VERSIONINFO crate_version=0.15.0 air_protocol_version=1 host_api_version=1\r
+server: VERSIONINFO crate_version=0.16.0 air_protocol_version=1 host_api_version=1\r
 client: VERSIONINFO extra\r
 server: WRONG\r
 ```
@@ -210,7 +219,9 @@ unavailable", not as a version. The WebSocket `hello` carries the same three fie
   for that client (the next change sends a fresh value). At 1024 it closes the connection
   ([OPERATING.md](OPERATING.md#host-clients-that-stop-reading)). Every other line reaches a
   client or ends its connection.
-- An unanswered `CONNECT` ends in `DISCONNECTED` about 30 s after the connect request is keyed.
+- An unanswered `CONNECT` ends in `DISCONNECTED` about 30 s after the last connect request is
+  keyed. With `RETRIES` unset and an automatic speed level a dial keys four requests, so that is
+  about 60-70 s after the first.
 - On the listening side, `PENDING` arrives first and `CONNECTED` a second or two after the
   dialler's `CONNECTED`. Do not expect `CONNECTED` first.
 
@@ -585,6 +596,8 @@ UI-View interoperability and monitor formatting remain unverified with those cli
 COP-172: `LISTEN OFF` cancels an inbound PENDING attempt with CANCELPENDING.
 RETRIES repeats requests at max twice request airtime plus two turnarounds,
 or five seconds. Repeats stop at 300 s; timeout follows the last request.
+COP-202: in Auto, the third and later requests go on the low-rate floor, each
+at least 19 s plus one station-ID frame apart at a 500 ms turnaround.
 See [BPQ.md](BPQ.md) for scanning gateways and measured limits.
 
 Unknown-command log deduplication remembers at most 64 words per client,

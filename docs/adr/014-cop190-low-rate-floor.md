@@ -66,8 +66,22 @@ receiver in `coppa-protocol` (`modem/floor.rs`). The frozen parameters:
   fail sync share (see `docs/LIMITATIONS.md` and BENCHMARKS, COP-190
   and COP-191 sections).
 - The engine `CoppaCore` constructs separate batch and streaming floor
-  receivers alongside OFDM. The library Link and daemon session controller
-  do not negotiate or transmit on the floor yet. Connecting on the floor,
-  OFDM fallback and the −6 dB connect bar remain open.
+  receivers alongside OFDM. The library Link negotiates capability bit 6,
+  starts on OFDM and falls back after two unanswered windows. Five newly
+  acknowledged floor exchanges allow one sequence-bound OFDM level-1 probe.
+  A failed probe retries the bounded segment on the floor.
+- COP-202 amendment: coppad reuses the same `FloorController` and the shared
+  policy helpers in `coppa_protocol::floor_controller` for its handshake; it
+  does not embed Link or keep a second controller. The floor is enabled while
+  the speed level is automatic. An unset VARA `RETRIES` means three repeats in
+  Auto. Floor request windows add one level-1 station-ID frame. The daemon
+  keeps its 30 s inbound handshake timeout, replays no lost CONNECT_CFM and
+  does not stagger discovery. Both adapters meet the −6 dB connect bar in the
+  recorded direction (`results/cop-190/connect/`). A floor-negotiated daemon
+  session carries data on the floor: segments are floor-sized only while the
+  controller is on the floor or probing, so good-channel frames keep their
+  multi-codeword size, and a session established on OFDM keeps the OFDM fade
+  hold rather than moving to the floor mid-session; see
+  `docs/LIMITATIONS.md`.
 - Version 2 spends one of the fourteen remaining version values; the next
   incompatible format allocates 3.
