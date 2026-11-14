@@ -645,7 +645,13 @@ jobs:
           # bounded timeout instead of a single read; this also naturally covers
           # workflow_dispatch (the fast tier's checks already completed when the PR was open, so
           # this returns on its first iteration there).
-          fast_tier_deadline=$((SECONDS + 1800))
+          # COP-207: the fast tier routinely runs 30-63 min (Windows platform check avg 44m, max
+          # 63m; Test with Features max 57m over 21 green runs), so a 30-min wait failed green PRs
+          # and burned Catalyst repair rounds (COP-198). ci.yml now caps those jobs with
+          # timeout-minutes: 90, so a hung check concludes on its own; wait past that plus queue.
+          fast_tier_wait_s=7200
+          fast_tier_deadline=$((SECONDS + fast_tier_wait_s))
+          still_pending=0
           fast_tier_results='[]'
           while [ "$SECONDS" -lt "$fast_tier_deadline" ]; do
             fast_tier_results=$(fetch_fast_tier)
@@ -657,9 +663,16 @@ jobs:
             echo "Waiting for ci.yml's fast tier to finish on $HEAD_SHA ($found/6 found, $still_pending still running)..."
             sleep 15
           done
+          wait_min=$((fast_tier_wait_s / 60))
           missing=$(echo "$fast_tier_results" | jq --argjson names "$fast_tier_names" '$names - [.[].name]')
           if [ "$(echo "$missing" | jq 'length')" -gt 0 ]; then
-            echo "::error::Missing or still-incomplete fast-tier check-run(s) for $HEAD_SHA after 30 minutes: $missing -- ci.yml may not have run at all, ran against a different SHA, or is still queued/running."
+            echo "::error::Missing fast-tier check-run(s) for $HEAD_SHA after $wait_min minutes: $missing -- ci.yml may not have run at all, ran against a different SHA, or is still queued."
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          running=$(echo "$fast_tier_results" | jq -c '[.[] | select(.status != "completed") | .name]')
+          if [ "$(echo "$running" | jq 'length')" -gt 0 ]; then
+            echo "::error::Fast-tier check(s) still running on $HEAD_SHA after $wait_min minutes (timed out waiting, not failed): $running"
             echo "outcome=failure" >> "$GITHUB_OUTPUT"
             exit 1
           fi

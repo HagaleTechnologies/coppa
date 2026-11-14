@@ -396,3 +396,125 @@ fn group_time_budget_is_configured() {
     assert!(runner.contains("compile"));
     assert!(runner.contains("execute"));
 }
+// COP-207: the fan-in waits for a slow-but-passing fast-tier check instead of failing it,
+// and a check that never finishes fails as "still running", not as unsuccessful.
+fn fast_tier(windows_pending_polls: usize, wait_s: &str) -> std::process::Output {
+    let body = shell("- name: Check all jobs (including the fast tier's own native results)")
+        .replace("${{ needs.create-ci-check.result }}", "success")
+        .replace(
+            "fast_tier_wait_s=7200",
+            &format!("fast_tier_wait_s={wait_s}"),
+        )
+        .replace("sleep 15", "sleep 0.05");
+    let s = Scratch::new();
+    let names = [
+        "Check",
+        "Test with Features (fast, lib-only)",
+        "Format",
+        "Platform Check (ubuntu-latest)",
+        "Platform Check (macos-latest)",
+        "Platform Check (windows-latest)",
+    ];
+    let runs = |windows_done: bool| {
+        names
+            .iter()
+            .map(|n| {
+                let done = windows_done || *n != "Platform Check (windows-latest)";
+                format!(
+                    r#"{{"name":"{n}","started_at":"2026-11-13T19:07:14Z","status":"{}","conclusion":{}}}"#,
+                    if done { "completed" } else { "in_progress" },
+                    if done { "\"success\"" } else { "null" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    fs::write(
+        s.0.join("pending"),
+        format!(r#"{{"check_runs":[{}]}}"#, runs(false)),
+    )
+    .unwrap();
+    fs::write(
+        s.0.join("done"),
+        format!(r#"{{"check_runs":[{}]}}"#, runs(true)),
+    )
+    .unwrap();
+    s.executable(
+        "gh",
+        &format!(
+            r#"#!/usr/bin/env bash
+n=0
+[ ! -f "$MOCK_STATE/polls" ] || n=$(cat "$MOCK_STATE/polls")
+echo $((n+1)) > "$MOCK_STATE/polls"
+if [ "$n" -lt {windows_pending_polls} ]; then cat "$MOCK_STATE/pending"; else cat "$MOCK_STATE/done"; fi
+"#
+        ),
+    );
+    let mut cmd = Command::new("bash");
+    cmd.args(["-e", "-c", &body])
+        .env(
+            "PATH",
+            format!("{}:{}", s.0.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("MOCK_STATE", &s.0)
+        .env("REPO", "test/repo")
+        .env("HEAD_SHA", "d1ee7d15")
+        .env("GITHUB_OUTPUT", s.0.join("out"))
+        .env("TEST_FULL", "success");
+    for key in [
+        "BENCH_FUZZ",
+        "CLIPPY",
+        "MSRV",
+        "DENY",
+        "SEMVER",
+        "FFI_ABI",
+        "AUDIT",
+        "WIKI_LINT",
+        "CHECKS_QUEUE_WATCHDOG",
+    ] {
+        cmd.env(key, "success");
+    }
+    cmd.output().unwrap()
+}
+#[test]
+fn fanin_waits_for_a_slow_passing_fast_tier_check() {
+    let out = fast_tier(5, "7200");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+#[test]
+fn fanin_reports_a_hung_fast_tier_check_as_still_running() {
+    let out = fast_tier(1_000_000, "1");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success());
+    assert!(stdout.contains("still running"), "{stdout}");
+    assert!(
+        stdout.contains("Platform Check (windows-latest)"),
+        "{stdout}"
+    );
+}
+#[test]
+fn fast_tier_wait_outlasts_its_jobs_time_limit() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    for job in [
+        "Test with Features (fast, lib-only)",
+        "Platform Check (${{ matrix.os }})",
+    ] {
+        let after = ci.split(&format!("name: {job}\n")).nth(1).unwrap();
+        let limit: u64 = after
+            .lines()
+            .take_while(|l| !l.starts_with("  ") || l.starts_with("    "))
+            .find_map(|l| l.trim().strip_prefix("timeout-minutes: "))
+            .unwrap_or_else(|| panic!("{job} has no timeout-minutes"))
+            .parse()
+            .unwrap();
+        assert!(
+            limit * 60 < 7200,
+            "{job}: {limit}m must end before the fan-in's wait"
+        );
+    }
+    assert!(WORKFLOW.contains("fast_tier_wait_s=7200"));
+}
