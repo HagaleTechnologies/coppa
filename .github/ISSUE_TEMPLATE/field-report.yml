@@ -1,0 +1,111 @@
+name: Field report
+description: Tell us how coppa behaved on real radios, working or not.
+title: "[field report] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        coppa has no over-the-air validation yet (COP-20), so a report from real radios helps even when the link worked.
+        Leave out anything you would not post publicly.
+  - type: textarea
+    id: version
+    attributes:
+      label: "`coppa --version` output"
+      description: Paste the whole output from each station if they differ.
+      placeholder: |
+        coppa 0.16.0
+        commit: 2909f043a741
+        features: file-backend
+        wire format: 1
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Debian 12 on a Raspberry Pi 4
+    validations:
+      required: true
+  - type: input
+    id: radio
+    attributes:
+      label: Radio and sound card or interface
+      placeholder: IC-7300 with its built-in USB sound card
+    validations:
+      required: true
+  - type: dropdown
+    id: ptt
+    attributes:
+      label: PTT method
+      options:
+        - VOX
+        - rigctld CAT
+        - Serial DTR or RTS
+        - CM108 GPIO
+        - Linux GPIO
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: band
+    attributes:
+      label: Band and frequency
+      placeholder: 40 m, 7.102 MHz USB dial
+    validations:
+      required: true
+  - type: input
+    id: profile
+    attributes:
+      label: Profile and highest speed level reached
+      description: The profile name from `coppa profiles` or `coppad.toml`, and the highest level the link reached.
+      placeholder: HF_STANDARD, level 4
+    validations:
+      required: true
+  - type: input
+    id: snr
+    attributes:
+      label: Reported SNR
+      description: Optional. The SNR coppa or the host reported, in dB.
+  - type: input
+    id: path
+    attributes:
+      label: Path (distance and propagation)
+      description: Optional.
+      placeholder: 350 km, NVIS, daytime
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host application
+      options:
+        - Pat, Winlink P2P
+        - Other VARA-style TCP host
+        - ARDOP host interface
+        - KISS or Reticulum
+        - coppa CLI only
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Connected and transferred data
+        - Connected, but the transfer failed or stalled
+        - Never connected
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: What happened
+      description: How long the session ran, how much data moved, and anything that went wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`coppa doctor` output"
+      description: Optional. `coppa doctor` checks audio devices and rigctld without transmitting.
+      render: text
