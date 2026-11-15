@@ -1,6 +1,6 @@
 //! Air-protocol version 2 low-rate floor framing (COP-190, ADR-014).
 //!
-//! A floor frame carries one PDU of at most `MAX_PAYLOAD` bytes in a fixed
+//! A floor frame carries one PDU of at most [`MAX_PAYLOAD`](crate::modem::floor::MAX_PAYLOAD) bytes in a fixed
 //! 8.0 s airtime: a 16-symbol sync alphabet, four independently repeated
 //! 4-byte headers (version, length, CRC16), and an NR BG2 LDPC codeword
 //! carrying the payload plus a CRC32 check and zero padding. The header

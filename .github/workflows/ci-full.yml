@@ -118,13 +118,19 @@ jobs:
           echo "check_run_id=$check_id" >> "$GITHUB_OUTPUT"
 
   test-full:
-    name: Full test suite
+    name: Full test suite (${{ matrix.group }})
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [workspace, daemon-unit, daemon-integration, no-audio]
     runs-on: ubuntu-latest
     # COP-122: crates/coppa-daemon/tests/dashboard_touch.rs skips when no
     # Chrome or Chromium is found; here a missing browser fails it instead.
-    # The first step below runs it (websocket feature on).
+    # The daemon-integration group runs it (websocket feature on).
     env:
       COPPA_REQUIRE_BROWSER: "1"
+      RUST_TEST_THREADS: "2"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -133,15 +139,11 @@ jobs:
         with:
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ci-${{ matrix.group }}
       - name: Install ALSA dev headers (for cpal)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test --workspace --features cpal-backend,websocket,ardop,mdns,kiss-tnc
-      # cpal-backend compiles the daemon's WebSocket, /health and mDNS CLI
-      # tests out of the step above; this step runs them (COP-140).
-      - name: Connectionless AGW CLI tests without audio
-        run: cargo test -p coppa-cli --features kiss-tnc --test tnc_agw
-      - name: Daemon tests without audio (CLI, PTT release, reload, smoke)
-        run: cargo test -p coppa-daemon --features websocket,mdns,kiss-tnc --test cli --test ptt_release --test reload --test runtime_smoke
+      - run: bash tools/ci/run-full-tests.sh ${{ matrix.group }}
 
   bench-fuzz:
     name: Bench & Fuzz Compilation
@@ -222,7 +224,11 @@ jobs:
         with:
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - name: Install ALSA and libudev dev headers (for cpal and serialport)
+      # libudev-dev is for the baseline, not HEAD: semver-checks builds rustdoc
+      # for the merge base with each crate's features, and a base from before
+      # COP-47 still has serialport pulling in libudev-sys (coppa-radio's
+      # serial-ptt). Drop it once no open PR can have a pre-COP-47 merge base.
+      - name: Install ALSA and libudev dev headers (cpal; pre-COP-47 baselines)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       - name: Install cargo-semver-checks 0.51.0 (pinned and checksum-verified)
         run: |
@@ -306,20 +312,26 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # rustsec/audit-check creates a check-run to report its findings (vulnerabilities AND
-      # informational warnings like a yanked crate) -- without checks: write the default
-      # GITHUB_TOKEN can't do that. Safe to grant unconditionally here (unlike the old
-      # pull_request-triggered version, which had to split into a fork/Dependabot-safe branch):
-      # this job only ever runs via workflow_dispatch/push/merge_group, none of which is a
-      # PR-controlled-secret context GitHub itself would silently downgrade.
-      checks: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: "1.98.0"
+      # Update the version, URL and checksum together.
+      - name: Install cargo-audit 0.22.2 (pinned and checksum-verified)
+        run: |
+          set -euo pipefail
+          url=https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz
+          curl -fsSL -o "$RUNNER_TEMP/cargo-audit.tgz" "$url"
+          echo "ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39  $RUNNER_TEMP/cargo-audit.tgz" | sha256sum -c -
+          mkdir -p "$HOME/.cargo/bin"
+          tar -xzf "$RUNNER_TEMP/cargo-audit.tgz" -C "$HOME/.cargo/bin" --strip-components=1 cargo-audit-x86_64-unknown-linux-gnu-v0.22.2/cargo-audit
+          cargo audit --version
+      # Fail on vulnerabilities; keep warnings visible, as before. cargo-deny gates yanked crates.
+      - name: Audit dependencies
+        run: cargo audit --file Cargo.lock
 
   # HAG-81 PR #164 review lesson applied from the start: GHA step boundaries within one job do
   # NOT isolate a secret from PR-controlled code -- only job boundaries do (a PR-controlled step
@@ -437,7 +449,7 @@ jobs:
             wait_for_all "Create CI check-run on the reviewed SHA"
           fi
           SECONDS=0
-          wait_for_all "Full test suite" "Bench & Fuzz Compilation" Clippy "MSRV Check" "Supply-chain check (cargo-deny)" "Semver check (cargo-semver-checks)" "C ABI compatibility" "Security Audit" "Wiki lint"
+          wait_for_all "Full test suite (workspace)" "Full test suite (daemon-unit)" "Full test suite (daemon-integration)" "Full test suite (no-audio)" "Bench & Fuzz Compilation" Clippy "MSRV Check" "Supply-chain check (cargo-deny)" "Semver check (cargo-semver-checks)" "C ABI compatibility" "Security Audit" "Wiki lint"
 
       - name: Mint a hagale-agent installation token for the CI check-run
         id: app-token
@@ -528,48 +540,6 @@ jobs:
     permissions:
       checks: write
     steps:
-      # Codex P1, this PR's own round-8 review: the relay step below PATCHes the "CI" check-run
-      # create-ci-check made with a hagale-agent token (round-7 fix) -- github.token can never
-      # update a check-run a different run/identity created, so that PATCH was silently failing
-      # on every normal workflow_dispatch. This step only reads check-runs, so github.token
-      # stays fine for it.
-      # Codex P1, this PR's own round-9 review: create-ci-check can succeed (the managed "CI"
-      # check-run exists, hagale-agent-owned) while THIS mint fails transiently -- the watchdog
-      # only watches for jobs that never start and has already finished by the time this step
-      # runs, so nothing else would ever notice or retry. continue-on-error keeps the job going;
-      # the Relay step below falls back to publishing a FRESH check-run with github.token when
-      # this token is unavailable, rather than attempting (and silently failing) a PATCH.
-      - name: Mint a hagale-agent installation token for check-run writes
-        id: app-token
-        # Q-0068: only the workflow_dispatch relay below consumes this token.
-        if: github.event_name == 'workflow_dispatch'
-        continue-on-error: true
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: 4696353
-          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-
-      # Codex P1, this PR's own round-10 review: publishing a FRESH check-run when the mint
-      # above fails does NOT actually recover anything -- create-ci-check's own hagale-agent-
-      # owned "CI" check-run is left stuck in_progress alongside the new one, so the SAME
-      # required-check name now has a stuck check AND a concluded one, and the PR stays
-      # blocked regardless. A single retry (most mint failures are a transient API blip)
-      # covers the ordinary case; if it ALSO fails, the Relay step below now fails loudly
-      # instead of masking the problem with a duplicate (see HAG-90, which already scopes
-      # this exact residual gap for ci-full.yml).
-      - name: Retry minting a hagale-agent installation token if that failed
-        id: app-token-retry
-        if: github.event_name == 'workflow_dispatch' && steps.app-token.outcome == 'failure'
-        continue-on-error: true
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: 4696353
-          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-
       - name: Check all jobs (including the fast tier's own native results)
         id: check
         env:
@@ -620,9 +590,13 @@ jobs:
           # the raw --paginate output into a SEPARATE `jq -s` (jq's own slurp flag) is the only
           # way to combine pages before filtering.
           fast_tier_names='["Check","Test with Features (fast, lib-only)","Format","Platform Check (ubuntu-latest)","Platform Check (macos-latest)","Platform Check (windows-latest)"]'
+          # COP-207: a long wait polls many times, so one bad response (an API error, or a page
+          # without check_runs) must cost a retry, not the whole required check. Returns nonzero
+          # on any failure and the caller keeps the previous snapshot.
           fetch_fast_tier() {
-            gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-              | jq -s --argjson names "$fast_tier_names" '[.[].check_runs[] | select(.name as $n | $names | index($n))] | group_by(.name) | map(max_by(.started_at))'
+            local raw
+            raw=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs") || return 1
+            jq -se --argjson names "$fast_tier_names" 'if all(.[]; (.check_runs | type) == "array") then [.[].check_runs[] | select(.name as $n | $names | index($n))] | group_by(.name) | map(max_by(.started_at)) else error("no check_runs in response") end' <<<"$raw"
           }
           # Codex P1, round 3 (this PR's own review): ci.yml and ci-full.yml are two SEPARATE
           # workflow files triggered by the SAME event (push/merge_group) with NO ordering
@@ -633,21 +607,39 @@ jobs:
           # bounded timeout instead of a single read; this also naturally covers
           # workflow_dispatch (the fast tier's checks already completed when the PR was open, so
           # this returns on its first iteration there).
-          fast_tier_deadline=$((SECONDS + 1800))
+          # COP-207: the fast tier routinely runs 30-63 min (Windows platform check avg 44m, max
+          # 63m; Test with Features max 57m over 21 green runs), so a 30-min wait failed green PRs
+          # and burned Catalyst repair rounds (COP-198). ci.yml now caps those jobs with
+          # timeout-minutes: 90, so a hung check concludes on its own; wait past that plus queue.
+          fast_tier_wait_s=7200
+          fast_tier_deadline=$((SECONDS + fast_tier_wait_s))
+          still_pending=0
           fast_tier_results='[]'
           while [ "$SECONDS" -lt "$fast_tier_deadline" ]; do
-            fast_tier_results=$(fetch_fast_tier)
+            if ! polled=$(fetch_fast_tier 2>/dev/null); then
+              echo "::warning::fast-tier check-run lookup on $HEAD_SHA failed; retrying"
+              sleep 30
+              continue
+            fi
+            fast_tier_results=$polled
             still_pending=$(echo "$fast_tier_results" | jq '[.[] | select(.status != "completed")] | length')
             found=$(echo "$fast_tier_results" | jq 'length')
             if [ "$found" -eq 6 ] && [ "$still_pending" -eq 0 ]; then
               break
             fi
             echo "Waiting for ci.yml's fast tier to finish on $HEAD_SHA ($found/6 found, $still_pending still running)..."
-            sleep 15
+            sleep 30
           done
+          wait_min=$((fast_tier_wait_s / 60))
           missing=$(echo "$fast_tier_results" | jq --argjson names "$fast_tier_names" '$names - [.[].name]')
           if [ "$(echo "$missing" | jq 'length')" -gt 0 ]; then
-            echo "::error::Missing or still-incomplete fast-tier check-run(s) for $HEAD_SHA after 30 minutes: $missing -- ci.yml may not have run at all, ran against a different SHA, or is still queued/running."
+            echo "::error::Missing fast-tier check-run(s) for $HEAD_SHA after $wait_min minutes: $missing -- ci.yml may not have run at all, ran against a different SHA, or is still queued."
+            echo "outcome=failure" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          running=$(echo "$fast_tier_results" | jq -c '[.[] | select(.status != "completed") | .name]')
+          if [ "$(echo "$running" | jq 'length')" -gt 0 ]; then
+            echo "::error::Fast-tier check(s) still running on $HEAD_SHA after $wait_min minutes (timed out waiting, not failed): $running"
             echo "outcome=failure" >> "$GITHUB_OUTPUT"
             exit 1
           fi
@@ -658,6 +650,52 @@ jobs:
             exit 1
           fi
           echo "outcome=success" >> "$GITHUB_OUTPUT"
+
+      # COP-207 (Codex P1 on #269): minted AFTER the fast-tier wait, never before it. The
+      # wait can run up to 120 min and an installation token expires after 60, so a token
+      # minted up front would be dead by the time the relay PATCHes the CI check-run.
+      # always(): the check step exits 1 on a failed tier, and the relay still needs it.
+      # Codex P1, this PR's own round-8 review: the relay step below PATCHes the "CI" check-run
+      # create-ci-check made with a hagale-agent token (round-7 fix) -- github.token can never
+      # update a check-run a different run/identity created, so that PATCH was silently failing
+      # on every normal workflow_dispatch. This step only reads check-runs, so github.token
+      # stays fine for it.
+      # Codex P1, this PR's own round-9 review: create-ci-check can succeed (the managed "CI"
+      # check-run exists, hagale-agent-owned) while THIS mint fails transiently -- the watchdog
+      # only watches for jobs that never start and has already finished by the time this step
+      # runs, so nothing else would ever notice or retry. continue-on-error keeps the job going;
+      # the Relay step below falls back to publishing a FRESH check-run with github.token when
+      # this token is unavailable, rather than attempting (and silently failing) a PATCH.
+      - name: Mint a hagale-agent installation token for check-run writes
+        id: app-token
+        # Q-0068: only the workflow_dispatch relay below consumes this token.
+        if: always() && github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      # Codex P1, this PR's own round-10 review: publishing a FRESH check-run when the mint
+      # above fails does NOT actually recover anything -- create-ci-check's own hagale-agent-
+      # owned "CI" check-run is left stuck in_progress alongside the new one, so the SAME
+      # required-check name now has a stuck check AND a concluded one, and the PR stays
+      # blocked regardless. A single retry (most mint failures are a transient API blip)
+      # covers the ordinary case; if it ALSO fails, the Relay step below now fails loudly
+      # instead of masking the problem with a duplicate (see HAG-90, which already scopes
+      # this exact residual gap for ci-full.yml).
+      - name: Retry minting a hagale-agent installation token if that failed
+        id: app-token-retry
+        if: always() && github.event_name == 'workflow_dispatch' && steps.app-token.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
 
       - name: Relay this result onto the reviewed SHA's CI check-run (workflow_dispatch only)
         if: always() && github.event_name == 'workflow_dispatch'

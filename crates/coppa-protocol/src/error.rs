@@ -316,4 +316,7 @@ pub enum ProtocolError {
         /// Shortest valid transport PDU, in bytes.
         min: usize,
     },
+    /// COP-168: CONNECT_CFM did not confirm the `windowed_arq` AND.
+    #[error("Windowed-ARQ capability does not match negotiation")]
+    WindowedArqMismatch,
 }

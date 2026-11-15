@@ -8,9 +8,10 @@ sources:
   - docs/SPEC.md
   - docs/adr/012-cop119-session-outer-code.md
   - crates/coppa-daemon/src/event_loop.rs
+  - crates/coppa-protocol/src/modem/transceiver.rs
 verified:
-  commit: d837c89
-  date: 2026-11-04
+  commit: 1ac3273
+  date: 2026-11-11
 links:
   - coppa-protocol
   - overview
@@ -32,3 +33,10 @@ The TX-duration guard can send a plain frame inside a protected session.
 `link.fade_protection` still reports the negotiated mode. `fade_hold` is a
 separate retransmission state. See OPERATING for configuration and BENCHMARKS
 for the measured simulation limits.
+
+COP-168 adds opt-in multi-codeword PHY combining. `HarqPolicy::multi_codeword`
+is false by default, including in existing daemon sessions. Enabling it keeps
+one accumulator per codeword, with at most 64 slots across all frame keys.
+Changing any policy field clears the accumulators. A measured PHY RV schedule
+does not enable windowed sessions in coppad. See LIMITATIONS for the remaining
+session integration work.

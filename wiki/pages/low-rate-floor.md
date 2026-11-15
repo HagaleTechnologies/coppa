@@ -8,6 +8,7 @@ sources:
   - BENCHMARKS.md
   - docs/LIMITATIONS.md
   - crates/coppa-bench/src/floor_candidate.rs
+  - crates/coppa-bench/src/floor_sweep.rs
   - crates/coppa-protocol/src/modem/floor.rs
 verified:
   commit: 19948e9f8eb8e8139fb86b9237112cc83ed6095a
@@ -50,10 +51,14 @@ and a 1 kHz tone plus noise. It does not establish RF false-alarm probability
 or a fading FER crossing.
 
 `floor_mode sweep --rx batch|streaming|both` measures the production batch and
-streaming receive paths on the same seeds, but only for the `ofdm:1`
-baseline; sweeping the production floor waveform through the diagnostic is
-COP-191's driver work. `connect` and `ramp` need the production floor
-session and do not exist yet.
+streaming receive paths. COP-191 adds `--waveform floor` using the production
+`FloorFrame` and `FloorStream`, with one impaired capture per seed fed to both.
+The noisy tail must cover the continuous receiver's next scheduled decode.
+See [production sweep results](../../BENCHMARKS.md#cop-191-production-floor-sweeps)
+for measured verdicts. Both receivers fail the sync-share bar on both channels,
+with zero wrong payloads. `connect` and `ramp` still need COP-190's deferred
+production session controller. A codec receive test does not prove session
+establishment, floor ACKs or OFDM recovery.
 
 
 CFO search in the experimental batch and continuous receiver uses thirteen
@@ -77,8 +82,10 @@ for seeds, accounting and remaining acceptance work. Session integration stays
 open; a decoded floor frame does not prove a connection.
 
 The library floor controller reserves streaming delivery time in addition to
-airtime. Keying interrupts capture, so Link breaks floor acquisition history
-at each transmission boundary. Otherwise retained samples from before and
+airtime. Keying interrupts capture, so Link breaks both OFDM and floor
+acquisition history at each transmission boundary. Keeping OFDM history across
+these gaps caused repeated losses in the level-8, 680-byte binary transfer
+regression in `crates/coppa-engine/src/link/tests.rs`. Otherwise retained samples from before and
 after transmission can be mistaken for contiguous audio. Probe recovery also
 needs room before idle keepalives. See the
 [session policy](../../docs/SPEC.md#negotiated-low-rate-floor-session-policy)
@@ -88,6 +95,14 @@ Floor-enabled caller retry delays use the complete callsign ordering that also
 chooses the answerer during simultaneous calls. A three-bucket delay based on
 the last callsign byte left N0AAA and N0AAD synchronized until retries ran out.
 The lexical answerer now waits through two OFDM windows and a floor response
-window before retrying OFDM. Floor retries keep their normal response window,
-which is shorter than the idle handshake timeout. The paired-audio regression covers these formerly equal
-delays; it does not establish the numerical connection bar.
+window before retrying OFDM. Floor retries keep their normal response window. The paired-audio regression
+covers these formerly equal delays; it does not establish the numerical
+connection bar.
+
+Discovery staggering can exceed the shared 30-second handshake expiry. For
+N0AAD calling N0AAA, a six-second RTO and 500 ms turnaround delay the first
+retry until 31 seconds. Link extends its local Calling timeout beyond that
+retry and turnaround; retry exhaustion still ends silent calls. Keep these
+bounds together when changing discovery timing. See `Link::run_timers` in
+[link.rs](../../crates/coppa-engine/src/link.rs) and the boundary and exhaustion
+tests in [link/tests.rs](../../crates/coppa-engine/src/link/tests.rs).

@@ -127,6 +127,16 @@ thoughts/
 # COP-114 independent FX.25 audio regression fixtures.
 !crates/coppa-codec/tests/fixtures/fx25/*.wav
 
+# COP-191 locked production floor sweeps, audited by floor_results.rs.
+!/results/cop-191/
+/results/cop-191/**
+!/results/cop-191/final-awgn/
+!/results/cop-191/final-awgn/metadata.txt
+!/results/cop-191/final-awgn/sweep.csv
+!/results/cop-191/final-poor/
+!/results/cop-191/final-poor/metadata.txt
+!/results/cop-191/final-poor/sweep.csv
+
 # COP-190 production-floor development evidence.
 !/results/cop-190/
 /results/cop-190/**

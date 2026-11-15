@@ -479,4 +479,20 @@ fn chat_record_and_app_messages_failures() {
         ProtocolError::AppMessagesMismatch,
         "Application-message capability does not match negotiation"
     );
+
+    // COP-168: bit 5 follows the same CONNECT_CFM rule as bit 4.
+    let caps = LinkCapabilities {
+        windowed_arq: true,
+        ..LinkCapabilities::default()
+    };
+    let mut s = session(caps.clone());
+    s.handle_connect_req(&caps.to_bytes(), Instant::now())
+        .unwrap();
+    let mut bad = caps;
+    bad.windowed_arq = false;
+    failure!(
+        s.handle_connect_cfm(&bad.to_bytes(), Instant::now()),
+        ProtocolError::WindowedArqMismatch,
+        "Windowed-ARQ capability does not match negotiation"
+    );
 }

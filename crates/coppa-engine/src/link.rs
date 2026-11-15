@@ -1186,7 +1186,9 @@ impl Link {
         };
         match encoded {
             Ok(samples) => {
-                // Capture is discontinuous while keyed. Break the floor detector history.
+                // Capture is discontinuous while keyed. Discard both receive
+                // histories so samples across a transmission are not joined.
+                self.core.reconfigure(self.config.engine.clone());
                 self.core.push_floor_samples(&[f32::NAN]);
                 if self.phase != Phase::Closing {
                     self.tx_mode = Some(mode);
@@ -1234,29 +1236,27 @@ impl Link {
     /// algorithm in `coppa_daemon::tx_chunker::next_chunk_len`; unify after
     /// COP-110 (PR #204) lands.
     fn fit_chunk_len(&self, seq: u8) -> usize {
-        let header = MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE;
-        let level_budget =
-            |level: u8| coppa_protocol::modem::max_payload_for_level(level).unwrap_or(0);
-        let level = self.core.speed_level();
-        let (budget, raw_cap) = if self.floor_negotiated() {
+        let floor_limit = if self.floor_negotiated() {
             let negotiated = self
                 .session
                 .as_ref()
                 .and_then(|s| s.negotiated.as_ref())
                 .map_or(40, |c| usize::from(c.max_payload_size));
-            // A floor-session chunk may be keyed (or retransmitted) on the raw
-            // 40-byte floor waveform, on the level-1 OFDM recovery probe, or at
-            // the current level. It must fit all three, and the OFDM budgets
-            // apply after compression, which can expand incompressible bytes.
-            (
-                level_budget(1).min(level_budget(level)),
-                Some(40.min(negotiated).saturating_sub(header)),
-            )
+            40.min(negotiated)
+                .saturating_sub(MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE)
         } else {
-            (level_budget(level), None)
+            usize::MAX
         };
-        let optimistic = budget.saturating_sub(header + 1).max(1);
-        let optimistic = raw_cap.map_or(optimistic, |cap| optimistic.min(cap).max(1));
+        // Floor-capable segments can be retransmitted on a level-1 recovery
+        // probe. Bound both the raw floor PDU and its compressed OFDM payload.
+        let level = if self.floor_negotiated() {
+            1
+        } else {
+            self.core.speed_level()
+        };
+        let budget = coppa_protocol::modem::max_payload_for_level(level).unwrap_or(0);
+        let header = MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE;
+        let optimistic = budget.saturating_sub(header + 1).max(1).min(floor_limit);
         // Only the first `optimistic` bytes can go in one chunk; copying the
         // whole backlog here would make a large send() quadratic.
         let rest: Vec<u8> = self.backlog.iter().take(optimistic).copied().collect();

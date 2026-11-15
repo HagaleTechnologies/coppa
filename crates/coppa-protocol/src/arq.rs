@@ -166,6 +166,85 @@ pub fn rv_for_attempt(attempt: u8) -> u8 {
     CYCLE[(attempt % 4) as usize]
 }
 
+/// COP-168 (COP-168 design rule 1): the largest data-frame window a connected
+/// session may negotiate for windowed ARQ.
+///
+/// The PHY HARQ key of a windowed session frame is 4 bits wide
+/// ([`windowed_phy_seq`]). Capping the window at 8 keeps at least `2 * W`
+/// keys, so a stale soft buffer left by a duplicate in
+/// `[recv_base - W, recv_base)` never shares a key with a segment in the
+/// receive window `[recv_base, recv_base + W)`.
+pub const MAX_SESSION_WINDOW: u8 = 8;
+
+/// COP-168 (COP-168 design rule 2): the PHY header `seq_num` byte of a frame in a
+/// windowed session keying.
+///
+/// The high nibble is `following`, the number of further frames in the same
+/// keying (saturating at 15). The low nibble is the HARQ key:
+/// `transport_seq & 0x0F` for a data frame, 0 for an ACK.
+///
+/// An ACK's key 0 equals the key of data segments 0, 16, 32 and so on, so
+/// in a session with data flowing both ways a receiver that let an ACK's
+/// RV0 frame reset key 0 would drop that data segment's soft buffer. The
+/// receiver side (not built yet) must keep ACK frames out of HARQ combining
+/// and the RV0 reset; `docs/LIMITATIONS.md` records this.
+pub fn windowed_phy_seq(following: u8, transport_seq: u8) -> u8 {
+    (following.min(15) << 4) | (transport_seq & 0x0F)
+}
+
+/// COP-168 (COP-168 design rule 5): the HARQ key of a windowed session frame, the
+/// low nibble of its PHY `seq_num`.
+pub fn windowed_harq_key(phy_seq: u8) -> u8 {
+    phy_seq & 0x0F
+}
+
+/// COP-168 (COP-168 design rule 2): how many further frames follow this one in the
+/// same keying, the high nibble of its PHY `seq_num`.
+pub fn phy_following(phy_seq: u8) -> u8 {
+    phy_seq >> 4
+}
+
+/// COP-168 (COP-168 design, RV table): the redundancy-version order per speed level for a
+/// windowed session, indexed by level (index 0 is unused).
+///
+/// Entry 0 of every row is RV0, the first transmission. Retransmission
+/// attempt `k` (k >= 1) uses entry `((k - 1) % 3) + 1`, so a retransmission
+/// never repeats RV0 and an RV0 frame always starts a fresh soft buffer.
+///
+/// Measured by `cargo run --release -p coppa-bench --example session_harq`;
+/// see BENCHMARKS.md, "COP-168 PHY HARQ schedule" for the calibrated operating
+/// points, paired rescue counts and limits. Each level's order maximizes
+/// first-retransmission rescue; ties within one frame use second-retransmission
+/// rescue, then the order closest to 3GPP's `[2, 3, 1]`. Level 9 uses level 8's
+/// order because this measurement covers HF levels 1 through 8 only.
+pub const RV_SCHEDULE: [[u8; 4]; 10] = [
+    [0, 1, 3, 2], // unused level 0
+    [0, 3, 1, 2],
+    [0, 3, 1, 2],
+    [0, 3, 2, 1],
+    [0, 3, 2, 1],
+    [0, 3, 2, 1],
+    [0, 1, 2, 3],
+    [0, 3, 2, 1],
+    [0, 3, 2, 1],
+    [0, 3, 2, 1], // VHF: copy level 8 until measured
+];
+
+/// COP-168 (COP-168 design rule 4): the redundancy version for transmission
+/// `attempt` of a segment at speed `level` in a windowed session.
+///
+/// `attempt` 0 is the first transmission and is always RV0. Attempt `k >= 1`
+/// cycles through [`RV_SCHEDULE`]`[level]`'s entries 1 to 3 with period 3.
+/// A level above 9 uses level 9's row. [`ArqTx::transmit_count`] gives the
+/// attempt index of a segment's next transmission.
+pub fn rv_for_session_attempt(level: u8, attempt: u8) -> u8 {
+    if attempt == 0 {
+        return 0;
+    }
+    let row = &RV_SCHEDULE[(level as usize).min(RV_SCHEDULE.len() - 1)];
+    row[((attempt as usize - 1) % 3) + 1]
+}
+
 /// ARQ configuration.
 #[derive(Debug, Clone)]
 pub struct ArqConfig {
@@ -730,6 +809,27 @@ impl ArqTx {
         self.config.max_retransmit = n;
     }
 
+    /// COP-168: sequence numbers in flight that no ACK has acknowledged yet,
+    /// oldest first.
+    ///
+    /// A selectively-acked segment is left out, so after a burst ACK this is
+    /// the set of segments the burst lost (COP-168 design rule 7). A segment that
+    /// has used up its retransmit budget is still listed.
+    pub fn unacked(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut seq = self.send_base;
+        while seq != self.next_seq {
+            let idx = seq as usize % MAX_WINDOW_SIZE as usize;
+            if let Some(seg) = &self.tx_buf[idx] {
+                if seg.seq_num == seq && !seg.acked {
+                    out.push(seq);
+                }
+            }
+            seq = seq.wrapping_add(1);
+        }
+        out
+    }
+
     /// Number of segments currently in flight (sent but unacked).
     pub fn in_flight(&self) -> u8 {
         self.next_seq.wrapping_sub(self.send_base)
@@ -850,6 +950,89 @@ impl ArqRx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── COP-168: windowed session primitives ────────────────────────
+
+    #[test]
+    fn windowed_phy_seq_packs_following_and_low_nibble() {
+        assert_eq!(windowed_phy_seq(3, 0x2B), 0x3B);
+        assert_eq!(windowed_phy_seq(0, 0x2E), 0x0E);
+        assert_eq!(
+            windowed_phy_seq(16, 0x01),
+            0xF1,
+            "following saturates at 15"
+        );
+        assert_eq!(windowed_phy_seq(255, 0x00), 0xF0);
+        for seq in 0..=255u8 {
+            for following in [0u8, 1, 7, 15] {
+                let b = windowed_phy_seq(following, seq);
+                assert_eq!(windowed_harq_key(b), seq & 0x0F);
+                assert_eq!(phy_following(b), following);
+            }
+        }
+    }
+
+    #[test]
+    fn window_keys_are_unique_and_wrap_consistent() {
+        for w in 2..=MAX_SESSION_WINDOW {
+            for b in 0..=255u8 {
+                let mut keys = Vec::new();
+                for i in 0..w {
+                    keys.push(windowed_harq_key(b.wrapping_add(i)));
+                    keys.push(windowed_harq_key(b.wrapping_sub(w).wrapping_add(i)));
+                }
+                let mut sorted = keys.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                assert_eq!(sorted.len(), keys.len(), "W={w} base={b}: {keys:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rv_for_session_attempt_never_repeats_rv0() {
+        for level in 0..=10u8 {
+            assert_eq!(rv_for_session_attempt(level, 0), 0);
+            for attempt in 1..=20u8 {
+                let rv = rv_for_session_attempt(level, attempt);
+                assert!((1..=3).contains(&rv), "level {level} attempt {attempt}");
+                if attempt > 3 {
+                    assert_eq!(rv, rv_for_session_attempt(level, attempt - 3));
+                }
+            }
+            let first3: Vec<u8> = (1..=3).map(|a| rv_for_session_attempt(level, a)).collect();
+            let mut sorted = first3.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, vec![1, 2, 3], "each RV once per cycle");
+        }
+        for row in RV_SCHEDULE {
+            assert_eq!(row[0], 0);
+            assert_ne!(row[1], 0);
+        }
+    }
+
+    #[test]
+    fn unacked_lists_in_flight_oldest_first() {
+        let now = Instant::now();
+        for start in [0u8, 254] {
+            let mut tx = ArqTx::new(ArqConfig::default()).unwrap();
+            // Advance next_seq/send_base to `start` (exercises the 255 -> 0 wrap).
+            for _ in 0..start {
+                let s = tx.send(vec![0], now).unwrap();
+                tx.process_ack(s.wrapping_add(1), 0, now);
+            }
+            let seqs: Vec<u8> = (0..4).map(|_| tx.send(vec![1, 2], now).unwrap()).collect();
+            assert_eq!(tx.unacked(), seqs);
+            // Cumulative ACK of seqs[0], selective ACK of seqs[2]
+            // (bit 0 covers ack_num + 1).
+            tx.process_ack(seqs[1], 0b1, now);
+            assert_eq!(tx.unacked(), vec![seqs[1], seqs[3]]);
+            tx.process_ack(seqs[1], 0b11, now);
+            assert_eq!(tx.unacked(), vec![seqs[1]]);
+            tx.process_ack(seqs[3].wrapping_add(1), 0, now);
+            assert!(tx.unacked().is_empty());
+        }
+    }
 
     #[test]
     fn cop81_all_window_values_are_checked_at_both_boundaries() {

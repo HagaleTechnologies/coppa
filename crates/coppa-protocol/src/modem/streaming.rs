@@ -42,7 +42,7 @@ use coppa_codec::ofdm::header_fec;
 use coppa_codec::ofdm::sync_detector::{SyncCandidate, SyncDetector};
 use coppa_codec::ofdm::CoppaProfile;
 
-use crate::modem::transceiver::{CoppaTransceiver, ReceiveError, MAX_CODEWORDS};
+use crate::modem::transceiver::{CoppaTransceiver, HarqPolicy, ReceiveError, MAX_CODEWORDS};
 
 /// LDPC coded block length (Z=81, 24 base columns) — constant for all code rates;
 /// mirrors `CoppaModem::demodulate_frame`'s own `CODED_BLOCK_LEN`.
@@ -191,7 +191,18 @@ pub struct StreamingReceiver {
     /// level change) replaces this receiver and restarts the count, which is
     /// fine for the daemon's before/after-delta read.
     header_only_decodes: u32,
+    /// COP-168: protected headers of the post-header failures counted in
+    /// `header_only_decodes`, oldest first, at most [`MAX_FAILED_HEADERS`]
+    /// (the oldest is dropped when full). A windowed session reads them to
+    /// learn which in-flight frames it heard but could not decode. Drained by
+    /// [`StreamingReceiver::take_failed_headers`].
+    failed_headers: VecDeque<CoppaHeader>,
 }
+
+/// Cap on [`StreamingReceiver::take_failed_headers`]' backlog (COP-168):
+/// twice the largest session window, so one burst plus its retransmission
+/// fits between two reads.
+pub const MAX_FAILED_HEADERS: usize = 16;
 
 impl std::fmt::Debug for StreamingReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -216,6 +227,33 @@ impl StreamingReceiver {
     #[cfg(test)]
     fn harq_buffer_count(&self) -> usize {
         self.transceiver.harq_buffer_count()
+    }
+
+    /// Set the receive-side IR-HARQ combining policy (COP-168). See
+    /// [`HarqPolicy`].
+    pub fn set_harq_policy(&mut self, policy: HarqPolicy) {
+        self.transceiver.set_harq_policy(policy);
+    }
+
+    /// The current receive-side IR-HARQ combining policy (COP-168).
+    pub fn harq_policy(&self) -> HarqPolicy {
+        self.transceiver.harq_policy()
+    }
+
+    /// Frames that passed CRC while their soft-buffer key held more than one
+    /// transmission (COP-168). See
+    /// [`CoppaTransceiver::harq_combined_successes`] for what it does and does
+    /// not show.
+    pub fn harq_combined_successes(&self) -> u64 {
+        self.transceiver.harq_combined_successes()
+    }
+
+    /// Drain the protected headers of frames whose header decoded but whose
+    /// payload failed FEC or CRC since the last call, oldest first
+    /// (COP-168). Holds at most [`MAX_FAILED_HEADERS`]; a second call with
+    /// no new failure returns an empty `Vec`.
+    pub fn take_failed_headers(&mut self) -> Vec<CoppaHeader> {
+        self.failed_headers.drain(..).collect()
     }
 
     /// Create a receiver for `profile` whose sync detector and transceiver
@@ -266,6 +304,7 @@ impl StreamingReceiver {
             resume_from: 0,
             pending: None,
             header_only_decodes: 0,
+            failed_headers: VecDeque::new(),
         }
     }
 
@@ -483,6 +522,14 @@ impl StreamingReceiver {
                             ReceiveError::LdpcNotConverged { .. } | ReceiveError::CrcMismatch
                         ) {
                             self.header_only_decodes += 1;
+                            // COP-168: keep the header the peek decoded, so
+                            // a windowed session can tell which frame failed.
+                            if let Some(h) = self.pending.as_ref().and_then(|p| p.header.clone()) {
+                                if self.failed_headers.len() >= MAX_FAILED_HEADERS {
+                                    self.failed_headers.pop_front();
+                                }
+                                self.failed_headers.push_back(h);
+                            }
                         }
                     }
                 }
@@ -976,6 +1023,60 @@ mod tests {
             before + 1,
             "pre-header failures must not count as evidence"
         );
+    }
+
+    /// COP-168: a frame whose header decodes and whose payload fails is
+    /// reported once by `take_failed_headers`, with its `seq_num`, level and
+    /// codeword count; the backlog is capped at `MAX_FAILED_HEADERS`.
+    #[test]
+    fn failed_payload_headers_are_reported_once() {
+        let profile = CoppaProfile::hf_standard();
+        let tx = CoppaTransceiver::new(profile.clone(), 1);
+        let symbol_len = profile.fft_size + profile.cp_samples;
+        let header_syms = header_fec::PROTECTED_HEADER_CODED_BITS.div_ceil(profile.data_carriers);
+        let header_end = (3 + header_syms) * symbol_len;
+
+        let payload = b"failed-header report".to_vec();
+        let mut header = header(2, payload.len() as u16);
+        header.fec_type = 1;
+        header.seq_num = 0x2B;
+        let mut corrupted = tx.transmit(&header, &payload).unwrap();
+        let cut = header_end.min(corrupted.len());
+        for s in corrupted.iter_mut().skip(cut) {
+            *s = 0.0;
+        }
+        let mut stream = vec![0.0f32; 4 * symbol_len];
+        stream.extend_from_slice(&corrupted);
+        stream.extend(std::iter::repeat_n(0.0f32, 4 * symbol_len));
+
+        let mut rx = StreamingReceiver::new(profile.clone(), 1);
+        assert!(rx.take_failed_headers().is_empty());
+        assert!(rx.push_samples(&stream).is_empty());
+        let failed = rx.take_failed_headers();
+        assert_eq!(failed.len(), 1, "one failed frame, one header");
+        assert_eq!(failed[0].seq_num, 0x2B);
+        assert_eq!(failed[0].speed_level, 2);
+        assert_eq!(failed[0].codewords, 1);
+        assert_eq!(failed[0].fec_type & 0x03, 1);
+        assert!(
+            rx.take_failed_headers().is_empty(),
+            "drained by the first call"
+        );
+
+        // The backlog never exceeds MAX_FAILED_HEADERS; the newest survive.
+        for i in 0..(MAX_FAILED_HEADERS + 2) {
+            rx.failed_headers.push_back(CoppaHeader {
+                seq_num: i as u8,
+                ..header.clone()
+            });
+            if rx.failed_headers.len() > MAX_FAILED_HEADERS {
+                rx.failed_headers.pop_front();
+            }
+        }
+        assert!(rx.push_samples(&stream).is_empty());
+        let failed = rx.take_failed_headers();
+        assert_eq!(failed.len(), MAX_FAILED_HEADERS);
+        assert_eq!(failed.last().map(|h| h.seq_num), Some(0x2B));
     }
 
     #[test]
