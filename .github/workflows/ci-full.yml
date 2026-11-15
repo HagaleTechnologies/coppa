@@ -537,11 +537,18 @@ jobs:
         checks-queue-watchdog,
       ]
     runs-on: ubuntu-latest
+    # COP-203: above the Check step's 80-minute cap (its 75-minute fast-tier wait plus margin)
+    # and the seconds-long mint and relay steps after it, so the wait's own named error fires
+    # before the job is cancelled.
+    timeout-minutes: 90
     permissions:
       checks: write
     steps:
       - name: Check all jobs (including the fast tier's own native results)
         id: check
+        # COP-203: 5 min above the 75-minute wait and under the job's 90. If a gh call hangs,
+        # this step fails on its own and the always() mint and relay steps still conclude CI.
+        timeout-minutes: 80
         env:
           EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -609,10 +616,18 @@ jobs:
           # this returns on its first iteration there).
           # COP-207: the fast tier routinely runs 30-63 min (Windows platform check avg 44m, max
           # 63m; Test with Features max 57m over 21 green runs), so a 30-min wait failed green PRs
-          # and burned Catalyst repair rounds (COP-198). ci.yml now caps those jobs with
-          # timeout-minutes: 90, so a hung check concludes on its own; wait past that plus queue.
-          fast_tier_wait_s=7200
-          fast_tier_deadline=$((SECONDS + fast_tier_wait_s))
+          # and burned Catalyst repair rounds (COP-198). ci.yml caps those jobs at 90 min.
+          # COP-203: ci.yml's platform checks take 40-63 minutes (Windows median 41, max 63.5
+          # over 193 runs, 2026-11-06..14), so a 30-minute wait failed CI on checks that later
+          # passed. Budget: wait 75 min, under this job's timeout-minutes of 90 (15 min margin).
+          # This job starts after every other ci-full job, the slowest usually test-full
+          # (timeout-minutes 25), so the verdict lands by about 25 + 75 = 100 min, 20 min under
+          # the merge queue's check_response_timeout_minutes of 120 (ruleset "Coppa - Native
+          # Merge Queue", id 23405672, read 2026-11-14). That ruleset lives outside this repo:
+          # recheck this budget if it changes. A check still running at the deadline fails
+          # below, by name, as still running.
+          fast_tier_wait_minutes=75
+          fast_tier_deadline=$((SECONDS + fast_tier_wait_minutes * 60))
           still_pending=0
           fast_tier_results='[]'
           while [ "$SECONDS" -lt "$fast_tier_deadline" ]; do
@@ -630,16 +645,17 @@ jobs:
             echo "Waiting for ci.yml's fast tier to finish on $HEAD_SHA ($found/6 found, $still_pending still running)..."
             sleep 30
           done
-          wait_min=$((fast_tier_wait_s / 60))
-          missing=$(echo "$fast_tier_results" | jq --argjson names "$fast_tier_names" '$names - [.[].name]')
+          # -c: a workflow-command annotation ends at the first newline, so the names must
+          # print on the same line as ::error:: (COP-203).
+          missing=$(echo "$fast_tier_results" | jq -c --argjson names "$fast_tier_names" '$names - [.[].name]')
           if [ "$(echo "$missing" | jq 'length')" -gt 0 ]; then
-            echo "::error::Missing fast-tier check-run(s) for $HEAD_SHA after $wait_min minutes: $missing -- ci.yml may not have run at all, ran against a different SHA, or is still queued."
+            echo "::error::Missing fast-tier check-run(s) for $HEAD_SHA after $fast_tier_wait_minutes minutes: $missing -- ci.yml may not have run at all, ran against a different SHA, or is still queued."
             echo "outcome=failure" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           running=$(echo "$fast_tier_results" | jq -c '[.[] | select(.status != "completed") | .name]')
           if [ "$(echo "$running" | jq 'length')" -gt 0 ]; then
-            echo "::error::Fast-tier check(s) still running on $HEAD_SHA after $wait_min minutes (timed out waiting, not failed): $running"
+            echo "::error::Fast-tier check(s) still running on $HEAD_SHA after $fast_tier_wait_minutes minutes (timed out waiting, not failed): $running"
             echo "outcome=failure" >> "$GITHUB_OUTPUT"
             exit 1
           fi
@@ -652,14 +668,15 @@ jobs:
           echo "outcome=success" >> "$GITHUB_OUTPUT"
 
       # COP-207 (Codex P1 on #269): minted AFTER the fast-tier wait, never before it. The
-      # wait can run up to 120 min and an installation token expires after 60, so a token
-      # minted up front would be dead by the time the relay PATCHes the CI check-run.
+      # wait can run up to 75 min (COP-203) and an installation token expires after 60 (the
+      # same reason as HAG-108's watchdog mint), so a token minted up front would be dead by
+      # the time the relay PATCHes the CI check-run.
       # always(): the check step exits 1 on a failed tier, and the relay still needs it.
       # Codex P1, this PR's own round-8 review: the relay step below PATCHes the "CI" check-run
       # create-ci-check made with a hagale-agent token (round-7 fix) -- github.token can never
       # update a check-run a different run/identity created, so that PATCH was silently failing
-      # on every normal workflow_dispatch. This step only reads check-runs, so github.token
-      # stays fine for it.
+      # on every normal workflow_dispatch. The Check step above only reads check-runs, so
+      # github.token stays fine for it.
       # Codex P1, this PR's own round-9 review: create-ci-check can succeed (the managed "CI"
       # check-run exists, hagale-agent-owned) while THIS mint fails transiently -- the watchdog
       # only watches for jobs that never start and has already finished by the time this step

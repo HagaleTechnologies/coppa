@@ -10,8 +10,8 @@ sources:
   - .github/workflows/ci-full.yml
   - crates/coppa-host/src/vara/command.rs
 verified:
-  commit: fa4de8e
-  date: 2026-11-13
+  commit: 76823db
+  date: 2026-11-15
 links:
   - paused-clock-timers
   - cpal-feature-gate
@@ -33,3 +33,10 @@ A paused Tokio deadline can outrun the real TCP delayed-ACK timer. Full-CI
 measurement exposed this in BPQ startup replies; the VARA command server
 disables Nagle buffering so small replies do not wait for real-time ACKs.
 See the measurement document for the baseline reproduction and fix.
+
+The `ci` fan-in waits for ci.yml's fast tier. That wait must stay under the
+`ci` job's `timeout-minutes` and under the merge queue's check-response
+timeout. The queue timeout is set in a ruleset outside this repository, so a
+ruleset change can break the budget without a diff here. A GitHub App token
+minted before a long wait expires after an hour; mint it after the wait. See
+[the fast-tier wait](../../docs/testing/full-ci.md#fast-tier-wait).
