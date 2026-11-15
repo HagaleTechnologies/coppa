@@ -220,6 +220,8 @@ Each crate has a README in `crates/<name>/`; to call the modem from your own Rus
 
 ## Architecture
 
+See [docs/README.md](docs/README.md) for an index of every document in `docs/`.
+
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full system design, TX/RX pipeline details, and layer responsibilities.
 
 See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for known limitations: measured gaps, open bugs and targets the code does not yet meet.
@@ -231,6 +233,13 @@ See [docs/SPEC.md](docs/SPEC.md) for the normative waveform/FEC/protocol conform
 See [docs/HOST-API.md](docs/HOST-API.md) to connect a host application (Pat, a dashboard or your own program) to coppad: the VARA-style command and data ports, the WebSocket API and KISS, with an `nc` walkthrough. For Reticulum over OFDM, see [docs/RETICULUM.md](docs/RETICULUM.md). For Pat and Winlink specifically, see [docs/PAT.md](docs/PAT.md).
 
 See [docs/OPERATING.md](docs/OPERATING.md) for field-operation guidance, including TX level calibration (`coppa tune`). To run coppad as a service (systemd or launchd), see [contrib/README.md](contrib/README.md); for a full Raspberry Pi 4 install, see [docs/tutorials/raspberry-pi-install.md](docs/tutorials/raspberry-pi-install.md).
+
+## Community
+
+- Questions and ideas: [GitHub Discussions](https://github.com/HagaleTechnologies/coppa/discussions).
+- Bugs, feature requests and field reports from real radios: [open an issue](https://github.com/HagaleTechnologies/coppa/issues/new/choose).
+- Security problems: report them privately, as [SECURITY.md](SECURITY.md) describes. Do not open a public issue.
+- Changes in each release: [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
