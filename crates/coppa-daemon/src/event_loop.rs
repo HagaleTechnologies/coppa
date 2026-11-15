@@ -26501,4 +26501,375 @@ mod tests {
         assert!(a.kiss_datagrams.is_empty());
         take_leg(&mut audio, "second datagram");
     }
+
+    // COP-196: the daemon half of the COP-190 connect bar. The fixed trial
+    // contract (ten trials, seeds 0x16910000+index, 48 kHz, constant -6 dB
+    // AWGN on the channel's 3 kHz reference, 960-sample blocks on one sample
+    // clock, both ends confirmed by sample 2_880_000) lives in
+    // crates/coppa-engine/tests/floor_session.rs; these trials drive the same
+    // contract through two daemon EventLoops, their real audio rings and
+    // session handlers, paused Tokio time and the production `clock_now()`
+    // timer paths. Until COP-195's floor session controller is incorporated,
+    // the OFDM handshake legs cannot decode at -6 dB, so the trials record
+    // failing outcomes for the missing controller rather than faking
+    // establishment. No `fast_session_rto`, fabricated ACKs, injected state,
+    // decoder resets or manual PTT releases are used: the dial goes out
+    // through `handle_host_event`, PTT keys and releases through the
+    // completion task's `TxComplete` dispatch, and both stations decode
+    // through `poll_audio_input` from their audio-in rings.
+    mod floor_connect {
+        use super::*;
+        use coppa_channel::persistent::{PersistentChannel, SnrProfile};
+
+        const TRIALS: usize = 10;
+        const SEED_BASE: u64 = 0x1691_0000;
+        const SNR_DB: f32 = -6.0;
+        const BLOCK: usize = 960;
+        const DEADLINE_SAMPLES: usize = 2_880_000;
+        const SAMPLE_RATE: f32 = 48_000.0;
+
+        /// Clean active reference power of the production floor waveform at
+        /// its transmitted amplitude, measured once per run (never from
+        /// silence, never from the noisy channel output).
+        fn floor_reference_power() -> f32 {
+            let core = coppa_engine::CoppaCore::new();
+            let clean = core.floor().encode(b"connect bar reference").unwrap();
+            clean.iter().map(|x| x * x).sum::<f32>() / clean.len() as f32
+        }
+
+        /// One station of a paired trial: an EventLoop on its real audio rings
+        /// (`set_audio_out` / `set_audio_in`), plus the persistent channel of
+        /// this station's transmit direction. Direction 0 is A to B, 1 is B to
+        /// A, exactly as in the engine contract.
+        struct FloorStation {
+            station: EventLoop,
+            air_in: coppa_audio::AudioRingProducer,
+            air_out: coppa_audio::AudioRingConsumer,
+            channel: PersistentChannel,
+        }
+
+        impl FloorStation {
+            fn new(callsign: &str, seed: u64, direction: u8, reference_power: f32) -> Self {
+                let mut config = DaemonConfig::default();
+                config.engine.callsign = callsign.to_string();
+                config.radio.ptt_pre_delay_ms = 0;
+                config.radio.ptt_tail_delay_ms = 0;
+                let mut station = EventLoop::new(config).unwrap();
+                station.listening = true;
+                let (out_producer, air_out) = coppa_audio::audio_ring(8_000_000);
+                station.set_audio_out(out_producer);
+                let (air_in, air_in_consumer) = coppa_audio::audio_ring(8_000_000);
+                station.set_audio_in(air_in_consumer);
+                let channel = PersistentChannel::new(
+                    SAMPLE_RATE,
+                    None,
+                    Some(SnrProfile::constant(SNR_DB)),
+                    reference_power,
+                    seed,
+                    direction,
+                );
+                Self {
+                    station,
+                    air_in,
+                    air_out,
+                    channel,
+                }
+            }
+
+            /// Dispatch every queued self-event (the production `run` select
+            /// arm), so a `TxComplete` releases PTT through the normal path.
+            async fn dispatch_pending(&mut self) {
+                while let Ok(event) = self.station.event_rx.try_recv() {
+                    self.station.dispatch_event(Some(event)).await;
+                }
+            }
+        }
+
+        struct Outcome {
+            index: usize,
+            seed: u64,
+            connected: bool,
+            elapsed_s: f32,
+            a_state: String,
+            b_state: String,
+            failure_reason: String,
+        }
+
+        /// Session-side state of one station for the recording: CONNECTED when
+        /// the session manager holds an established session with a live MAC
+        /// link, CONNECTING while a dial or handshake is pending, else IDLE.
+        fn station_state(station: &EventLoop) -> &'static str {
+            let established = station.session_mgr.active_sessions().iter().any(|&id| {
+                station
+                    .session_mgr
+                    .get(id)
+                    .is_some_and(|s| s.is_established())
+            });
+            if established && station.session_link.is_some() {
+                "CONNECTED"
+            } else if station.session_link.is_some()
+                || station.pending_dial.is_some()
+                || station.session_mgr.active_sessions().iter().any(|&id| {
+                    station
+                        .session_mgr
+                        .get(id)
+                        .is_some_and(|s| s.state == SessionState::Connecting)
+                })
+            {
+                "CONNECTING"
+            } else {
+                "IDLE"
+            }
+        }
+
+        /// Both ends confirmed: each station holds an established session and
+        /// a live session link whose peer identity matches the other station.
+        /// The three-leg handshake only reaches this state through decoded
+        /// audio, so a connected verdict always rests on actual handshake
+        /// traffic at both ends.
+        fn both_confirmed(a: &EventLoop, b: &EventLoop, b_call: &str, a_call: &str) -> bool {
+            let confirmed = |station: &EventLoop, peer: &str| {
+                station
+                    .session_link
+                    .as_ref()
+                    .is_some_and(|l| l.remote.as_str() == peer)
+                    && station.session_mgr.active_sessions().iter().any(|&id| {
+                        station
+                            .session_mgr
+                            .get(id)
+                            .is_some_and(|s| s.is_established())
+                    })
+            };
+            confirmed(a, b_call) && confirmed(b, a_call)
+        }
+
+        /// Run one trial: fresh stations and channels per trial, persistent
+        /// state throughout, the deadline starting at the initial connect
+        /// request, audio drained at playback rate (the 960 samples each
+        /// 20 ms tick plays), both directions processed every block including
+        /// noisy silence and turnarounds, and one block of pipeline delay (a
+        /// station hears the peer's previous block) so neither side gets an
+        /// instantaneous response. `muted` suppresses all peer audio for the
+        /// negative control.
+        async fn run_trial(index: usize, muted: bool, deadline_samples: usize) -> Outcome {
+            let seed = SEED_BASE + index as u64;
+            let reference_power = floor_reference_power();
+            let mut a = FloorStation::new("VK3ABC", seed, 0, reference_power);
+            let mut b = FloorStation::new("W1AW", seed, 1, reference_power);
+            let start = tokio::time::Instant::now();
+            // The deadline starts at the initial connect request, including
+            // its initial OFDM attempts and any automatic fallback.
+            a.station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "W1AW".into(),
+                })
+                .await;
+            let mut tx_a = vec![0.0f32; BLOCK];
+            let mut tx_b = vec![0.0f32; BLOCK];
+            let mut samples = 0usize;
+            let mut connected_at: Option<usize> = None;
+            let mut next_fast_poll = Duration::from_millis(500);
+            let mut next_slow_poll = Duration::from_secs(5);
+            while samples < deadline_samples {
+                // The production `run` select arms, on their own cadence.
+                if start.elapsed() >= next_fast_poll {
+                    for station in [&mut a.station, &mut b.station] {
+                        station.enforce_ptt_backstop().await;
+                        station.check_arq_retransmits().await;
+                        station.repeat_pending_dial().await;
+                        station.check_session_retransmits().await;
+                        station.retry_held_tx_drain().await;
+                        station.finish_drained_disconnect().await;
+                    }
+                    next_fast_poll += Duration::from_millis(500);
+                }
+                if start.elapsed() >= next_slow_poll {
+                    for station in [&mut a.station, &mut b.station] {
+                        station.reap_timed_out_sessions().await;
+                        station.send_due_keepalives().await;
+                    }
+                    next_slow_poll += Duration::from_secs(5);
+                }
+                a.dispatch_pending().await;
+                b.dispatch_pending().await;
+                // Both stations run one block on the common sample clock: the
+                // production decode path first (it may key a reply), then this
+                // tick's played audio leaves the speaker ring, through the
+                // station's transmit channel, and into the peer's mic ring.
+                a.station.poll_audio_input().await;
+                b.station.poll_audio_input().await;
+                a.station.flush_pending_audio_out();
+                b.station.flush_pending_audio_out();
+                let n_a = a.air_out.read(&mut tx_a);
+                let n_b = b.air_out.read(&mut tx_b);
+                samples += BLOCK;
+                let heard_by_b = if muted {
+                    vec![0.0; n_a]
+                } else {
+                    a.channel.process(&tx_a[..n_a])
+                };
+                let heard_by_a = if muted {
+                    vec![0.0; n_b]
+                } else {
+                    b.channel.process(&tx_b[..n_b])
+                };
+                // Each peer decodes this audio on the next tick's poll, so
+                // call ordering gives neither side an instantaneous response.
+                let mut written = 0;
+                while written < heard_by_b.len() {
+                    written += b.air_in.write(&heard_by_b[written..]);
+                }
+                let mut written = 0;
+                while written < heard_by_a.len() {
+                    written += a.air_in.write(&heard_by_a[written..]);
+                }
+                if both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC") {
+                    connected_at = Some(samples);
+                    break;
+                }
+                // Move virtual time one block forward on the shared clock.
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            let a_state = station_state(&a.station).to_string();
+            let b_state = station_state(&b.station).to_string();
+            let a_established = a.station.session_mgr.active_sessions().iter().any(|&id| {
+                a.station
+                    .session_mgr
+                    .get(id)
+                    .is_some_and(|s| s.is_established())
+            });
+            let b_established = b.station.session_mgr.active_sessions().iter().any(|&id| {
+                b.station
+                    .session_mgr
+                    .get(id)
+                    .is_some_and(|s| s.is_established())
+            });
+            let (connected, elapsed_s, failure_reason) = match connected_at {
+                Some(at) => (true, at as f32 / SAMPLE_RATE, String::new()),
+                None => (
+                    false,
+                    deadline_samples as f32 / SAMPLE_RATE,
+                    format!(
+                        "timeout: A={} B={} established=({} / {})",
+                        a_state, b_state, a_established, b_established
+                    )
+                    .replace(',', ";"),
+                ),
+            };
+            Outcome {
+                index,
+                seed,
+                connected,
+                elapsed_s,
+                a_state,
+                b_state,
+                failure_reason,
+            }
+        }
+
+        /// Run all ten trials, print every outcome including failures, and
+        /// export the evidence CSV when `COPPA_FLOOR_CONNECT_OUT` names an
+        /// output directory. Default test execution writes nothing.
+        async fn run_trials() -> Vec<Outcome> {
+            let reference_power = floor_reference_power();
+            println!("reference power {reference_power:.6} (clean floor mean square)");
+            let mut outcomes = Vec::new();
+            for index in 0..TRIALS {
+                let outcome = run_trial(index, false, DEADLINE_SAMPLES).await;
+                println!(
+                    "daemon trial {} seed {:#x}: connected={} elapsed={:.1}s A={} B={} reason={}",
+                    outcome.index,
+                    outcome.seed,
+                    outcome.connected,
+                    outcome.elapsed_s,
+                    outcome.a_state,
+                    outcome.b_state,
+                    outcome.failure_reason
+                );
+                outcomes.push(outcome);
+            }
+            if let Ok(dir) = std::env::var("COPPA_FLOOR_CONNECT_OUT") {
+                let path = std::path::Path::new(&dir).join("daemon.csv");
+                let mut csv = String::from(
+                    "trial,seed,snr_db,connected,elapsed_s,a_state,b_state,failure_reason\n",
+                );
+                for outcome in &outcomes {
+                    csv.push_str(&format!(
+                        "{},{:#x},{},{},{:.1},{},{},{}\n",
+                        outcome.index,
+                        outcome.seed,
+                        SNR_DB,
+                        outcome.connected,
+                        outcome.elapsed_s,
+                        outcome.a_state,
+                        outcome.b_state,
+                        if outcome.failure_reason.is_empty() {
+                            "-"
+                        } else {
+                            &outcome.failure_reason
+                        }
+                    ));
+                }
+                std::fs::write(&path, csv)
+                    .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+                println!("wrote {}", path.display());
+            }
+            outcomes
+        }
+
+        /// COP-196 AC2: two daemon EventLoops, beginning unconnected, must
+        /// reach confirmed establishment at both ends within 60 simulated
+        /// seconds at -6 dB AWGN in at least nine of the ten fixed-seed
+        /// trials, through their real audio queues and session handlers.
+        ///
+        /// Ignored because a full ten-trial release run is expensive; run
+        /// explicitly per `results/cop-190/connect/metadata.md`. While
+        /// COP-195's floor session controller is not incorporated, the trials
+        /// are expected to fail the nine-of-ten bar; that measured outcome is
+        /// the recorded evidence for the missing controller, not a reason to
+        /// change seeds, thresholds, gains or deadlines.
+        #[tokio::test(start_paused = true)]
+        #[ignore = "expensive release measurement; see results/cop-190/connect/metadata.md"]
+        async fn floor_daemon_connect_minus6() {
+            let outcomes = run_trials().await;
+            let connected = outcomes.iter().filter(|o| o.connected).count();
+            println!(
+                "daemon connected {connected}/{} at {SNR_DB} dB",
+                outcomes.len()
+            );
+            assert!(
+                connected >= 9,
+                "connect bar not met: {connected}/{} trials connected; failures: {}",
+                outcomes.len(),
+                outcomes
+                    .iter()
+                    .filter(|o| !o.connected)
+                    .map(|o| format!("seed {:#x}: {}", o.seed, o.failure_reason))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+        }
+
+        /// Negative control for the trial runner: with all peer audio
+        /// suppressed the same runner must not report establishment at either
+        /// end, so a passing bar can never come from local intent (the dial
+        /// and its retries) rather than decoded peer traffic.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_muted_peers_never_connect() {
+            let outcome = run_trial(0, true, 5 * SAMPLE_RATE as usize).await;
+            assert!(
+                !outcome.connected,
+                "muted peers cannot establish a session: A={} B={}",
+                outcome.a_state, outcome.b_state
+            );
+            assert_eq!(
+                (outcome.a_state.as_str(), outcome.b_state.as_str()),
+                ("CONNECTING", "IDLE"),
+                "with no peer audio the dial is still pending and the listener idle"
+            );
+        }
+    }
 }
