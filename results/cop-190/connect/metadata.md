@@ -6,15 +6,22 @@ inputs and outputs, not facts about the commit carrying them.
 
 ## Outcome
 
-Both adapters recorded **0 of 10** connected trials. Every trial timed out
-at the 60 s deadline with both stations IDLE (the caller's dial exhausted
-its retries after nothing decoded) and zero decoded frames at either end.
-The root cause is the missing negotiated floor session controller tracked
-by COP-195: at −6 dB the OFDM handshake legs do not decode, and no
-floor-carried session path exists yet to carry them. These trials are the
-recorded proof of that gap; they are expected to turn green once COP-195's
-controller is incorporated. No seeds, thresholds, gains or deadlines were
-changed to alter the outcome.
+- **Link adapter: 10 of 10** connected. Every trial reached both-ends
+  Connected (matching identities, decoded traffic at both ends) at 35.5
+  simulated seconds, through COP-195's negotiated floor session controller
+  (merged to main in `76823db`). Bar met.
+- **Daemon adapter: 0 of 10** connected. Every trial timed out at the 60 s
+  deadline with both stations IDLE: the daemon runs its own session stack
+  and still advertises `robust_floor=false`, so it never negotiates the
+  floor. Per decision COP-197 (option B) this bar is explicitly unmet and
+  re-filed as COP-202; the audit still checks the daemon recording for
+  completeness but does not enforce its pass count until COP-202 lands and
+  re-records it.
+
+The first recording (both adapters 0/10, taken on COP-190 alone before
+COP-195 existed) is superseded for the link adapter by the run below; the
+daemon re-run on the same revision reproduced its 0/10 CSV byte for byte.
+No seeds, thresholds, gains or deadlines were changed to alter any outcome.
 
 ## Replay commands
 
@@ -43,19 +50,21 @@ cargo test -p coppa-daemon --lib floor_
 `floor_connection_recordings_are_complete` checks both committed CSVs
 (exact header, exact seed set, one row per trial, −6 dB only, finite
 in-range elapsed times, success/timeout time consistency, failure-reason
-consistency) and requires at least nine connected rows per adapter, so it
-fails until the bar is actually met. The muted negative controls
+consistency) and requires at least nine connected rows for the link adapter (the daemon
+pass count is reported but not enforced until COP-202). The muted negative controls
 (`floor_link_muted_peers_never_connect`,
 `floor_daemon_muted_peers_never_connect`) prove the trial runners cannot
 report connection success from local intent alone.
 
 ## Configuration
 
-- Dependency revision tested: COP-190 head `355805ccc999803fbdffc6a9bbe5bca17604c2e8`
-  merged onto main `cdc4ae5f852634dda4f289744a8050ffc8d61179` (COP-196
-  branch). COP-195's controller is absent at this revision.
+- Dependency revision tested: COP-196 branch merged with main
+  `76823db0e888d764dd23302cada71e5fe0895666` (includes COP-190 and
+  COP-195's library floor session controller). The daemon floor slice is
+  absent at this revision (COP-202).
 - Rust: rustc 1.98.0 (88d9e12ae 2026-08-18), cargo 1.98.0
-  (797e8a9bc 2026-08-05), Linux.
+  (797e8a9bc 2026-08-05); first recording on Linux, current link and
+  daemon re-runs on macOS (aarch64).
 - Adapters: engine library `Link` pairs (caller VK3ABC, listener W1AW,
   `LinkConfig::new` defaults: level 1, compression off, 500 ms turnaround,
   5 s initial RTO, 3 connect retries) and daemon `EventLoop` pairs
@@ -86,9 +95,9 @@ report connection success from local intent alone.
 
 ## Separate pass counts
 
-- `link.csv`: 0/10 connected (seeds 0x16910000–0x16910009).
-- `daemon.csv`: 0/10 connected (same seeds).
+- `link.csv`: 10/10 connected (seeds 0x16910000–0x16910009).
+- `daemon.csv`: 0/10 connected (same seeds); bar re-filed as COP-202.
 
-All ten outcomes per adapter are retained, failures included; there are
-no superseded runs to record (these are the first recorded runs under
-this contract).
+All ten outcomes per adapter are retained, failures included. Superseded
+run: the initial link recording on COP-190 alone (pre-COP-195), 0/10, all
+timeouts with both ends IDLE and nothing decoded.

@@ -255,6 +255,101 @@ Every section title of the pre-COP-146 file, in its original order. Grouped logs
 | Synthetic transfer impairments (COP-132) | 2026-11-04 | [log](docs/benchmarks/2026-11-05-cop-132-synthetic-transfer-impairments.md) |
 | COP-152: Bounded-prefix payload residual | 2026-11-06 (merge date) | [log](docs/benchmarks/2026-11-06-cop-152-bounded-prefix-residual.md) |
 
+## COP-168 PHY HARQ schedule
+
+This is a simulated PHY comparison, not an on-air throughput result. COP-184
+keeps the COP-168 protocol and PHY work in this PR; daemon windowing and the
+session throughput tables remain follow-ups. Existing coppad sessions still
+send RV0 and do not use this schedule.
+
+Built with `cargo build --release -p coppa-bench --example session_harq --offline`,
+then run as `target/release/examples/session_harq`. These measurements use the
+COP-168 working tree above base `1ac3273ed92f4ce36ce02e01102c0e1890cd9b4c`.
+The diagnostic uses real HF transceivers, random session-framed payloads,
+Watterson Moderate, fresh paired channel draws per physical attempt,
+`awgn_ref_seeded` with a 3 kHz noise reference, and a 1200-sample receive tail.
+The full output is retained in the COP-168 implementation artifact
+`session-harq.txt`.
+
+Calibration searches the 0.5 dB lattice from -10 to 50 dB with 400 independent
+frames at each sampled point. Levels 1–3 reach the requested 25–35% first-frame
+failure range. Levels 4–8 do not reach it in this search; their fading outage
+floor stays above 35%. The table reports the closest measured point rather
+than changing seeds or payloads to force the target.
+
+For each level, the paired comparison stops at 400 failed RV0 frames or 2000
+trials. Each failed frame is retried up to three times with Chase RV0 repeats
+and all six permutations of RV1/RV2/RV3. Counts after attempts 2–4 are cumulative
+rescues among failed initial frames. Intervals are 95% Wilson intervals.
+Discordant pairs list schedule-only / Chase-only rescues. Selection maximizes
+first-retry rescues, then within one frame of that maximum uses second-retry
+rescues, then the smallest Kendall distance to 3GPP's RV2/RV3/RV1 order.
+Level 9 copies level 8 because this run covers only HF levels 1–8. The
+8-codeword level-4 diagnostic uses the single-codeword calibration SNR and
+reports its own observed failure rate.
+
+Release diagnostic wall time: 1344.912 s, or 22 min 24.9 s.
+
+| Level | Codewords | SNR dB | Calibration RV0 failures / 400 | Main trials | Main RV0 failures | RV order after RV0 | First-retry margin vs Chase, pp |
+|---|---|---|---|---|---|---|---|
+| 1 | 1 | 6 | 119 | 1195 | 400 | 3 / 1 / 2 | -0.25 |
+| 2 | 1 | 6 | 138 | 1118 | 400 | 3 / 1 / 2 | -6.75 |
+| 3 | 1 | 16 | 102 | 1799 | 400 | 3 / 2 / 1 | +4.50 |
+| 4 | 1 | 42.5 | 171 | 1025 | 400 | 3 / 2 / 1 | +13.25 |
+| 4 | 8 | 42.5 | not separately calibrated | 402 | 400 | 3 / 2 / 1 | +3.00 |
+| 5 | 1 | 46.5 | 275 | 635 | 400 | 3 / 2 / 1 | +18.25 |
+| 6 | 1 | 42.5 | 220 | 694 | 400 | 1 / 2 / 3 | +29.50 |
+| 7 | 1 | 35 | 307 | 491 | 400 | 3 / 2 / 1 | +28.25 |
+| 8 | 1 | 35 | 369 | 425 | 400 | 3 / 2 / 1 | +24.75 |
+
+Rescues below are cumulative counts among the 400 failed initial frames.
+Bracketed intervals are percentages, not counts.
+
+| Level | Codewords | Attempt | Chase rescues, Wilson 95% | Selected schedule rescues, Wilson 95% | Discordant schedule-only / Chase-only |
+|---|---|---|---|---|---|
+| 1 | 1 | 2 | 279 [65.08%, 74.05%] | 278 [64.82%, 73.81%] | 10 / 11 |
+| 1 | 1 | 3 | 363 [87.51%, 93.21%] | 361 [86.95%, 92.79%] | 4 / 6 |
+| 1 | 1 | 4 | 393 [96.43%, 99.15%] | 388 [94.83%, 98.28%] | 0 / 5 |
+| 2 | 1 | 2 | 257 [59.44%, 68.79%] | 230 [52.61%, 62.25%] | 5 / 32 |
+| 2 | 1 | 3 | 355 [85.28%, 91.49%] | 342 [81.71%, 88.61%] | 4 / 17 |
+| 2 | 1 | 4 | 390 [95.46%, 98.64%] | 363 [87.51%, 93.21%] | 0 / 27 |
+| 3 | 1 | 2 | 359 [86.39%, 92.35%] | 377 [91.52%, 96.14%] | 21 / 3 |
+| 3 | 1 | 3 | 393 [96.43%, 99.15%] | 398 [98.20%, 99.86%] | 5 / 0 |
+| 3 | 1 | 4 | 399 [98.60%, 99.96%] | 399 [98.60%, 99.96%] | 0 / 0 |
+| 4 | 1 | 2 | 325 [77.13%, 84.77%] | 378 [91.81%, 96.34%] | 55 / 2 |
+| 4 | 1 | 3 | 386 [94.21%, 97.90%] | 396 [97.46%, 99.61%] | 12 / 2 |
+| 4 | 1 | 4 | 397 [97.82%, 99.74%] | 396 [97.46%, 99.61%] | 3 / 4 |
+| 4 | 8 | 2 | 8 [1.02%, 3.90%] | 20 [3.26%, 7.60%] | 13 / 1 |
+| 4 | 8 | 3 | 23 [3.86%, 8.48%] | 54 [10.50%, 17.20%] | 37 / 6 |
+| 4 | 8 | 4 | 37 [6.79%, 12.49%] | 74 [15.00%, 22.60%] | 49 / 12 |
+| 5 | 1 | 2 | 228 [52.10%, 61.76%] | 301 [70.79%, 79.23%] | 74 / 1 |
+| 5 | 1 | 3 | 337 [80.36%, 87.49%] | 388 [94.83%, 98.28%] | 53 / 2 |
+| 5 | 1 | 4 | 374 [90.65%, 95.53%] | 398 [98.20%, 99.86%] | 26 / 2 |
+| 6 | 1 | 2 | 203 [45.87%, 55.62%] | 321 [76.07%, 83.86%] | 119 / 1 |
+| 6 | 1 | 3 | 322 [76.33%, 84.08%] | 398 [98.20%, 99.86%] | 76 / 0 |
+| 6 | 1 | 4 | 372 [90.07%, 95.11%] | 400 [99.05%, 100.00%] | 28 / 0 |
+| 7 | 1 | 2 | 114 [24.30%, 33.11%] | 227 [51.85%, 61.52%] | 113 / 0 |
+| 7 | 1 | 3 | 226 [51.60%, 61.27%] | 371 [89.78%, 94.90%] | 147 / 2 |
+| 7 | 1 | 4 | 287 [67.15%, 75.94%] | 392 [96.10%, 98.98%] | 108 / 3 |
+| 8 | 1 | 2 | 34 [6.15%, 11.64%] | 133 [28.81%, 38.01%] | 99 / 0 |
+| 8 | 1 | 3 | 73 [14.77%, 22.33%] | 309 [72.89%, 81.09%] | 236 / 0 |
+| 8 | 1 | 4 | 116 [24.77%, 33.63%] | 368 [88.92%, 94.28%] | 254 / 2 |
+
+The selected IR schedules do not beat Chase on first-retry rescue at levels 1
+and 2. Their margins are -0.25 and -6.75 percentage points. At level 4, the
+single-codeword margin is +13.25 points, but the operating point is above the
+requested calibration failure range. The eight-codeword frame fails on
+400/402 initial transmissions at that same SNR. Combining rescues 20/400
+on its first retry versus 8/400 for Chase, a +3.00-point margin, but that is
+still only a 5% rescue rate. These results do not establish a session
+throughput improvement or justify replacing Chase everywhere.
+
+The plan-phase 120-trial probe, dated 2026-11-10 and recorded in the COP-168
+plan, used different seeds and operating points. This larger paired diagnostic
+replaces that probe for the shipped schedule. The level-3 AWGN 3 dB regression
+guard uses 40 deterministic trials and passes in release mode with the shipped
+RV3 first retry. It is release-only because the debug run exceeded 150 s.
+
 ## COP-187 experimental header repair
 
 This is a development measurement of the COP-169 16-FSK candidate, not a
@@ -399,6 +494,104 @@ CFO tolerance, continuous acquisition, production v2 framing or session recovery
 Unit tests separately cover clean SSB filtering with its FIR tail flushed and
 one seeded -6 dB AWGN capture at 0 and +/-150 Hz. They do not establish a filtered
 FER curve or a noisy SSB compatibility envelope.
+
+## COP-189 continuous candidate acquisition slice
+
+`floor_candidate --streaming` exercises continuous acquisition of the existing
+experimental 16-FSK candidate. It ingests arbitrary chunks, decodes overlapping
+windows on a one-second cadence, and keeps at most 480,000 audio samples. Each
+window originally attempted at most 16 separated sync candidates at zero CFO.
+The CFO search described below increases that bound. Decode work is independent
+of caller chunk sizes and stream duration. Tone energies and candidate lists
+remain bounded by the ten-second window; this implementation recomputes them
+for each window rather than claiming an incremental matched-filter receiver.
+Metadata records decode attempts and peak retained samples at chunk boundaries.
+A missing streaming delivery counts conservatively as SyncFailed because this
+adapter does not expose a validated failure-stage trace.
+
+The release regression
+`cargo test --release -p coppa-bench --lib continuous_acquisition_300_seconds_noise -- --ignored`
+passed with zero deliveries for 300 seconds each of seeded white noise,
+SSB-filtered one-second noise blocks and a 1 kHz tone plus noise. Each stream
+attempted 293 decodes and retained at most 480,000 samples. This is synthetic
+noise rejection evidence only. It does not select a production waveform or
+resolve the floor FER, connection or fade-ramp acceptance requirements. No
+final-seed production results are published for this slice.
+
+
+### COP-189 CFO acquisition repair
+
+The experimental batch and continuous receivers now share a matched-filter bank
+covering 450..1500 Hz in 25 Hz steps. Thirteen views select the sixteen nominal
+tones shifted by -150..+150 Hz. Each view may try sixteen separated candidates,
+so a window attempts at most 208 candidate decodes. Only one sixteen-tone view
+is allocated at a time. Audio retention and the one-second window cadence are
+unchanged. Templates repeat after two symbols, including the half-bin offsets.
+Transmit tones, framing, eight-second airtime and CRC checks are unchanged.
+
+`cargo test --release -p coppa-bench --lib cfo_search_decodes_unknown_offset_in_batch_and_chunks`
+requires exact payload delivery at -150, -75, +75 and +150 Hz, with an unknown
+137-sample prefix, in batch and 317-sample chunks. It failed at -150 Hz before
+the repair. This is a noiseless acquisition regression, not a fading FER curve.
+Diagnostic metadata now records the grid and expanded work bound. Historical
+COP-169 and COP-187 CSVs remain measurements of their original receivers.
+
+The search holds CFO constant over the frame. It does not implement fading
+tracking or prove reception between grid points. The BPSK comparison, production
+selection and integration, session support and final sweep/connect/ramp evidence
+remain unbuilt. No acceptance criterion is declared complete by this repair.
+
+## COP-191 production floor sweeps
+
+These simulated audio-channel measurements use the production air-v2
+`FloorFrame` and continuous `FloorStream`, not the experimental bench codec.
+Each channel has nine points from -12 to +4 dB in 2 dB steps and 200 trials
+per point. The final base is `0x16900000`; each seed is
+`base + point*200 + trial`. Both receivers consume the same captured audio
+per attempt, with a randomized noise lead-in, an 8 s transmitted frame and
+a 1.25 s noisy tail. Streaming chunks contain 4,800 samples.
+
+| Channel | Receiver | Frame errors / trials | 50% FER crossing | Sync-share violations, dB | Passes |
+| --- | --- | --- | --- | --- | --- |
+| AWGN | batch | 22 / 1800 | at or below -12 dB | -12, -10 | false |
+| AWGN | streaming | 22 / 1800 | at or below -12 dB | -12, -10 | false |
+| Poor | batch | 329 / 1800 | -10.148936 dB | -10, -8, -6, -4, +2 | false |
+| Poor | streaming | 329 / 1800 | -10.148936 dB | -10, -8, -6, -4, +2 | false |
+
+All four receiver/channel combinations delivered zero wrong payloads.
+Poor has one interpolated crossing and no recrossings. AWGN is below 50%
+throughout the grid, so its crossing is a bound rather than an interpolation.
+The crossings meet their respective -8 and -2 dB bars, but all four verdicts
+fail the separate `2 * sync_failed < frame_errors` clause above the crossing.
+Zero-failure points satisfy that clause.
+
+Batch failures retain their observed stages. Streaming exposes no trusted-header
+failure diagnostics, so every non-delivery is conservatively SyncFailed.
+Its counters do not establish that all those failures occurred in acquisition.
+
+The [AWGN CSV](results/cop-191/final-awgn/sweep.csv) and
+[Poor CSV](results/cop-191/final-poor/sweep.csv) retain all attempts in the
+unchanged sweep schema, including failed protected headers. Adjacent
+`metadata.txt` files record the invocation, seed rule, power reference,
+completion and independent verdicts. `cop191_final_sweeps_recompute` checks
+both receiver grids, counts, Wilson 95% intervals, airtime, goodput,
+crossings and metadata. Airtime excludes noise lead-in and tail; goodput is
+correct payload bits divided by transmitted airtime.
+
+Reproduce with:
+
+```sh
+cargo run --release -p coppa-bench --example floor_mode -- sweep --waveform floor --rx both --channel awgn --snr-min -12 --snr-max 4 --snr-step 2 --trials 200 --seed 378535936 --out-dir results/cop-191/final-awgn
+cargo run --release -p coppa-bench --example floor_mode -- sweep --waveform floor --rx both --channel poor --snr-min -12 --snr-max 4 --snr-step 2 --trials 200 --seed 378535936 --out-dir results/cop-191/final-poor
+```
+
+Both commands exited 1 because the measured verdicts fail. `acceptance_run=true`
+identifies the locked experiment configuration, not a passing result.
+Omitting `--waveform` still selects the `ofdm:1` baseline. There is no overall
+floor acceptance claim: `connect` and `ramp` remain unavailable until COP-190
+provides the negotiated Link/daemon controller. No session trials, ACK traces
+or OFDM recovery evidence are claimed here. These are simulated channel
+measurements, not RF certification.
 
 
 ## COP-190 production floor development measurements

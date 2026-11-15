@@ -343,9 +343,9 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "coppa"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "coppa-audio",
  "coppa-bench",
@@ -469,11 +469,12 @@ dependencies = [
  "num-complex",
  "proptest",
  "rand 0.10.3",
+ "serde_json",
 ]
 
 [[package]]
 name = "coppa-audio"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "coppa-dsp",
@@ -486,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-bench"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -500,12 +501,12 @@ dependencies = [
  "num-complex",
  "rand 0.10.3",
  "serde",
- "toml 1.2.0+spec-1.1.0",
+ "toml 1.2.1+spec-1.1.0",
 ]
 
 [[package]]
 name = "coppa-channel"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "approx",
  "coppa-dsp",
@@ -515,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-cli"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -531,13 +532,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "toml 1.2.0+spec-1.1.0",
+ "toml 1.2.1+spec-1.1.0",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "coppa-codec"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "approx",
  "coppa-channel",
@@ -552,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-daemon"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -573,14 +574,14 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
- "toml 1.2.0+spec-1.1.0",
+ "toml 1.2.1+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "coppa-dsp"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "approx",
  "num-complex",
@@ -589,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-engine"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "approx",
  "coppa-channel",
@@ -603,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-ffi"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "cbindgen",
  "coppa-engine",
@@ -611,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-host"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "base64",
  "coppa-engine",
@@ -630,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-ml"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "num-complex",
  "rustfft",
@@ -638,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-protocol"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "approx",
  "coppa-bench",
@@ -654,12 +655,12 @@ dependencies = [
  "rand 0.10.3",
  "serde",
  "thiserror 2.0.21",
- "toml 1.2.0+spec-1.1.0",
+ "toml 1.2.1+spec-1.1.0",
 ]
 
 [[package]]
 name = "coppa-radio"
-version = "0.14.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "gpiocdev",
@@ -914,9 +915,9 @@ dependencies = [
 
 [[package]]
 name = "fancy-regex"
-version = "0.19.2"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d301f5bf187b3c295fce6468d3875037a0bccc5f6b151c63cac2f85babf21912"
+checksum = "0a2e16b9a584b602f1e0e5e22c30ca0906786088c27500653e432d086def8b53"
 dependencies = [
  "bit-set 0.8.0",
  "regex-automata",
@@ -1292,9 +1293,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.60.2"
+version = "0.61.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a42a11b47492e6a2cc76e9c7bcc8077776cb31dac444e0795d7f61bcc6441c08"
+checksum = "e1324c9bebe052584e96e7c80d2f9cf2d86e1a6d83d621a46932c5636996be18"
 dependencies = [
  "ahash",
  "bytecount",
@@ -1320,18 +1321,18 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.60.2"
+version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "107aeb6ff14b8deb5610096a8ce5c554ec89806b521147eaeb3cae05b07edb7a"
+checksum = "7e41151614b6c927e21982be8bef5a26741ae5a0ae6a781eedee2aa930a980e6"
 dependencies = [
  "regex-syntax",
 ]
 
 [[package]]
 name = "jsonschema-value"
-version = "0.60.2"
+version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e281d6b177bb4834f2ffd6f92aa0443cffe29c996b251c8d94eb6f456186feba"
+checksum = "1515b9a91134ef67d7bac95c2d76fbc7e383c4c55ee544204ceec8088f881fef"
 dependencies = [
  "ahash",
  "bytecount",
@@ -1361,26 +1362,6 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
-
-[[package]]
-name = "libudev"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78b324152da65df7bb95acfcaab55e3097ceaab02fb19b228a9eb74d55f135e0"
-dependencies = [
- "libc",
- "libudev-sys",
-]
-
-[[package]]
-name = "libudev-sys"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c8469b4a23b962c1396b9b451dda50ef5b283e8dd309d69033475fa9b334324"
-dependencies = [
- "libc",
- "pkg-config",
-]
 
 [[package]]
 name = "linux-raw-sys"
@@ -2036,9 +2017,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.60.2"
+version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f42818036d3b37cda6bd4c494543158a36e431cb717015ef7c93acc6ba214d3b"
+checksum = "a028057ef852c58a42d75e09da87b5e733f4030f4c7411728955e4f87203a577"
 dependencies = [
  "ahash",
  "fluent-uri",
@@ -2264,9 +2245,9 @@ dependencies = [
 
 [[package]]
 name = "serde_spanned"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e7523beb55eece201a2356bee0bbca0d1ab466c14c07703b2e0ee6d42cb0c2c"
+checksum = "9c187e0a369471c550af028cba56d4f4fa2a489ad28151ae95a4d340a2a8b782"
 dependencies = [
  "serde_core",
 ]
@@ -2282,7 +2263,6 @@ dependencies = [
  "core-foundation",
  "core-foundation-sys",
  "io-kit-sys",
- "libudev",
  "mach2 0.4.3",
  "nix",
  "scopeguard",
@@ -2350,9 +2330,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.4"
+version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
+checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 
 [[package]]
 name = "socket-pktinfo"
@@ -2567,14 +2547,14 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.2.0+spec-1.1.0"
+version = "1.2.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5ffcdf8f50436dbbfd675c1fe1b8e0854f42b7defea8584bdebe1aee900e561"
+checksum = "d5755c51863cdac711f1956baf8eb9588e060755f7d3c4c979e70ea1e1f32cd7"
 dependencies = [
  "indexmap",
  "serde_core",
  "serde_spanned",
- "toml_datetime 1.1.2+spec-1.1.0",
+ "toml_datetime 1.1.3+spec-1.1.0",
  "toml_parser",
  "toml_writer",
  "winnow 1.0.0",
@@ -2591,9 +2571,9 @@ dependencies = [
 
 [[package]]
 name = "toml_datetime"
-version = "1.1.2+spec-1.1.0"
+version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b86d767906c6c42421dcba507eb9d203e779497710a47782a224bb871653053"
+checksum = "173f25c883cd2176a2d8212155638c0a60d484a9d84546d270866f40f56b6e49"
 dependencies = [
  "serde_core",
 ]
@@ -2605,7 +2585,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16bff38f1d86c47f9ff0647e6838d7bb362522bdf44006c7068c2b1e606f1f3c"
 dependencies = [
  "indexmap",
- "toml_datetime 1.1.2+spec-1.1.0",
+ "toml_datetime 1.1.3+spec-1.1.0",
  "toml_parser",
  "winnow 1.0.0",
 ]

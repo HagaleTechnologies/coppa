@@ -1,14 +1,11 @@
 //! Engine-side floor session coverage of the COP-190/COP-196 connect bar:
 //! the engine constructs a separately detected floor receive path next to
 //! its OFDM paths, floor audio decodes through the seeded persistent
-//! channel with zero wrong payloads, the v1 OFDM path is unaffected, and
+//! channel with zero wrong payloads, the v1 OFDM path is unaffected, the
+//! negotiated floor-aware library controller (COP-195) is exercised, and
 //! paired library Links are driven through the production audio paths at
-//! -6 dB AWGN under the COP-190 fixed trial contract. The negotiated,
-//! floor-aware session controller (fallback, OFDM probe, floor-carried
-//! handshake legs) is COP-195's work: the connection trials below are
-//! authored here against COP-190 and report their measured outcomes, so
-//! the missing controller shows up as failing trials rather than as
-//! absent coverage; see `docs/LIMITATIONS.md`, COP-169 section.
+//! -6 dB AWGN under the COP-190 fixed trial contract; see
+//! `docs/LIMITATIONS.md`, COP-169 section.
 
 use std::time::{Duration, Instant};
 
@@ -227,11 +224,9 @@ fn run_link_trials() -> Vec<TrialOutcome> {
 /// least nine of the ten fixed-seed trials.
 ///
 /// Ignored because a full ten-trial release run is expensive; run
-/// explicitly per `results/cop-190/connect/metadata.md`. While COP-195's
-/// floor session controller is not incorporated, the trials are expected
-/// to fail the nine-of-ten bar; that measured outcome is the recorded
-/// evidence for the missing controller, not a reason to change seeds,
-/// thresholds, gains or deadlines.
+/// explicitly per `results/cop-190/connect/metadata.md`. With COP-195's
+/// negotiated floor session controller on main, all ten trials connect;
+/// seeds, thresholds, gains and deadlines are unchanged from the contract.
 #[test]
 #[ignore = "expensive release measurement; see results/cop-190/connect/metadata.md"]
 fn floor_link_connect_minus6() {
@@ -276,13 +271,19 @@ fn floor_link_muted_peers_never_connect() {
 /// COP-196 AC3: audit the committed connection evidence. Checks both CSVs
 /// (exact header, exact seed set 0x16910000..0x16910009, one row per trial
 /// index, -6 dB rows only), finite in-range elapsed times (success rows
-/// record when both ends first qualified, timeout rows record 60.0),
-/// consistency between `connected` and `failure_reason`, and separate pass
-/// counts of at least nine per adapter.
+/// record when both ends first qualified, timeout rows record 60.0) and
+/// consistency between `connected` and `failure_reason`, then enforces the
+/// nine-of-ten pass count on the link adapter.
+///
+/// The daemon adapter's recording is still audited for completeness, but
+/// its pass-count bar is explicitly unmet and re-filed as COP-202 (decision
+/// COP-197, option B): the daemon runs its own session stack and does not
+/// yet offer the robust floor. COP-202 restores the daemon bar here once
+/// the daemon floor ships and its trials are re-recorded.
 #[test]
 fn floor_connection_recordings_are_complete() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for adapter in ["link", "daemon"] {
+    for (adapter, bar_enforced) in [("link", true), ("daemon", false)] {
         let path = root
             .join("results/cop-190/connect")
             .join(format!("{adapter}.csv"));
@@ -290,10 +291,16 @@ fn floor_connection_recordings_are_complete() {
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let connected = audit_connect_csv(&path.display().to_string(), &csv)
             .unwrap_or_else(|e| panic!("{adapter} evidence rejected: {e}"));
-        assert!(
-            connected >= 9,
-            "{adapter} connect bar not met: {connected}/{TRIALS} recorded trials connected"
-        );
+        if bar_enforced {
+            assert!(
+                connected >= 9,
+                "{adapter} connect bar not met: {connected}/{TRIALS} recorded trials connected"
+            );
+        } else {
+            println!(
+                "{adapter} connect bar not enforced (COP-202): {connected}/{TRIALS} recorded trials connected"
+            );
+        }
     }
 }
 
@@ -465,9 +472,237 @@ fn floor_audio_through_the_persistent_channel_decodes_exactly() {
     assert_eq!(received, [payload.to_vec()]);
 }
 
-// The paired connection trials above cover the COP-190 connect bar for
-// library Links (and, in coppa-daemon, for EventLoop pairs) against the
-// built physical layer. The negotiated floor session controller that must
-// carry the handshake legs at -6 dB -- floor-aware discovery, fallback and
-// OFDM probing -- remains COP-195's scope: until it is incorporated these
-// trials measure and record its absence as failing trials.
+// Deterministic library session regressions below do not establish a connection probability.
+
+use coppa_engine::LinkPhyMode;
+
+// Tests need one real epoch; every subsequent deadline uses injected sample time.
+#[allow(clippy::disallowed_methods)]
+fn test_epoch() -> Instant {
+    Instant::now()
+}
+
+/// Move actual audio in 200 ms blocks, with time derived from sample duration.
+/// OFDM can be erased without erasing the independently detected floor.
+fn pump(a: &mut Link, b: &mut Link, base: Instant, tick: &mut u64, seconds: u64, erase_ofdm: bool) {
+    let (mut a_out, mut b_out) = (vec![0.0; 9600], vec![0.0; 9600]);
+    for _ in 0..seconds * 5 {
+        let now = base + Duration::from_millis(*tick * 200);
+        *tick += 1;
+        let (a_in, b_in) = (b_out.clone(), a_out.clone());
+        a.process(now, &a_in, &mut a_out);
+        b.process(now, &b_in, &mut b_out);
+        if erase_ofdm {
+            if a.phy_mode().0 != Some(LinkPhyMode::Floor) {
+                a_out.fill(0.0);
+            }
+            if b.phy_mode().0 != Some(LinkPhyMode::Floor) {
+                b_out.fill(0.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn floor_pair_connects_and_delivers() {
+    let base = test_epoch();
+    let mut a = Link::new(LinkConfig::new("N0AAA")).unwrap();
+    let mut b = Link::new(LinkConfig::new("N0BBB")).unwrap();
+    b.set_listening(true);
+    a.connect("N0BBB", base).unwrap();
+    let mut tick = 0;
+    pump(&mut a, &mut b, base, &mut tick, 60, true);
+    assert_eq!(a.state(), LinkState::Connected);
+    assert_eq!(b.state(), LinkState::Connected);
+    let payload = b"a message longer than the floor's nineteen application bytes";
+    a.send(payload).unwrap();
+    pump(&mut a, &mut b, base, &mut tick, 100, true);
+    let mut received = [0; 100];
+    let n = b.recv(&mut received);
+    assert_eq!(&received[..n], payload);
+    assert_eq!(a.pending_tx_bytes(), 0);
+    assert_eq!(b.recv(&mut received), 0);
+}
+
+#[test]
+fn floor_v1_peer_stays_ofdm() {
+    let base = test_epoch();
+    let mut config = LinkConfig::new("N0BBB");
+    config.robust_floor = false;
+    let mut a = Link::new(LinkConfig::new("N0AAA")).unwrap();
+    let mut b = Link::new(config).unwrap();
+    b.set_listening(true);
+    a.connect("N0BBB", base).unwrap();
+    let mut tick = 0;
+    pump(&mut a, &mut b, base, &mut tick, 15, false);
+    assert_eq!(a.state(), LinkState::Connected);
+    assert_eq!(b.state(), LinkState::Connected);
+    assert!(matches!(a.phy_mode().0, Some(LinkPhyMode::Ofdm { .. })));
+    a.send(b"legacy").unwrap();
+    pump(&mut a, &mut b, base, &mut tick, 15, false);
+    let mut bytes = [0; 6];
+    assert_eq!(b.recv(&mut bytes), 6);
+    assert_eq!(&bytes, b"legacy");
+}
+
+#[test]
+fn floor_phy_mode_reporting() {
+    let mut a = Link::new(LinkConfig::new("N0AAA")).unwrap();
+    assert_eq!(a.phy_mode(), (None, None));
+    let now = test_epoch();
+    a.connect("N0BBB", now).unwrap();
+    a.process(now, &[], &mut [0.0; 9600]);
+    assert!(matches!(a.phy_mode().0, Some(LinkPhyMode::Ofdm { .. })));
+    assert_eq!(a.phy_mode().1, None);
+    a.disconnect(now).unwrap();
+    assert_eq!(a.phy_mode(), (None, None));
+}
+
+#[test]
+fn floor_five_ack_probe() {
+    for lose_probe in [false, true] {
+        let base = test_epoch();
+        let mut a = Link::new(LinkConfig::new("N0AAA")).unwrap();
+        let mut b = Link::new(LinkConfig::new("N0BBB")).unwrap();
+        b.set_listening(true);
+        a.connect("N0BBB", base).unwrap();
+        let mut tick = 0;
+        pump(&mut a, &mut b, base, &mut tick, 60, true);
+        assert_eq!(b.state(), LinkState::Connected);
+        let payload: Vec<u8> = (0..19 * 7).map(|i| i as u8).collect();
+        a.send(&payload).unwrap();
+        let (mut a_out, mut b_out) = (vec![0.0; 9600], vec![0.0; 9600]);
+        let mut saw_probe = false;
+        let mut saw_return = false;
+        let mut last_count = a.frames_transmitted();
+        for _ in 0..240 * 5 {
+            let now = base + Duration::from_millis(tick * 200);
+            tick += 1;
+            let (a_in, b_in) = (b_out.clone(), a_out.clone());
+            a.process(now, &a_in, &mut a_out);
+            b.process(now, &b_in, &mut b_out);
+            if a.frames_transmitted() != last_count {
+                last_count = a.frames_transmitted();
+                if matches!(a.phy_mode().0, Some(LinkPhyMode::Ofdm { level: 1 })) {
+                    saw_probe = true;
+                }
+                if saw_probe && a.phy_mode().0 == Some(LinkPhyMode::Floor) {
+                    saw_return = true;
+                }
+            }
+            if lose_probe {
+                if a.phy_mode().0 != Some(LinkPhyMode::Floor) {
+                    a_out.fill(0.0);
+                }
+                if b.phy_mode().0 != Some(LinkPhyMode::Floor) {
+                    b_out.fill(0.0);
+                }
+            }
+            if a.pending_tx_bytes() == 0 && b.received_len() == payload.len() {
+                break;
+            }
+        }
+        assert!(saw_probe, "five new ACKs must permit a probe");
+        assert_eq!(saw_return, lose_probe);
+        let mut received = vec![0; payload.len() + 1];
+        assert_eq!(b.recv(&mut received), payload.len());
+        assert_eq!(&received[..payload.len()], payload);
+        assert_eq!(b.received_len(), 0);
+        assert_eq!(a.pending_tx_bytes(), 0);
+    }
+}
+
+#[test]
+fn floor_simultaneous_calls() {
+    let base = test_epoch();
+    let mut a = Link::new(LinkConfig::new("N0AAA")).unwrap();
+    let mut b = Link::new(LinkConfig::new("N0BBB")).unwrap();
+    // Outgoing calls must converge even when unsolicited incoming calls are disabled.
+    a.connect("N0BBB", base).unwrap();
+    b.connect("N0AAA", base).unwrap();
+    let mut tick = 0;
+    pump(&mut a, &mut b, base, &mut tick, 100, true);
+    assert_eq!(a.state(), LinkState::Connected);
+    assert_eq!(b.state(), LinkState::Connected);
+    for link in [&mut a, &mut b] {
+        assert_eq!(
+            std::iter::from_fn(|| link.poll_event())
+                .filter(|e| matches!(e, coppa_engine::LinkEvent::Connected { .. }))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn floor_simultaneous_calls_equal_retry_bucket() {
+    let base = test_epoch();
+    let mut a = Link::new(LinkConfig::new("N0AAA")).unwrap();
+    let mut b = Link::new(LinkConfig::new("N0AAD")).unwrap();
+    // Outgoing calls must converge even when unsolicited incoming calls are disabled.
+    a.connect("N0AAD", base).unwrap();
+    b.connect("N0AAA", base).unwrap();
+    let mut tick = 0;
+    pump(&mut a, &mut b, base, &mut tick, 150, true);
+    assert_eq!(a.state(), LinkState::Connected);
+    assert_eq!(b.state(), LinkState::Connected);
+    for link in [&mut a, &mut b] {
+        assert_eq!(
+            std::iter::from_fn(|| link.poll_event())
+                .filter(|e| matches!(e, coppa_engine::LinkEvent::Connected { .. }))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn floor_duplicate_handshake() {
+    use coppa_protocol::{
+        mac::{Callsign, MacFrameType, MacPdu},
+        session::LinkCapabilities,
+    };
+    let base = test_epoch();
+    let mut a = Link::new(LinkConfig::new("N0AAA")).unwrap();
+    let mut b = Link::new(LinkConfig::new("N0BBB")).unwrap();
+    b.set_listening(true);
+    a.connect("N0BBB", base).unwrap();
+    let mut tick = 0;
+    pump(&mut a, &mut b, base, &mut tick, 60, true);
+    let caps = LinkCapabilities {
+        robust_floor: true,
+        ..Default::default()
+    };
+    let core = CoppaCore::new();
+    // Replay complete, validated handshake audio after establishment.
+    for (kind, dest, src, receiver) in [
+        (MacFrameType::ConnectReq, "N0BBB", "N0AAA", &mut b),
+        (MacFrameType::ConnectAck, "N0AAA", "N0BBB", &mut a),
+    ] {
+        let pdu = MacPdu::new(
+            kind,
+            Callsign::new(dest).unwrap(),
+            Callsign::new(src).unwrap(),
+            0,
+            caps.to_bytes(),
+        );
+        let mut audio = core.floor().encode(&pdu.to_bytes()).unwrap();
+        audio.extend(vec![0.0; 2 * SAMPLE_RATE]);
+        for chunk in audio.chunks(9600) {
+            receiver.process(
+                base + Duration::from_millis(tick * 200),
+                chunk,
+                &mut [0.0; 9600],
+            );
+            tick += 1;
+        }
+        assert_eq!(receiver.state(), LinkState::Connected);
+        assert_eq!(
+            std::iter::from_fn(|| receiver.poll_event())
+                .filter(|e| matches!(e, coppa_engine::LinkEvent::Connected { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(receiver.received_len(), 0);
+    }
+}

@@ -624,9 +624,196 @@ pub fn run_sweep(
         .collect()
 }
 
+/// Tail for the floor's one-second decode schedule. Together with the
+/// randomized lead-in this includes a decode after the entire 8 s frame,
+/// while keeping the capture below the production 10 s retention bound.
+pub const FLOOR_TAIL_S: f64 = 1.25;
+
+/// Run production floor receivers on exactly the same impaired capture per
+/// seed, retaining separate tallies. Streaming has no trusted-header stage
+/// counter, so non-delivery is conservatively SyncFailed.
+///
+/// # Errors
+/// Rejects empty/unsorted grids, zero trials and empty receiver selections.
+/// Production capacity/encoding failures are command errors, not FER.
+pub fn run_floor_sweep(
+    channel: SweepChannel,
+    paths: &[RxPath],
+    grid: &[i32],
+    trials: usize,
+    seed_base: u64,
+) -> anyhow::Result<Vec<(RxPath, Vec<PointTally>)>> {
+    anyhow::ensure!(
+        !grid.is_empty() && grid.windows(2).all(|w| w[0] < w[1]),
+        "SNR grid must be nonempty and strictly increasing"
+    );
+    anyhow::ensure!(
+        trials > 0 && !paths.is_empty(),
+        "trials and receivers must be nonempty"
+    );
+    let frame = coppa_protocol::modem::floor::FloorFrame::new();
+    let mut results: Vec<_> = paths.iter().map(|&p| (p, Vec::new())).collect();
+    for (pi, &snr) in grid.iter().enumerate() {
+        let mut tallies = vec![PointTally::new(f64::from(snr)); paths.len()];
+        for trial in 0..trials {
+            let seed = attempt_seed(seed_base, pi, trials, trial);
+            let (outcomes, airtime) = floor_attempt(&frame, channel, paths, snr as f32, seed)?;
+            for (tally, outcome) in tallies.iter_mut().zip(outcomes) {
+                tally.record(outcome, airtime, coppa_protocol::modem::floor::MAX_PAYLOAD);
+            }
+        }
+        for ((_, points), tally) in results.iter_mut().zip(tallies) {
+            points.push(tally);
+        }
+    }
+    Ok(results)
+}
+
+fn floor_outcome(
+    result: Result<&[u8], coppa_protocol::modem::floor::FloorError>,
+    sent: &[u8],
+) -> anyhow::Result<AttemptOutcome> {
+    use coppa_protocol::modem::floor::FloorError;
+    Ok(match result {
+        Ok(got) if got == sent => AttemptOutcome::Delivered,
+        Ok(_) => AttemptOutcome::WrongPayload,
+        Err(FloorError::Acquisition) => AttemptOutcome::SyncFailed(SyncCause::NoDetection),
+        Err(FloorError::Header) => AttemptOutcome::SyncFailed(SyncCause::HeaderDecode),
+        Err(FloorError::Payload) => AttemptOutcome::PayloadFailed,
+        Err(FloorError::Capacity) => anyhow::bail!("floor capacity/configuration error"),
+    })
+}
+
+fn floor_attempt(
+    frame: &coppa_protocol::modem::floor::FloorFrame,
+    channel: SweepChannel,
+    paths: &[RxPath],
+    snr_db: f32,
+    seed: u64,
+) -> anyhow::Result<(Vec<AttemptOutcome>, usize)> {
+    use coppa_protocol::modem::floor::{FloorStream, FRAME_SAMPLES, MAX_PAYLOAD};
+    let mut rng = StdRng::seed_from_u64(seed);
+    let payload: Vec<u8> = (0..MAX_PAYLOAD).map(|_| rng.random::<u8>()).collect();
+    let clean = frame
+        .encode(&payload)
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    anyhow::ensure!(clean.len() == FRAME_SAMPLES, "unexpected floor airtime");
+    let fading = match channel {
+        SweepChannel::Awgn => None,
+        SweepChannel::Poor => Some(WattersonPreset::Poor.config()),
+    };
+    let mut cable = VirtualCable::new(
+        SAMPLE_RATE as f32,
+        fading.as_ref(),
+        Some(SnrProfile::constant(snr_db)),
+        coppa_channel::mean_power(&clean),
+        seed,
+    );
+    let jitter_s = f64::from(rng.random::<u16>()) / f64::from(u16::MAX) * 0.05;
+    let mut capture = cable.idle(LEAD_IN_S + jitter_s).at_b;
+    capture.extend(
+        cable
+            .transmit(coppa_channel::persistent::Direction::AToB, &clean)
+            .at_b,
+    );
+    capture.extend(cable.idle(FLOOR_TAIL_S).at_b);
+    let outcomes = paths
+        .iter()
+        .map(|path| match path {
+            RxPath::Batch => {
+                floor_outcome(frame.receive(&capture).as_deref().map_err(|e| *e), &payload)
+            }
+            RxPath::Streaming => {
+                let mut stream = FloorStream::default();
+                let mut decoded = Vec::new();
+                for chunk in capture.chunks(STREAM_CHUNK_SAMPLES) {
+                    decoded.extend(stream.push(chunk));
+                }
+                let slices: Vec<_> = decoded.iter().map(Vec::as_slice).collect();
+                Ok(classify_streaming(&slices, false, &payload))
+            }
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((outcomes, clean.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_paths_share_capture() {
+        let paths = [RxPath::Batch, RxPath::Streaming];
+        let results = run_floor_sweep(SweepChannel::Awgn, &paths, &[30], 1, DEV_SEED_BASE).unwrap();
+        assert_eq!(results.len(), 2);
+        for (path, points) in results {
+            assert!(paths.contains(&path));
+            assert_eq!(points.len(), 1);
+            assert_eq!(points[0].delivered, 1);
+            assert_eq!(points[0].trials, 1);
+            assert_eq!(
+                points[0].airtime_samples,
+                coppa_protocol::modem::floor::FRAME_SAMPLES as u64
+            );
+            assert_eq!(
+                points[0].delivered_bytes,
+                coppa_protocol::modem::floor::MAX_PAYLOAD as u64
+            );
+        }
+    }
+
+    #[test]
+    fn floor_outcomes_are_conservative() {
+        use coppa_protocol::modem::floor::FloorError;
+        for (error, expected) in [
+            (
+                FloorError::Acquisition,
+                AttemptOutcome::SyncFailed(SyncCause::NoDetection),
+            ),
+            (
+                FloorError::Header,
+                AttemptOutcome::SyncFailed(SyncCause::HeaderDecode),
+            ),
+            (FloorError::Payload, AttemptOutcome::PayloadFailed),
+        ] {
+            assert_eq!(floor_outcome(Err(error), b"sent").unwrap(), expected);
+        }
+        assert!(floor_outcome(Err(FloorError::Capacity), b"sent").is_err());
+        assert_eq!(
+            classify_streaming(&[], false, b"sent"),
+            AttemptOutcome::SyncFailed(SyncCause::NoDetection)
+        );
+        // Full comparison rejects short payloads and matching prefixes with extra bytes.
+        for got in [b"sen".as_slice(), b"sent extra".as_slice()] {
+            assert_eq!(
+                floor_outcome(Ok(got), b"sent").unwrap(),
+                AttemptOutcome::WrongPayload
+            );
+        }
+        for (grid, trials) in [(vec![], 1), (vec![2, 0], 1), (vec![0, 0], 1), (vec![0], 0)] {
+            assert!(run_floor_sweep(
+                SweepChannel::Awgn,
+                &[RxPath::Batch],
+                &grid,
+                trials,
+                DEV_SEED_BASE
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn wrong_delivery_overrides_success() {
+        for decoded in [
+            vec![b"sent".as_slice(), b"wrong".as_slice()],
+            vec![b"wrong".as_slice(), b"sent".as_slice()],
+        ] {
+            assert_eq!(
+                classify_streaming(&decoded, false, b"sent"),
+                AttemptOutcome::WrongPayload
+            );
+        }
+    }
 
     fn tally(snr: f64, delivered: usize, sync: usize, payload: usize) -> PointTally {
         let mut t = PointTally::new(snr);

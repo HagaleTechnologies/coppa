@@ -4,6 +4,9 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProtocolError {
+    /// CONNECT_CFM disagrees with mutual floor support.
+    #[error("robust floor capability mismatch")]
+    RobustFloorMismatch,
     /// Invalid outer-code packet header or length.
     #[error("Malformed outer-code packet")]
     MalformedOuterPacket,
@@ -313,4 +316,7 @@ pub enum ProtocolError {
         /// Shortest valid transport PDU, in bytes.
         min: usize,
     },
+    /// COP-168: CONNECT_CFM did not confirm the `windowed_arq` AND.
+    #[error("Windowed-ARQ capability does not match negotiation")]
+    WindowedArqMismatch,
 }

@@ -1,0 +1,9 @@
+Third-party licenses for the coppa and coppad release binaries
+{{#each licenses}}
+================================================================================
+{{name}} ({{id}})
+Used by:
+{{#each used_by}}  - {{crate.name}} {{crate.version}} ({{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}/{{crate.version}}{{/if}})
+{{/each}}
+{{{text}}}
+{{/each}}

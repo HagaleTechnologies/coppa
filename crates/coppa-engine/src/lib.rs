@@ -48,7 +48,7 @@ pub use engine::{
     CoppaCore, StreamFrame, HOST_API_VERSION, MAX_TUNE_SECONDS, TUNE_SINGLE_MAX_HZ,
     TUNE_SINGLE_MIN_HZ, TUNE_TONE_HIGH_HZ, TUNE_TONE_LOW_HZ, WIRE_FORMAT_VERSION,
 };
-pub use link::{DisconnectReason, Link, LinkConfig, LinkError, LinkEvent, LinkState};
+pub use link::{DisconnectReason, Link, LinkConfig, LinkError, LinkEvent, LinkPhyMode, LinkState};
 pub use profiles::{Profile, EMERGENCY, HF_ROBUST, HF_STANDARD, VHF_FAST};
 
 pub mod error;
