@@ -6,7 +6,6 @@ inputs and outputs, not facts about the commit carrying them.
 
 ## Outcome
 
-<<<<<<< HEAD
 COP-202 re-recorded both adapters: **link 10 of 10** connected (every
 trial at 35.5 s) and **daemon 10 of 10** connected (every trial at
 42.0 s). Both adapters run COP-195's shared floor controller
@@ -26,42 +25,20 @@ silence") and the library Link trial, which always passes the whole
 zero-filled block. `floor_daemon_trial_carries_noisy_silence` guards it.
 
 COP-196's first recordings (0 of 10 for both adapters, before the
-controller existed in either adapter) are superseded by these files.
-=======
-- **Link adapter: 10 of 10** connected. Every trial reached both-ends
-  Connected (matching identities, decoded traffic at both ends) at 35.5
-  simulated seconds, through COP-195's negotiated floor session controller
-  (merged to main in `76823db`). Bar met.
-- **Daemon adapter: 0 of 10** connected. Every trial timed out at the 60 s
-  deadline with both stations IDLE: the daemon runs its own session stack
-  and still advertises `robust_floor=false`, so it never negotiates the
-  floor. Per decision COP-197 (option B) this bar is explicitly unmet and
-  re-filed as COP-202; the audit still checks the daemon recording for
-  completeness but does not enforce its pass count until COP-202 lands and
-  re-records it.
-
-The first recording (both adapters 0/10, taken on COP-190 alone before
-COP-195 existed) is superseded for the link adapter by the run below; the
-daemon re-run on the same revision reproduced its 0/10 CSV byte for byte.
-No seeds, thresholds, gains or deadlines were changed to alter any outcome.
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
+controller existed in either adapter) are superseded by these files. So is
+the interim state COP-196 merged to main under decision COP-197 (option
+B): link 10 of 10, daemon 0 of 10 with the daemon pass count reported but
+not enforced and re-filed as COP-202. With the daemon floor path in place,
+the audit enforces nine of ten for both adapters again.
 
 ## Replay commands
 
 ```sh
-<<<<<<< HEAD
 mkdir -p /tmp/cop202-connect
 COPPA_FLOOR_CONNECT_OUT=/tmp/cop202-connect \
   cargo test --release -p coppa-engine --test floor_session \
   floor_link_connect_minus6 -- --ignored --nocapture
 COPPA_FLOOR_CONNECT_OUT=/tmp/cop202-connect \
-=======
-mkdir -p /tmp/cop196-connect
-COPPA_FLOOR_CONNECT_OUT=/tmp/cop196-connect \
-  cargo test --release -p coppa-engine --test floor_session \
-  floor_link_connect_minus6 -- --ignored --nocapture
-COPPA_FLOOR_CONNECT_OUT=/tmp/cop196-connect \
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
   cargo test --release -p coppa-daemon --lib \
   floor_daemon_connect_minus6 -- --ignored --nocapture
 ```
@@ -81,20 +58,14 @@ cargo test -p coppa-daemon --lib floor_
 `floor_connection_recordings_are_complete` checks both committed CSVs
 (exact header, exact seed set, one row per trial, −6 dB only, finite
 in-range elapsed times, success/timeout time consistency, failure-reason
-<<<<<<< HEAD
 consistency) and requires at least nine connected rows per adapter, so it
 fails until the bar is actually met. The muted negative controls
-=======
-consistency) and requires at least nine connected rows for the link adapter (the daemon
-pass count is reported but not enforced until COP-202). The muted negative controls
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
 (`floor_link_muted_peers_never_connect`,
 `floor_daemon_muted_peers_never_connect`) prove the trial runners cannot
 report connection success from local intent alone.
 
 ## Configuration
 
-<<<<<<< HEAD
 - Dependency revision tested (COP-202): main
   `21e94b63deb86db05e6e9fb416173b6032c68bf2` with COP-198 head
   `d1ee7d1575977ff0a9ab35e535aa90700410ef94` (which contains COP-195) and
@@ -102,15 +73,6 @@ report connection success from local intent alone.
   COP-202 daemon floor path.
 - Rust: rustc 1.98.0 (88d9e12ae 2026-08-18), cargo 1.98.0
   (797e8a9bc 2026-08-05), Linux.
-=======
-- Dependency revision tested: COP-196 branch merged with main
-  `76823db0e888d764dd23302cada71e5fe0895666` (includes COP-190 and
-  COP-195's library floor session controller). The daemon floor slice is
-  absent at this revision (COP-202).
-- Rust: rustc 1.98.0 (88d9e12ae 2026-08-18), cargo 1.98.0
-  (797e8a9bc 2026-08-05); first recording on Linux, current link and
-  daemon re-runs on macOS (aarch64).
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
 - Adapters: engine library `Link` pairs (caller VK3ABC, listener W1AW,
   `LinkConfig::new` defaults: level 1, compression off, 500 ms turnaround,
   5 s initial RTO, 3 connect retries) and daemon `EventLoop` pairs
@@ -141,17 +103,9 @@ report connection success from local intent alone.
 
 ## Separate pass counts
 
-<<<<<<< HEAD
 - `link.csv`: 10/10 connected (seeds 0x16910000–0x16910009), each at 35.5 s.
 - `daemon.csv`: 10/10 connected (same seeds), each at 42.0 s.
 
 All ten outcomes per adapter are retained. These files supersede
-COP-196's 0/10 recordings, which predate the controller.
-=======
-- `link.csv`: 10/10 connected (seeds 0x16910000–0x16910009).
-- `daemon.csv`: 0/10 connected (same seeds); bar re-filed as COP-202.
-
-All ten outcomes per adapter are retained, failures included. Superseded
-run: the initial link recording on COP-190 alone (pre-COP-195), 0/10, all
-timeouts with both ends IDLE and nothing decoded.
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
+COP-196's 0/10 recordings, which predate the controller, and the interim
+COP-197 option B daemon recording (0/10, bar re-filed as COP-202).

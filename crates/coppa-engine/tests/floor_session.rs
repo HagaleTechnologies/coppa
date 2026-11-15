@@ -1,7 +1,6 @@
 //! Engine-side floor session coverage of the COP-190/COP-196 connect bar:
 //! the engine constructs a separately detected floor receive path next to
 //! its OFDM paths, floor audio decodes through the seeded persistent
-<<<<<<< HEAD
 //! channel with zero wrong payloads, the v1 OFDM path is unaffected, and
 //! paired library Links are driven through the production audio paths at
 //! -6 dB AWGN under the COP-190 fixed trial contract. The negotiated,
@@ -10,13 +9,6 @@
 //! legs; the connection trials below measure it, and the audit checks the
 //! recorded outcomes for both the library Link and the coppad adapter
 //! (COP-202). Open gaps: `docs/LIMITATIONS.md`, COP-169 section.
-=======
-//! channel with zero wrong payloads, the v1 OFDM path is unaffected, the
-//! negotiated floor-aware library controller (COP-195) is exercised, and
-//! paired library Links are driven through the production audio paths at
-//! -6 dB AWGN under the COP-190 fixed trial contract; see
-//! `docs/LIMITATIONS.md`, COP-169 section.
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
 
 use std::time::{Duration, Instant};
 
@@ -235,16 +227,10 @@ fn run_link_trials() -> Vec<TrialOutcome> {
 /// least nine of the ten fixed-seed trials.
 ///
 /// Ignored because a full ten-trial release run is expensive; run
-<<<<<<< HEAD
 /// explicitly per `results/cop-190/connect/metadata.md`. Link runs
-/// COP-195's floor session controller, so the trials measure it. A missed
-/// bar is a reason to investigate timing, not to change seeds, thresholds,
-/// gains or deadlines.
-=======
-/// explicitly per `results/cop-190/connect/metadata.md`. With COP-195's
-/// negotiated floor session controller on main, all ten trials connect;
-/// seeds, thresholds, gains and deadlines are unchanged from the contract.
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
+/// COP-195's floor session controller, so the trials measure it; all ten
+/// recorded trials connect. A missed bar is a reason to investigate timing,
+/// not to change seeds, thresholds, gains or deadlines.
 #[test]
 #[ignore = "expensive release measurement; see results/cop-190/connect/metadata.md"]
 fn floor_link_connect_minus6() {
@@ -289,7 +275,6 @@ fn floor_link_muted_peers_never_connect() {
 /// COP-196 AC3: audit the committed connection evidence. Checks both CSVs
 /// (exact header, exact seed set 0x16910000..0x16910009, one row per trial
 /// index, -6 dB rows only), finite in-range elapsed times (success rows
-<<<<<<< HEAD
 /// record when both ends first qualified, timeout rows record 60.0),
 /// consistency between `connected` and `failure_reason`, and separate pass
 /// counts of at least nine per adapter.
@@ -361,39 +346,6 @@ fn floor_connection_audit_requires_the_daemon_recording() {
     assert!(missing.contains("daemon"), "{missing}");
     assert!(short.contains("daemon connect bar not met"), "{short}");
     assert_eq!(passing, Ok(()));
-=======
-/// record when both ends first qualified, timeout rows record 60.0) and
-/// consistency between `connected` and `failure_reason`, then enforces the
-/// nine-of-ten pass count on the link adapter.
-///
-/// The daemon adapter's recording is still audited for completeness, but
-/// its pass-count bar is explicitly unmet and re-filed as COP-202 (decision
-/// COP-197, option B): the daemon runs its own session stack and does not
-/// yet offer the robust floor. COP-202 restores the daemon bar here once
-/// the daemon floor ships and its trials are re-recorded.
-#[test]
-fn floor_connection_recordings_are_complete() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for (adapter, bar_enforced) in [("link", true), ("daemon", false)] {
-        let path = root
-            .join("results/cop-190/connect")
-            .join(format!("{adapter}.csv"));
-        let csv = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let connected = audit_connect_csv(&path.display().to_string(), &csv)
-            .unwrap_or_else(|e| panic!("{adapter} evidence rejected: {e}"));
-        if bar_enforced {
-            assert!(
-                connected >= 9,
-                "{adapter} connect bar not met: {connected}/{TRIALS} recorded trials connected"
-            );
-        } else {
-            println!(
-                "{adapter} connect bar not enforced (COP-202): {connected}/{TRIALS} recorded trials connected"
-            );
-        }
-    }
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
 }
 
 /// The audit core, shared with the malformed-record case: returns the

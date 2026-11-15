@@ -26977,16 +26977,9 @@ mod tests {
     // crates/coppa-engine/tests/floor_session.rs; these trials drive the same
     // contract through two daemon EventLoops, their real audio rings and
     // session handlers, paused Tokio time and the production `clock_now()`
-<<<<<<< HEAD
     // timer paths. The daemon runs COP-195's shared floor controller
     // (COP-202), so the trials measure real floor establishment rather than
     // faking it. No `fast_session_rto`, fabricated ACKs, injected state,
-=======
-    // timer paths. Until COP-195's floor session controller is incorporated,
-    // the OFDM handshake legs cannot decode at -6 dB, so the trials record
-    // failing outcomes for the missing controller rather than faking
-    // establishment. No `fast_session_rto`, fabricated ACKs, injected state,
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
     // decoder resets or manual PTT releases are used: the dial goes out
     // through `handle_host_event`, PTT keys and releases through the
     // completion task's `TxComplete` dispatch, and both stations decode
@@ -27024,7 +27017,6 @@ mod tests {
 
         impl FloorStation {
             fn new(callsign: &str, seed: u64, direction: u8, reference_power: f32) -> Self {
-<<<<<<< HEAD
                 Self::with_snr(callsign, seed, direction, reference_power, SNR_DB)
             }
 
@@ -27035,8 +27027,6 @@ mod tests {
                 reference_power: f32,
                 snr_db: f32,
             ) -> Self {
-=======
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
                 let mut config = DaemonConfig::default();
                 config.engine.callsign = callsign.to_string();
                 config.radio.ptt_pre_delay_ms = 0;
@@ -27050,11 +27040,7 @@ mod tests {
                 let channel = PersistentChannel::new(
                     SAMPLE_RATE,
                     None,
-<<<<<<< HEAD
                     Some(SnrProfile::constant(snr_db)),
-=======
-                    Some(SnrProfile::constant(SNR_DB)),
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
                     reference_power,
                     seed,
                     direction,
@@ -27134,7 +27120,6 @@ mod tests {
             confirmed(a, b_call) && confirmed(b, a_call)
         }
 
-<<<<<<< HEAD
         /// Move one full `BLOCK` through each direction's channel (COP-202
         /// harness fix): a station that played fewer samples this tick
         /// contributes silence for the rest of the block, and the channel adds
@@ -27240,8 +27225,6 @@ mod tests {
             b.station.flush_pending_audio_out();
         }
 
-=======
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
         /// Run one trial: fresh stations and channels per trial, persistent
         /// state throughout, the deadline starting at the initial connect
         /// request, audio drained at playback rate (the 960 samples each
@@ -27269,68 +27252,10 @@ mod tests {
             let mut tx_b = vec![0.0f32; BLOCK];
             let mut samples = 0usize;
             let mut connected_at: Option<usize> = None;
-<<<<<<< HEAD
             let mut clock = PairClock::new(start);
             while samples < deadline_samples {
                 step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, muted).await;
                 samples += BLOCK;
-=======
-            let mut next_fast_poll = Duration::from_millis(500);
-            let mut next_slow_poll = Duration::from_secs(5);
-            while samples < deadline_samples {
-                // The production `run` select arms, on their own cadence.
-                if start.elapsed() >= next_fast_poll {
-                    for station in [&mut a.station, &mut b.station] {
-                        station.enforce_ptt_backstop().await;
-                        station.check_arq_retransmits().await;
-                        station.repeat_pending_dial().await;
-                        station.check_session_retransmits().await;
-                        station.retry_held_tx_drain().await;
-                        station.finish_drained_disconnect().await;
-                    }
-                    next_fast_poll += Duration::from_millis(500);
-                }
-                if start.elapsed() >= next_slow_poll {
-                    for station in [&mut a.station, &mut b.station] {
-                        station.reap_timed_out_sessions().await;
-                        station.send_due_keepalives().await;
-                    }
-                    next_slow_poll += Duration::from_secs(5);
-                }
-                a.dispatch_pending().await;
-                b.dispatch_pending().await;
-                // Both stations run one block on the common sample clock: the
-                // production decode path first (it may key a reply), then this
-                // tick's played audio leaves the speaker ring, through the
-                // station's transmit channel, and into the peer's mic ring.
-                a.station.poll_audio_input().await;
-                b.station.poll_audio_input().await;
-                a.station.flush_pending_audio_out();
-                b.station.flush_pending_audio_out();
-                let n_a = a.air_out.read(&mut tx_a);
-                let n_b = b.air_out.read(&mut tx_b);
-                samples += BLOCK;
-                let heard_by_b = if muted {
-                    vec![0.0; n_a]
-                } else {
-                    a.channel.process(&tx_a[..n_a])
-                };
-                let heard_by_a = if muted {
-                    vec![0.0; n_b]
-                } else {
-                    b.channel.process(&tx_b[..n_b])
-                };
-                // Each peer decodes this audio on the next tick's poll, so
-                // call ordering gives neither side an instantaneous response.
-                let mut written = 0;
-                while written < heard_by_b.len() {
-                    written += b.air_in.write(&heard_by_b[written..]);
-                }
-                let mut written = 0;
-                while written < heard_by_a.len() {
-                    written += a.air_in.write(&heard_by_a[written..]);
-                }
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
                 if both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC") {
                     connected_at = Some(samples);
                     break;
@@ -27432,16 +27357,9 @@ mod tests {
         /// trials, through their real audio queues and session handlers.
         ///
         /// Ignored because a full ten-trial release run is expensive; run
-<<<<<<< HEAD
         /// explicitly per `results/cop-190/connect/metadata.md`. COP-202: the
         /// daemon runs COP-195's shared floor controller, so the trials
         /// measure it. A missed bar is a reason to investigate timing, not to
-=======
-        /// explicitly per `results/cop-190/connect/metadata.md`. While
-        /// COP-195's floor session controller is not incorporated, the trials
-        /// are expected to fail the nine-of-ten bar; that measured outcome is
-        /// the recorded evidence for the missing controller, not a reason to
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
         /// change seeds, thresholds, gains or deadlines.
         #[tokio::test(start_paused = true)]
         #[ignore = "expensive release measurement; see results/cop-190/connect/metadata.md"]
@@ -27483,7 +27401,6 @@ mod tests {
                 "with no peer audio the dial is still pending and the listener idle"
             );
         }
-<<<<<<< HEAD
 
         /// COP-202 AC2: every tick moves one full block through each
         /// direction's channel, so a station that plays nothing still hears
@@ -28110,7 +28027,5 @@ mod tests {
             );
             assert_eq!(delivered, payload, "the whole write arrived once");
         }
-=======
->>>>>>> c4e4ca8cbc294130c576fc82b15d561f83e7e596
     }
 }
