@@ -375,7 +375,8 @@ update. The re-measure and redesign of this bar is tracked as COP-183, the succe
   accepts floor handshakes, falls back after two unanswered response windows,
   and probes OFDM after five newly acknowledged floor exchanges. Its
   deterministic audio tests cover delivery and recovery, not connection
-  probability. The daemon controller and host mode reporting remain unbuilt.
+  probability. The daemon controller and host mode reporting remain unbuilt
+  (COP-210).
   The −6 dB connect bar (9 of 10 within 60 s) is unmet. Production development sweeps now
   cover batch and streaming reception on AWGN and Poor. COP-191 records
   final-seed 200-trial sweeps and adds `--waveform floor`; the Poor ramp,
@@ -399,7 +400,7 @@ update. The re-measure and redesign of this bar is tracked as COP-183, the succe
 - The 16-FSK design now exists twice: COP-190 moved it into the production
   crates, while the measurement-only bench copy (`floor_candidate.rs`)
   retains its historical measurements. Link uses the production floor for
-  negotiated sessions; the daemon controller still uses OFDM. The design's
+  negotiated sessions; the daemon controller still uses OFDM (COP-210). The design's
   development Poor sweep, measured on the frozen bench copy, fails the conservative sync-share clause:
   header sync dominates near the crossing. Production development sweeps
   also fail sync share, at −12 dB AWGN and −8/−6 dB Poor for both paths.
@@ -495,10 +496,11 @@ stall scenario does (`docs/testing/bpq-session.md`).
   `coppa-codec::floor`, and the framing plus a separately detected
   streaming receiver (`FloorFrame`, `FloorStream`) live in
   `coppa-protocol::modem::floor`, guarded by `air_v2_conformance.rs` and
-  `floor_receive.rs`. CoppaCore constructs a floor codec and continuous receive path, but
-  Link and daemon have no floor-aware session controller: capability
-  negotiation, connect-on-floor, OFDM fallback and the −6 dB connect bar
-  (9 of 10 within 60 s) remain unmet, as does Poor ramp acceptance. COP-191 adds the
+  `floor_receive.rs`. CoppaCore constructs a floor codec and continuous receive path.
+  The library Link negotiates capability, connects on the floor and falls back
+  from OFDM (COP-195); the daemon has no floor-aware session controller yet
+  (COP-210). The −6 dB connect bar (9 of 10 within 60 s) remains unmet, as does
+  Poor ramp acceptance. COP-191 adds the
   production sweep driver; `connect` and `ramp` remain blocked on the
   COP-190 production session controller.
 - COP-187 repairs the experimental 16-FSK candidate's independent hard header
