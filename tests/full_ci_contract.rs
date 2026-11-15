@@ -398,6 +398,33 @@ fn group_time_budget_is_configured() {
 }
 // COP-207: the fan-in waits for a slow-but-passing fast-tier check instead of failing it,
 // and a check that never finishes fails as "still running", not as unsuccessful.
+const WINDOWS: &str = "Platform Check (windows-latest)";
+/// The Windows platform check's state in one fake check-runs response.
+#[derive(Clone, Copy)]
+enum Windows {
+    Running,
+    Absent,
+    Passed,
+    Failed,
+}
+/// One run of the fan-in's real fast-tier poll against a fake `gh`.
+struct FanIn {
+    out: std::process::Output,
+    /// How many times the step called `gh`.
+    polls: usize,
+    /// What the step wrote to `$GITHUB_OUTPUT`.
+    github_output: String,
+}
+impl FanIn {
+    /// Every `::error::` annotation line the step printed.
+    fn errors(&self) -> Vec<String> {
+        String::from_utf8_lossy(&self.out.stdout)
+            .lines()
+            .filter(|l| l.starts_with("::error::"))
+            .map(str::to_owned)
+            .collect()
+    }
+}
 fn fast_tier(windows_pending_polls: usize, wait_s: &str) -> std::process::Output {
     fast_tier_with(windows_pending_polls, wait_s, "", "")
 }
@@ -407,11 +434,36 @@ fn fast_tier_with(
     bad: &str,
     fail: &str,
 ) -> std::process::Output {
+    fast_tier_run(
+        Windows::Running,
+        Windows::Passed,
+        windows_pending_polls,
+        wait_s,
+        bad,
+        fail,
+    )
+    .out
+}
+/// Runs the fan-in step with its wait cut to `wait_s` seconds. Windows reports `before` for
+/// the first `pending_polls` calls and `after` from then on; the other five checks pass.
+fn fast_tier_run(
+    before: Windows,
+    after: Windows,
+    pending_polls: usize,
+    wait_s: &str,
+    bad: &str,
+    fail: &str,
+) -> FanIn {
+    const DEADLINE: &str = "fast_tier_deadline=$((SECONDS + fast_tier_wait_minutes * 60))";
     let body = shell("- name: Check all jobs (including the fast tier's own native results)")
-        .replace("${{ needs.create-ci-check.result }}", "success")
+        .replace("${{ needs.create-ci-check.result }}", "success");
+    // Fail loudly on a rename instead of silently running the real 75-minute wait.
+    assert!(body.contains(DEADLINE), "fan-in deadline line changed");
+    assert!(body.contains("sleep 30"), "fan-in poll interval changed");
+    let body = body
         .replace(
-            "fast_tier_wait_s=7200",
-            &format!("fast_tier_wait_s={wait_s}"),
+            DEADLINE,
+            &format!("fast_tier_deadline=$((SECONDS + {wait_s}))"),
         )
         .replace("sleep 30", "sleep 0.05");
     let s = Scratch::new();
@@ -421,30 +473,33 @@ fn fast_tier_with(
         "Format",
         "Platform Check (ubuntu-latest)",
         "Platform Check (macos-latest)",
-        "Platform Check (windows-latest)",
+        WINDOWS,
     ];
-    let runs = |windows_done: bool| {
+    let runs = |windows: Windows| {
         names
             .iter()
-            .map(|n| {
-                let done = windows_done || *n != "Platform Check (windows-latest)";
-                format!(
-                    r#"{{"name":"{n}","started_at":"2026-11-13T19:07:14Z","status":"{}","conclusion":{}}}"#,
-                    if done { "completed" } else { "in_progress" },
-                    if done { "\"success\"" } else { "null" }
-                )
+            .filter_map(|n| {
+                let (status, conclusion) = match (*n == WINDOWS, windows) {
+                    (true, Windows::Absent) => return None,
+                    (true, Windows::Running) => ("in_progress", "null"),
+                    (true, Windows::Failed) => ("completed", "\"failure\""),
+                    _ => ("completed", "\"success\""),
+                };
+                Some(format!(
+                    r#"{{"name":"{n}","started_at":"2026-11-13T19:07:14Z","status":"{status}","conclusion":{conclusion}}}"#
+                ))
             })
             .collect::<Vec<_>>()
             .join(",")
     };
     fs::write(
         s.0.join("pending"),
-        format!(r#"{{"check_runs":[{}]}}"#, runs(false)),
+        format!(r#"{{"check_runs":[{}]}}"#, runs(before)),
     )
     .unwrap();
     fs::write(
         s.0.join("done"),
-        format!(r#"{{"check_runs":[{}]}}"#, runs(true)),
+        format!(r#"{{"check_runs":[{}]}}"#, runs(after)),
     )
     .unwrap();
     s.executable(
@@ -456,7 +511,7 @@ n=0
 echo $((n+1)) > "$MOCK_STATE/polls"
 case " ${{MOCK_BAD:-}} " in *" $n "*) echo '{{"message":"Server Error"}}'; exit 0;; esac
 case " ${{MOCK_FAIL:-}} " in *" $n "*) echo 'HTTP 502' >&2; exit 1;; esac
-if [ "$n" -lt {windows_pending_polls} ]; then cat "$MOCK_STATE/pending"; else cat "$MOCK_STATE/done"; fi
+if [ "$n" -lt {pending_polls} ]; then cat "$MOCK_STATE/pending"; else cat "$MOCK_STATE/done"; fi
 "#
         ),
     );
@@ -486,7 +541,57 @@ if [ "$n" -lt {windows_pending_polls} ]; then cat "$MOCK_STATE/pending"; else ca
     ] {
         cmd.env(key, "success");
     }
-    cmd.output().unwrap()
+    let out = cmd.output().unwrap();
+    FanIn {
+        out,
+        polls: fs::read_to_string(s.0.join("polls")).map_or(0, |n| n.trim().parse().unwrap()),
+        github_output: fs::read_to_string(s.0.join("out")).unwrap_or_default(),
+    }
+}
+#[test]
+fn fanin_waits_for_slow_fast_tier_then_fails_closed() {
+    // Scenario 1: Windows is still running for two polls, then passes.
+    let run = fast_tier_run(Windows::Running, Windows::Passed, 2, "7200", "", "");
+    let stdout = String::from_utf8_lossy(&run.out.stdout);
+    assert!(run.out.status.success(), "{stdout}");
+    assert!(run.github_output.contains("outcome=success"), "{stdout}");
+    assert!(run.polls > 2, "{} polls: {stdout}", run.polls);
+    // Scenario 2: still running at the deadline, or never reported, fails closed. The one
+    // annotation line names the Windows check and no other.
+    for (windows, error) in [
+        (
+            Windows::Running,
+            format!(
+                "::error::Fast-tier check(s) still running on d1ee7d15 after 75 minutes (timed out waiting, not failed): [\"{WINDOWS}\"]"
+            ),
+        ),
+        (
+            Windows::Absent,
+            format!(
+                "::error::Missing fast-tier check-run(s) for d1ee7d15 after 75 minutes: [\"{WINDOWS}\"] -- ci.yml may not have run at all, ran against a different SHA, or is still queued."
+            ),
+        ),
+    ] {
+        let run = fast_tier_run(windows, windows, 0, "2", "", "");
+        let stdout = String::from_utf8_lossy(&run.out.stdout);
+        assert!(!run.out.status.success(), "{stdout}");
+        assert!(run.github_output.contains("outcome=failure"), "{stdout}");
+        assert!(run.polls > 1, "{} polls: {stdout}", run.polls);
+        assert_eq!(run.errors(), [error], "{stdout}");
+    }
+    // A Windows check that fails is reported on the first poll, without waiting.
+    let run = fast_tier_run(Windows::Failed, Windows::Failed, 0, "7200", "", "");
+    let stdout = String::from_utf8_lossy(&run.out.stdout);
+    assert!(!run.out.status.success(), "{stdout}");
+    assert!(run.github_output.contains("outcome=failure"), "{stdout}");
+    assert_eq!(run.polls, 1, "{stdout}");
+    assert_eq!(
+        run.errors(),
+        [format!(
+            "::error::One or more fast-tier checks did not succeed on d1ee7d15: [{{\"name\":\"{WINDOWS}\",\"conclusion\":\"failure\"}}]"
+        )],
+        "{stdout}"
+    );
 }
 #[test]
 fn fanin_waits_for_a_slow_passing_fast_tier_check() {
@@ -508,31 +613,79 @@ fn fanin_reports_a_hung_fast_tier_check_as_still_running() {
         "{stdout}"
     );
 }
+/// The merge queue's `check_response_timeout_minutes`. It lives in the "Coppa - Native Merge
+/// Queue" ruleset (id 23405672), outside this repo; read with `gh api` on 2026-11-14.
+const QUEUE_CHECK_RESPONSE_TIMEOUT_MINUTES: u32 = 120;
+/// The first whole number after `key` in `text`.
+fn minutes_after(text: &str, key: &str) -> u32 {
+    let after = text
+        .split(key)
+        .nth(1)
+        .unwrap_or_else(|| panic!("{key:?} missing"));
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("{key:?} has no number"))
+}
 #[test]
-fn fast_tier_wait_outlasts_its_jobs_time_limit() {
+fn fanin_wait_fits_job_and_queue_limits() {
+    // COP-203 Scenario 3: the fan-in's own named error must fire before the job is
+    // cancelled and before the merge queue drops the group.
+    let job = WORKFLOW.split("\n  ci:\n").nth(1).expect("ci job missing");
+    let test_full = WORKFLOW
+        .split("\n  test-full:\n")
+        .nth(1)
+        .expect("test-full job missing");
+    let check = job
+        .split("- name: Check all jobs (including the fast tier's own native results)")
+        .nth(1)
+        .and_then(|after| after.split("- name: ").next())
+        .expect("Check step missing");
+    let wait = minutes_after(job, "fast_tier_wait_minutes=");
+    let check_timeout = minutes_after(check, "\n        timeout-minutes: ");
+    let job_timeout = minutes_after(job, "\n    timeout-minutes: ");
+    let test_full_timeout = minutes_after(test_full, "\n    timeout-minutes: ");
+    // The slowest Windows leg seen is 63.5 minutes; it must fit with no head start.
+    assert!(wait >= 64, "wait {wait} is under the slowest fast-tier leg");
+    // The Check step's own cap leaves room for the always() mint and relay steps after it.
+    assert!(
+        wait < check_timeout && check_timeout < job_timeout,
+        "wait {wait} < Check step {check_timeout} < ci job {job_timeout} must hold"
+    );
+    assert!(
+        test_full_timeout + wait < QUEUE_CHECK_RESPONSE_TIMEOUT_MINUTES,
+        "test-full {test_full_timeout} + wait {wait} must end before the queue's timeout"
+    );
+    assert!(job.contains(&format!(
+        "check_response_timeout_minutes of {QUEUE_CHECK_RESPONSE_TIMEOUT_MINUTES}"
+    )));
+    assert!(job.contains("id 23405672"));
+    assert!(!WORKFLOW.contains("after 30 minutes"));
+}
+#[test]
+fn fast_tier_jobs_keep_their_time_limit() {
+    // COP-207's caps free a hung runner. The fan-in no longer outwaits them (COP-203 keeps its
+    // wait under the queue timeout and fails a still-running check by name), but each cap must
+    // stay and must sit above the slowest leg seen (63.5 min) so it never cancels a passing run.
     let ci = include_str!("../.github/workflows/ci.yml");
     for job in [
         "Test with Features (fast, lib-only)",
         "Platform Check (${{ matrix.os }})",
     ] {
         let after = ci.split(&format!("name: {job}\n")).nth(1).unwrap();
-        let limit: u64 = after
+        let limit: u32 = after
             .lines()
             .take_while(|l| !l.starts_with("  ") || l.starts_with("    "))
             .find_map(|l| l.trim().strip_prefix("timeout-minutes: "))
             .unwrap_or_else(|| panic!("{job} has no timeout-minutes"))
             .parse()
             .unwrap();
-        assert!(
-            limit * 60 < 7200,
-            "{job}: {limit}m must end before the fan-in's wait"
-        );
+        assert!(limit >= 64, "{job}: {limit}m would cancel a passing leg");
     }
-    assert!(WORKFLOW.contains("fast_tier_wait_s=7200"));
 }
 #[test]
 fn relay_token_is_minted_after_the_fast_tier_wait() {
-    // An installation token lives 60 min; the fast-tier wait can run 120 (COP-207).
+    // An installation token lives 60 min; the fast-tier wait can run 75 (COP-203).
     let check = WORKFLOW
         .find("- name: Check all jobs (including the fast tier's own native results)")
         .unwrap();
