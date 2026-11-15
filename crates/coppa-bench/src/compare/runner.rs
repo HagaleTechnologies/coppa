@@ -213,34 +213,39 @@ fn run_jobs(
             });
         }
         drop(tx);
-        let mut first_error = None;
+        let mut first_error: Option<anyhow::Error> = None;
         for (done, result) in rx.iter().enumerate() {
-            match result {
-                Ok((row, wall)) => {
-                    let mut line = row.to_line();
-                    line.push('\n');
-                    file.write_all(line.as_bytes())?;
-                    file.flush()?;
-                    writeln!(
-                        log,
-                        "[{:>3}/{}] {} {} {} dB {} B trial {} seed 0x{:08x}: {} ({:.1} s wall)",
-                        done + 1,
-                        total,
-                        row.row,
-                        row.channel.name(),
-                        row.snr_db,
-                        row.size_bytes,
-                        row.trial,
-                        row.seed,
-                        describe(&row),
-                        wall
-                    )?;
-                    ran.push(row.key());
-                }
+            if first_error.is_some() {
+                // Draining: workers stop after the trial they are running.
+                continue;
+            }
+            let recorded = result.and_then(|(row, wall)| {
+                let mut line = row.to_line();
+                line.push('\n');
+                file.write_all(line.as_bytes())?;
+                file.flush()?;
+                writeln!(
+                    log,
+                    "[{:>3}/{}] {} {} {} dB {} B trial {} seed 0x{:08x}: {} ({:.1} s wall)",
+                    done + 1,
+                    total,
+                    row.row,
+                    row.channel.name(),
+                    row.snr_db,
+                    row.size_bytes,
+                    row.trial,
+                    row.seed,
+                    describe(&row),
+                    wall
+                )?;
+                Ok(row.key())
+            });
+            match recorded {
+                Ok(key) => ran.push(key),
                 Err(e) => {
                     // Stop handing out work; finish what is running.
                     next.store(usize::MAX / 2, Ordering::SeqCst);
-                    first_error.get_or_insert(e);
+                    first_error = Some(e);
                 }
             }
         }

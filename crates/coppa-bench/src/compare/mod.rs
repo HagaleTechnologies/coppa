@@ -13,12 +13,25 @@ pub mod runner;
 pub mod stats;
 pub mod trial;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The repository root, resolved from this crate's manifest at build time.
 #[must_use]
 pub fn repo_root() -> PathBuf {
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .ancestors()
+        .nth(2)
+        .map_or_else(|| manifest.join("../.."), Path::to_path_buf)
+}
+
+/// The published page: `<repo>/docs/benchmarks/comparison.md`.
+#[must_use]
+pub fn default_page() -> PathBuf {
+    repo_root()
+        .join("docs")
+        .join("benchmarks")
+        .join("comparison.md")
 }
 
 /// The published out-dir: `<repo>/results/compare`.

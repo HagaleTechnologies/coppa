@@ -109,6 +109,8 @@ cargo run -p coppa-bench --release -- --trials 50
 cargo run -p coppa-bench --release --example <name>
 # The per-level CI guard behind the table above
 cargo test -p coppa-bench --lib waterfall_bracket
+# The COP-170 same-simulator comparison page
+cargo run -p coppa-bench --release -- compare
 ```
 
 ## COP-169: floor-mode measurement contract and the `ofdm:1` baseline
@@ -206,6 +208,20 @@ long noise-only runs, design selection, final seeds and production session
 integration remain unbuilt. The ticket's three scenarios remain unmet.
 This candidate was written using repository primitives and the ticket's
 parameters. No external modem source was read or copied.
+
+## COP-170 same-simulator comparison
+
+[docs/benchmarks/comparison.md](docs/benchmarks/comparison.md) measures coppa
+through the channel grid of the 2020 Winlink comparison: WGN, Watterson Good
+(MPG) and Poor (MPP) at 30 to 0 dB SNR, for 2 KB and 16 KB transfers. Each cell
+gives the mean net bytes/min over its trials, failures included, with a 95%
+Student t interval, completed/n, and a link to the exact command and seed range
+that produced it. The page follows this file's conventions: SNR in a 3 kHz
+noise bandwidth against the clean mean power of the transmitted frame. One
+command regenerates it: `cargo run -p coppa-bench --release -- compare`, and
+`compare --check` tells whether it is stale. It publishes coppa rows only. The
+2 KB tables are recorded; the 16 KB cells, the black-box harness for other
+modems and the channel cross-check are open (`docs/LIMITATIONS.md`, COP-170).
 
 ## Log index
 

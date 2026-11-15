@@ -17,14 +17,19 @@ Not on crates.io and not a product crate. From a clone of the repository:
 - `cargo run -p coppa-bench --release -- compare` (COP-170) runs two library
   `Link`s through the WGN, MPG and MPP channels at the 2020 Winlink
   comparison's SNR grid (30 to 0 dB) for 2 KB and 16 KB transfers, 8 trials
-  per cell, and prints one Markdown table per channel and size: mean net
-  bytes/min, its 95% Student t interval, and completed/n. Every trial is a row
+  per cell, and renders [docs/benchmarks/comparison.md](../../docs/benchmarks/comparison.md):
+  one Markdown table per channel and size with mean net bytes/min, its 95%
+  Student t interval and completed/n, each cell linked to a replay row with
+  its seed range and command. `compare --check` exits 1 when the page is
+  stale. Every trial is a row
   in `results/compare/<row>.csv`; its seed is
   `0x17000000 + cell * 0x10000 + trial`, so a re-run reproduces it and an
   interrupted run resumes with only the missing trials. `--channel`, `--snr`,
   `--size`, `--trials`, `--rows` (`link-l2`, `link-l4`, `link-default`),
-  `--jobs` and `--out-dir` narrow or move the run; `--no-render` skips the
-  tables. The flat flags above do not mix with `compare`.
+  `--jobs` and `--out-dir` narrow or move the run (an `--out-dir` also moves
+  the page there, so a replay never overwrites the published one); `--page`
+  names another page; `--no-render` measures only. The flat flags above do not
+  mix with `compare`.
 
 Results are logged in [BENCHMARKS.md](https://github.com/HagaleTechnologies/coppa/blob/main/BENCHMARKS.md).
 Read its [Conventions](../../BENCHMARKS.md) section and the

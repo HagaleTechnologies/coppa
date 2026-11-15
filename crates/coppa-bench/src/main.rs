@@ -7,8 +7,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use coppa_bench::compare::grid::{Channel, SIZES, SNRS_DB};
-use coppa_bench::compare::link_stack::{row_spec, TrialOptions, ROWS};
-use coppa_bench::compare::render::render_tables;
+use coppa_bench::compare::link_stack::{row_spec, RowSpec, TrialOptions, ROWS};
+use coppa_bench::compare::render::{
+    first_difference, recorded_version, regions, render_page, render_tables, skeleton,
+};
 use coppa_bench::compare::runner::{csv_path, run_plan, Plan};
 use coppa_bench::compare::trial::read_csv;
 
@@ -97,9 +99,17 @@ struct CompareArgs {
     /// Default: <repo>/results/compare.
     #[arg(long)]
     out_dir: Option<PathBuf>,
-    /// Measure only; print no tables.
-    #[arg(long, default_value_t = false)]
+    /// Page whose generated regions are rewritten. Default:
+    /// <repo>/docs/benchmarks/comparison.md, or <out-dir>/comparison.md when
+    /// --out-dir is given, so a replay never overwrites the published page.
+    #[arg(long)]
+    page: Option<PathBuf>,
+    /// Measure only; leave the page alone and print no tables.
+    #[arg(long, default_value_t = false, conflicts_with = "check")]
     no_render: bool,
+    /// Measure nothing; exit 1 if the page differs from what the CSVs render.
+    #[arg(long, default_value_t = false)]
+    check: bool,
 }
 
 fn parse_row(s: &str) -> Result<String, String> {
@@ -145,6 +155,15 @@ fn parse_seed(s: &str) -> Result<u64, String> {
     .map_err(|_| format!("invalid seed '{s}'"))
 }
 
+/// The page a `compare` invocation renders into.
+fn compare_page(args: &CompareArgs) -> PathBuf {
+    match (&args.page, &args.out_dir) {
+        (Some(page), _) => page.clone(),
+        (None, Some(out_dir)) => out_dir.join("comparison.md"),
+        (None, None) => coppa_bench::compare::default_page(),
+    }
+}
+
 /// The plan a `compare` invocation selects.
 fn compare_plan(args: &CompareArgs) -> Plan {
     let jobs = args.jobs.unwrap_or_else(|| {
@@ -152,8 +171,14 @@ fn compare_plan(args: &CompareArgs) -> Plan {
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1)
     });
+    let mut rows: Vec<_> = Vec::new();
+    for spec in args.rows.iter().filter_map(|r| row_spec(r)) {
+        if !rows.contains(&spec) {
+            rows.push(spec);
+        }
+    }
     Plan {
-        rows: args.rows.iter().filter_map(|r| row_spec(r)).collect(),
+        rows,
         channels: args.channel.clone(),
         snrs: args.snr.clone(),
         sizes: args.size.clone(),
@@ -167,6 +192,61 @@ fn compare_plan(args: &CompareArgs) -> Plan {
     }
 }
 
+/// Rows the page shows: every known row with a CSV in the out-dir, plus the
+/// plan's rows, in registry order. A run restricted to one row never drops
+/// another row's published tables.
+fn page_rows(plan: &Plan) -> Vec<RowSpec> {
+    ROWS.into_iter()
+        .filter(|r| plan.rows.contains(r) || csv_path(&plan.out_dir, r).exists())
+        .collect()
+}
+
+/// Every recorded trial of the page's rows, the rows, and the version label.
+fn recorded(
+    plan: &Plan,
+) -> anyhow::Result<(
+    Vec<RowSpec>,
+    Vec<coppa_bench::compare::trial::TrialRow>,
+    String,
+)> {
+    let rows = page_rows(plan);
+    let mut trials = Vec::new();
+    for row in &rows {
+        trials.extend(read_csv(&csv_path(&plan.out_dir, row))?);
+    }
+    let metadata = fs::read_to_string(plan.out_dir.join("metadata.md")).ok();
+    Ok((rows, trials, recorded_version(metadata.as_deref())))
+}
+
+/// `compare --check`: 0 when the page matches the CSVs, 1 when it is stale.
+fn check_compare(args: &CompareArgs) -> anyhow::Result<i32> {
+    let plan = compare_plan(args);
+    let page_path = compare_page(args);
+    let (rows, trials, version) = recorded(&plan)?;
+    let page = fs::read_to_string(&page_path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", page_path.display()))?;
+    let expected = render_page(&page, &regions(&rows, &trials, &version))
+        .map_err(|e| anyhow::anyhow!("{}: {e}", page_path.display()))?;
+    match first_difference(&page, &expected) {
+        None => {
+            eprintln!(
+                "compare: {} matches {} ({} trials)",
+                page_path.display(),
+                plan.out_dir.display(),
+                trials.len()
+            );
+            Ok(0)
+        }
+        Some((line, region)) => {
+            eprintln!(
+                "compare: {} is stale: {region} differs at line {line}; run cargo run --release -p coppa-bench -- compare",
+                page_path.display()
+            );
+            Ok(1)
+        }
+    }
+}
+
 fn run_compare(args: &CompareArgs) -> anyhow::Result<()> {
     let plan = compare_plan(args);
     if cfg!(debug_assertions) {
@@ -174,18 +254,27 @@ fn run_compare(args: &CompareArgs) -> anyhow::Result<()> {
     }
     let mut log = std::io::stderr();
     run_plan(&plan, TrialOptions::default(), &mut log)?;
-    let mut trials = Vec::new();
     for row in &plan.rows {
-        let path = csv_path(&plan.out_dir, row);
-        trials.extend(read_csv(&path)?);
-        eprintln!("compare: wrote {}", path.display());
+        eprintln!("compare: wrote {}", csv_path(&plan.out_dir, row).display());
     }
-    if !args.no_render {
-        print!(
-            "{}",
-            render_tables(&plan.rows, &trials, env!("CARGO_PKG_VERSION"))
-        );
+    if args.no_render {
+        return Ok(());
     }
+    let (rows, trials, version) = recorded(&plan)?;
+    let page_path = compare_page(args);
+    let page = match fs::read_to_string(&page_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => skeleton(),
+        Err(e) => anyhow::bail!("reading {}: {e}", page_path.display()),
+    };
+    let rendered = render_page(&page, &regions(&rows, &trials, &version))
+        .map_err(|e| anyhow::anyhow!("{}: {e}", page_path.display()))?;
+    if rendered != page {
+        fs::write(&page_path, &rendered)
+            .map_err(|e| anyhow::anyhow!("writing {}: {e}", page_path.display()))?;
+    }
+    eprintln!("compare: rendered {}", page_path.display());
+    print!("{}", render_tables(&rows, &trials, &version));
     Ok(())
 }
 
@@ -232,11 +321,19 @@ fn selected_modes(level: Option<u8>) -> impl Iterator<Item = &'static ModeInfo> 
 fn main() {
     let args = Args::parse();
     if let Some(Cmd::Compare(compare)) = &args.cmd {
-        if let Err(e) = run_compare(compare) {
-            eprintln!("compare: error: {e:#}");
-            std::process::exit(1);
+        let result = if compare.check {
+            check_compare(compare)
+        } else {
+            run_compare(compare).map(|()| 0)
+        };
+        match result {
+            Ok(0) => return,
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("compare: error: {e:#}");
+                std::process::exit(1);
+            }
         }
-        return;
     }
     let snrs = snr_points(args.snr_min, args.snr_max, args.snr_step);
     let chan = parse_channel(&args.channel);
@@ -315,6 +412,41 @@ mod tests {
     }
 
     #[test]
+    fn out_dir_moves_the_default_page() {
+        let bare = Args::try_parse_from(["coppa-bench", "compare"]).unwrap();
+        let Some(Cmd::Compare(bare)) = &bare.cmd else {
+            panic!("expected the compare subcommand");
+        };
+        assert_eq!(compare_page(bare), coppa_bench::compare::default_page());
+        assert!(compare_page(bare).ends_with("docs/benchmarks/comparison.md"));
+        let moved =
+            Args::try_parse_from(["coppa-bench", "compare", "--out-dir", "/tmp/replay"]).unwrap();
+        let Some(Cmd::Compare(moved)) = &moved.cmd else {
+            panic!("expected the compare subcommand");
+        };
+        assert_eq!(
+            compare_page(moved),
+            PathBuf::from("/tmp/replay/comparison.md")
+        );
+        let explicit = Args::try_parse_from([
+            "coppa-bench",
+            "compare",
+            "--out-dir",
+            "/tmp/replay",
+            "--page",
+            "/tmp/p.md",
+        ])
+        .unwrap();
+        let Some(Cmd::Compare(explicit)) = &explicit.cmd else {
+            panic!("expected the compare subcommand");
+        };
+        assert_eq!(compare_page(explicit), PathBuf::from("/tmp/p.md"));
+        assert!(
+            Args::try_parse_from(["coppa-bench", "compare", "--check", "--no-render"]).is_err()
+        );
+    }
+
+    #[test]
     fn compare_rejects_off_grid_points() {
         assert!(Args::try_parse_from(["coppa-bench", "compare", "--snr", "12"]).is_err());
         assert!(Args::try_parse_from(["coppa-bench", "compare", "--size", "100"]).is_err());
@@ -334,6 +466,12 @@ mod tests {
         };
         assert_eq!(compare.channel, [Channel::Mpg, Channel::Mpp]);
         assert_eq!(compare.seed_base, 16);
+        let dup =
+            Args::try_parse_from(["coppa-bench", "compare", "--rows", "link-l2,link-l2"]).unwrap();
+        let Some(Cmd::Compare(dup)) = &dup.cmd else {
+            panic!("expected the compare subcommand");
+        };
+        assert_eq!(compare_plan(dup).rows.len(), 1);
     }
 
     #[test]
