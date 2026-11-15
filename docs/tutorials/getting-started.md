@@ -2,9 +2,12 @@
 
 ## Prerequisites
 
+Prebuilt `coppa` and `coppad` binaries need no Rust toolchain: see
+[Install](../../README.md#install) in the README. The steps below build from
+source.
+
 - Rust 1.85.0 or later
 - ALSA development headers (Linux): `sudo apt-get install libasound2-dev`
-- udev development headers (Linux), only to build coppad with `--features serial-ptt`: `sudo apt-get install libudev-dev`
 - For radio control (PTT through `rigctld`):
   `sudo apt-get install libhamlib-utils`. Coppad talks to `rigctld` at
   `127.0.0.1:4532` by default and runs degraded (no PTT) when it cannot

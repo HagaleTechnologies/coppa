@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 //! Engine-side floor session coverage of the COP-190/COP-196 connect bar:
 //! the engine constructs a separately detected floor receive path next to
 //! its OFDM paths, floor audio decodes through the seeded persistent
@@ -11,6 +12,14 @@
 //! (COP-202). Open gaps: `docs/LIMITATIONS.md`, COP-169 section.
 
 use std::time::{Duration, Instant};
+=======
+//! Engine-side receive cases of the COP-190 floor session work: the engine
+//! constructs a separately detected floor receive path next to its OFDM
+//! paths, floor audio decodes through the seeded persistent channel with
+//! zero wrong payloads, and the v1 OFDM path is unaffected. The negotiated,
+//! floor-aware library controller is exercised below; the daemon and measured
+//! connection bar remain open; see `docs/LIMITATIONS.md`, COP-169 section.
+>>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
 
 use coppa_channel::persistent::{PersistentChannel, SnrProfile};
 use coppa_engine::{CoppaCore, Link, LinkConfig, LinkState};
@@ -518,7 +527,12 @@ fn floor_audio_through_the_persistent_channel_decodes_exactly() {
 
 // Deterministic library session regressions below do not establish a connection probability.
 
+<<<<<<< HEAD
 use coppa_engine::LinkPhyMode;
+=======
+use coppa_engine::{Link, LinkConfig, LinkPhyMode, LinkState};
+use std::time::{Duration, Instant};
+>>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
 
 // Tests need one real epoch; every subsequent deadline uses injected sample time.
 #[allow(clippy::disallowed_methods)]

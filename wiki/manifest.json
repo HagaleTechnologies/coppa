@@ -558,7 +558,11 @@
       "visibility": "public"
     },
     {
+<<<<<<< HEAD
       "hash": "sha256:4f14238ae771d15d415aaccf5b59686301a2ab942538122d1884236c47e8b7c2",
+=======
+      "hash": "sha256:ea365d47d94ef69ddb33b6e0a67e692c7f79e6dab0a22d49d9816ad6e7ce45d8",
+>>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
       "id": "low-rate-floor",
       "kind": "gotcha",
       "links": [
@@ -668,6 +672,29 @@
       "title": "What will bite you in the daemon's real-radio TX/RX path?",
       "verified_commit": "dc18b8b",
       "verified_date": "2026-11-03",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:b72602a5a8149ae78fdc3bbd581a91b96d5629bc76d9e45315a2ae6d85366729",
+      "id": "release-binaries",
+      "kind": "gotcha",
+      "links": [
+        "cpal-feature-gate",
+        "phase4-field-readiness",
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/release-binaries.md",
+      "sources": [
+        ".github/workflows/release.yml",
+        "tools/release/release.py",
+        "docs/RELEASING.md"
+      ],
+      "status": "current",
+      "title": "What will bite you when building or installing coppa release binaries?",
+      "verified_commit": "4237273",
+      "verified_date": "2026-11-09",
       "visibility": "public"
     },
     {

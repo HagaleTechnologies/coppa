@@ -2,14 +2,19 @@
 # for the full schema.
 
 [graph]
-# Workspace targets that we ship to. Linux is the primary deployment target;
-# the Mac and Windows entries match the cross-platform-check CI matrix.
+# The release targets (.github/workflows/release.yml, COP-47). The macOS
+# universal binary holds both Apple targets. Keep in step with about.toml.
 targets = [
     "x86_64-unknown-linux-gnu",
-    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "armv7-unknown-linux-gnueabihf",
     "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
 ]
-all-features = false
+# The release ships every coppad feature (cpal, websocket, serial and GPIO
+# PTT, KISS, ARDOP, mDNS), so check the graph with all of them on.
+all-features = true
 
 [advisories]
 # Fail on any RustSec advisory in dependencies. Yanked crates also fail.
@@ -31,15 +36,6 @@ ignore = [
     # the original and the fork are now unmaintained. Proc-macro only
     # (compile time), no runtime surface.
     { id = "RUSTSEC-2026-0173", reason = "proc-macro only — runs at build time, no runtime exposure (also tracked as RUSTSEC-2024-0370)" },
-
-    # `chacha20` 0.10.1 (pulled transitively via `rand` 0.10.2) was yanked
-    # 2026-08-27 alongside 0.10.0 for a portability bug, not a security
-    # vulnerability: the SSE2 backend wrongly used the SSE4.1 intrinsic
-    # `_mm_extract_epi32`, which raises SIGILL on x86_64 CPUs that have
-    # SSE2 but not SSE4.1 (RustCrypto/stream-ciphers#580). Fixed in 0.10.2
-    # the same day; no RUSTSEC advisory was filed and no key/plaintext/
-    # nonce material is affected. Re-check when `rand` picks up 0.10.2+.
-    "chacha20@0.10.1",
 ]
 
 [licenses]

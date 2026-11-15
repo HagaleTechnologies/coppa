@@ -70,6 +70,7 @@ receiver in `coppa-protocol` (`modem/floor.rs`). The frozen parameters:
   starts on OFDM and falls back after two unanswered windows. Five newly
   acknowledged floor exchanges allow one sequence-bound OFDM level-1 probe.
   A failed probe retries the bounded segment on the floor.
+<<<<<<< HEAD
 - COP-202 amendment: coppad reuses the same `FloorController` and the shared
   policy helpers in `coppa_protocol::floor_controller` for its handshake; it
   does not embed Link or keep a second controller. The floor is enabled while
@@ -83,5 +84,8 @@ receiver in `coppa-protocol` (`modem/floor.rs`). The frozen parameters:
   multi-codeword size, and a session established on OFDM keeps the OFDM fade
   hold rather than moving to the floor mid-session; see
   `docs/LIMITATIONS.md`.
+=======
+  The daemon controller and the −6 dB connection probability bar remain open.
+>>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
 - Version 2 spends one of the fourteen remaining version values; the next
   incompatible format allocates 3.

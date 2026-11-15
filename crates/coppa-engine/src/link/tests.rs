@@ -909,3 +909,68 @@ fn floor_capable_high_speed_binary_transfer() {
     assert_eq!(Cable::recv_all(&mut cable.b), payload);
     assert_eq!(cable.a.phy_mode().0, Some(LinkPhyMode::Ofdm { level: 8 }));
 }
+<<<<<<< HEAD
+=======
+
+#[test]
+fn floor_probe_chunk_fits_level_one_after_compression() {
+    // Validation finding (COP-195): a floor-sized chunk of incompressible
+    // bytes expands past level 1's budget once Huffman+LZ4 framing is added,
+    // so the five-ack OFDM probe could not encode it and the session died.
+    let mut config = LinkConfig::new("N0AAA");
+    config.engine.compression_enabled = true;
+    config.engine.speed_level = 4;
+    let mut link = Link::new(config).unwrap();
+    let now = Instant::now();
+    let mut session = link.new_session(Callsign::new("N0BBB").unwrap(), 0, now);
+    session.negotiated = Some(LinkCapabilities {
+        robust_floor: true,
+        ..Default::default()
+    });
+    link.session = Some(session);
+    link.established();
+    // Five floor-acknowledged exchanges arm the level-1 OFDM probe.
+    link.floor.received(LinkPhyMode::Floor);
+    for seq in 0..5 {
+        link.floor.prepare_data(seq);
+        link.floor.acknowledged(seq, LinkPhyMode::Floor);
+    }
+    // xorshift bytes: no structure for Huffman or LZ4 to exploit.
+    let mut x: u32 = 0x9E37_79B9;
+    link.backlog = (0..512)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect();
+    let seq = link.arq.as_ref().unwrap().tx.next_seq();
+    link.floor.prepare_data(seq);
+    assert_eq!(
+        link.floor.mode(link.core.speed_level()),
+        LinkPhyMode::Ofdm { level: 1 }
+    );
+    let take = link.fit_chunk_len(seq);
+    assert!(take >= 1);
+    let chunk: Vec<u8> = link.backlog.iter().take(take).copied().collect();
+    let frame = session_data_frame(link.session.as_ref().unwrap(), seq, &chunk);
+    // The same bytes must fit the raw floor waveform and every OFDM level
+    // a retransmission can use, level 1 included.
+    assert!(frame.len() <= 40, "floor frame {} bytes", frame.len());
+    let level1 = coppa_protocol::modem::max_payload_for_level(1).unwrap();
+    assert!(
+        link.core.encoded_payload_len(&frame) <= level1,
+        "compressed frame {} bytes over level-1 budget {level1}",
+        link.core.encoded_payload_len(&frame)
+    );
+    assert!(link.key(
+        QueuedFrame {
+            kind: FrameKind::Data,
+            bytes: frame,
+            mode: None
+        },
+        now
+    ));
+}
+>>>>>>> 76823db0e888d764dd23302cada71e5fe0895666

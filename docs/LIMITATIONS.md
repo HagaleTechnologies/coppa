@@ -328,6 +328,7 @@ update. The re-measure and redesign of this bar is tracked as COP-183, the succe
   when all missing chunks still arrive. Default pacing makes a 1 MiB copy
   take about 22.8 hours. Validation is virtual-audio bench only, with no
   RF, fading or real-time audio claim. See [BROADCAST.md](BROADCAST.md).
+- **Release binaries (COP-47) are verified only in CI and emulation.** The release workflow (`.github/workflows/release.yml`) is the verification of record: its run on a pull request that touches the release machinery, or a `workflow_dispatch` rehearsal, builds all five targets and checks them before anything is published. What it checks: each Linux binary's ELF machine type, a highest needed glibc version of at most 2.31, a `NEEDED` list limited to the C library family and `libasound.so.2`, and no `libudev.so.1` (`tools/release/smoke-linux.sh inspect`); `coppa --version`, `coppa loopback`, `coppad --version` and the `coppad` start-up banner against Debian 11's glibc 2.31 and ALSA 1.2.4, through the 2.31 loader on x86-64 and qemu-user on aarch64 and armv7 (`smoke-linux.sh run`); on Windows, `--version` and loopback, and no `VCRUNTIME*.dll` or `api-ms-win-crt-*.dll` import; on macOS, a two-architecture universal binary with a minimum OS of 11.0, a valid ad-hoc signature, and arm64 runs of `--version`, loopback and the `coppad` banner (the x86-64 half runs only if the runner has Rosetta, otherwise the job prints a notice). What it does not check: no release archive has been run on real Raspberry Pi hardware or with a real sound card or radio; the macOS and Windows binaries are not signed or notarized, so Gatekeeper and SmartScreen may warn; there are no ARMv6 (Raspberry Pi 1, Zero, Zero W), musl or fully static Linux builds, and the Linux binaries need glibc 2.31 or later and `libasound.so.2`; `cargo binstall` needs `--git` and an explicit `@version` until the crates are on crates.io (H-130), and its `universal-apple-darwin` fallback has not been tried on a real Mac. In the COP-47 implement session the three Linux builds were also cross-built locally with the workflow's scripts and passed `smoke-linux.sh inspect` and `run` (x86-64 through the 2.31 loader, aarch64 and armv7 under qemu-user 7.2); the Windows and macOS builds were checked only on GitHub runners. The first published release, and the first run on a Pi, are post-merge steps in `docs/RELEASING.md`. See `docs/DECISIONS/2026-11-09-release-binaries-and-versioning.md`.
 
 ## COP-119 session fade protection
 
@@ -374,6 +375,7 @@ update. The re-measure and redesign of this bar is tracked as COP-183, the succe
   accepts floor handshakes, falls back after two unanswered response windows,
   and probes OFDM after five newly acknowledged floor exchanges. Its
   deterministic audio tests cover delivery and recovery, not connection
+<<<<<<< HEAD
   probability. COP-202: coppad now runs the same shared `FloorController` for
   its handshake (bit 6 in Auto, floor CONNECT_REQ after two unanswered OFDM
   windows, replies in the received waveform), and the −6 dB connect bar is
@@ -391,6 +393,11 @@ update. The re-measure and redesign of this bar is tracked as COP-183, the succe
   about 5.5 s, the last floor request's reply window and the inbound floor
   handshake can outlast the flat 30 s handshake timeout. Link records 0/10 in the
   reversed direction (lexically higher caller). Production development sweeps now
+=======
+  probability. The daemon controller and host mode reporting remain unbuilt
+  (COP-210).
+  The −6 dB connect bar (9 of 10 within 60 s) is unmet. Production development sweeps now
+>>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
   cover batch and streaming reception on AWGN and Poor. COP-191 records
   final-seed 200-trial sweeps and adds `--waveform floor`; the Poor ramp,
   `connect` and `ramp` drivers still need the session controller.
@@ -413,7 +420,11 @@ update. The re-measure and redesign of this bar is tracked as COP-183, the succe
 - The 16-FSK design now exists twice: COP-190 moved it into the production
   crates, while the measurement-only bench copy (`floor_candidate.rs`)
   retains its historical measurements. Link uses the production floor for
+<<<<<<< HEAD
   negotiated sessions; coppad uses it for floor handshakes (COP-202). The design's
+=======
+  negotiated sessions; the daemon controller still uses OFDM (COP-210). The design's
+>>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
   development Poor sweep, measured on the frozen bench copy, fails the conservative sync-share clause:
   header sync dominates near the crossing. Production development sweeps
   also fail sync share, at −12 dB AWGN and −8/−6 dB Poor for both paths.
@@ -510,10 +521,17 @@ stall scenario does (`docs/testing/bpq-session.md`).
   streaming receiver (`FloorFrame`, `FloorStream`) live in
   `coppa-protocol::modem::floor`, guarded by `air_v2_conformance.rs` and
   `floor_receive.rs`. CoppaCore constructs a floor codec and continuous receive path.
+<<<<<<< HEAD
   COP-195 gives Link a floor-aware session controller and COP-202 runs the
   same controller in coppad's sessions; the −6 dB connect bar (9 of 10
   within 60 s) is met for both adapters in the recorded direction. Poor ramp
   acceptance remains unmet. COP-191 adds the
+=======
+  The library Link negotiates capability, connects on the floor and falls back
+  from OFDM (COP-195); the daemon has no floor-aware session controller yet
+  (COP-210). The −6 dB connect bar (9 of 10 within 60 s) remains unmet, as does
+  Poor ramp acceptance. COP-191 adds the
+>>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
   production sweep driver; `connect` and `ramp` remain blocked on the
   COP-190 production session controller.
 - COP-187 repairs the experimental 16-FSK candidate's independent hard header

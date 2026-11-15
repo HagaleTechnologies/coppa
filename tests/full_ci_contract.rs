@@ -396,3 +396,170 @@ fn group_time_budget_is_configured() {
     assert!(runner.contains("compile"));
     assert!(runner.contains("execute"));
 }
+// COP-207: the fan-in waits for a slow-but-passing fast-tier check instead of failing it,
+// and a check that never finishes fails as "still running", not as unsuccessful.
+fn fast_tier(windows_pending_polls: usize, wait_s: &str) -> std::process::Output {
+    fast_tier_with(windows_pending_polls, wait_s, "", "")
+}
+fn fast_tier_with(
+    windows_pending_polls: usize,
+    wait_s: &str,
+    bad: &str,
+    fail: &str,
+) -> std::process::Output {
+    let body = shell("- name: Check all jobs (including the fast tier's own native results)")
+        .replace("${{ needs.create-ci-check.result }}", "success")
+        .replace(
+            "fast_tier_wait_s=7200",
+            &format!("fast_tier_wait_s={wait_s}"),
+        )
+        .replace("sleep 30", "sleep 0.05");
+    let s = Scratch::new();
+    let names = [
+        "Check",
+        "Test with Features (fast, lib-only)",
+        "Format",
+        "Platform Check (ubuntu-latest)",
+        "Platform Check (macos-latest)",
+        "Platform Check (windows-latest)",
+    ];
+    let runs = |windows_done: bool| {
+        names
+            .iter()
+            .map(|n| {
+                let done = windows_done || *n != "Platform Check (windows-latest)";
+                format!(
+                    r#"{{"name":"{n}","started_at":"2026-11-13T19:07:14Z","status":"{}","conclusion":{}}}"#,
+                    if done { "completed" } else { "in_progress" },
+                    if done { "\"success\"" } else { "null" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    fs::write(
+        s.0.join("pending"),
+        format!(r#"{{"check_runs":[{}]}}"#, runs(false)),
+    )
+    .unwrap();
+    fs::write(
+        s.0.join("done"),
+        format!(r#"{{"check_runs":[{}]}}"#, runs(true)),
+    )
+    .unwrap();
+    s.executable(
+        "gh",
+        &format!(
+            r#"#!/usr/bin/env bash
+n=0
+[ ! -f "$MOCK_STATE/polls" ] || n=$(cat "$MOCK_STATE/polls")
+echo $((n+1)) > "$MOCK_STATE/polls"
+case " ${{MOCK_BAD:-}} " in *" $n "*) echo '{{"message":"Server Error"}}'; exit 0;; esac
+case " ${{MOCK_FAIL:-}} " in *" $n "*) echo 'HTTP 502' >&2; exit 1;; esac
+if [ "$n" -lt {windows_pending_polls} ]; then cat "$MOCK_STATE/pending"; else cat "$MOCK_STATE/done"; fi
+"#
+        ),
+    );
+    let mut cmd = Command::new("bash");
+    cmd.args(["-e", "-c", &body])
+        .env(
+            "PATH",
+            format!("{}:{}", s.0.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("MOCK_STATE", &s.0)
+        .env("REPO", "test/repo")
+        .env("HEAD_SHA", "d1ee7d15")
+        .env("GITHUB_OUTPUT", s.0.join("out"))
+        .env("TEST_FULL", "success")
+        .env("MOCK_BAD", bad)
+        .env("MOCK_FAIL", fail);
+    for key in [
+        "BENCH_FUZZ",
+        "CLIPPY",
+        "MSRV",
+        "DENY",
+        "SEMVER",
+        "FFI_ABI",
+        "AUDIT",
+        "WIKI_LINT",
+        "CHECKS_QUEUE_WATCHDOG",
+    ] {
+        cmd.env(key, "success");
+    }
+    cmd.output().unwrap()
+}
+#[test]
+fn fanin_waits_for_a_slow_passing_fast_tier_check() {
+    let out = fast_tier(5, "7200");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+#[test]
+fn fanin_reports_a_hung_fast_tier_check_as_still_running() {
+    let out = fast_tier(1_000_000, "1");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success());
+    assert!(stdout.contains("still running"), "{stdout}");
+    assert!(
+        stdout.contains("Platform Check (windows-latest)"),
+        "{stdout}"
+    );
+}
+#[test]
+fn fast_tier_wait_outlasts_its_jobs_time_limit() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    for job in [
+        "Test with Features (fast, lib-only)",
+        "Platform Check (${{ matrix.os }})",
+    ] {
+        let after = ci.split(&format!("name: {job}\n")).nth(1).unwrap();
+        let limit: u64 = after
+            .lines()
+            .take_while(|l| !l.starts_with("  ") || l.starts_with("    "))
+            .find_map(|l| l.trim().strip_prefix("timeout-minutes: "))
+            .unwrap_or_else(|| panic!("{job} has no timeout-minutes"))
+            .parse()
+            .unwrap();
+        assert!(
+            limit * 60 < 7200,
+            "{job}: {limit}m must end before the fan-in's wait"
+        );
+    }
+    assert!(WORKFLOW.contains("fast_tier_wait_s=7200"));
+}
+#[test]
+fn relay_token_is_minted_after_the_fast_tier_wait() {
+    // An installation token lives 60 min; the fast-tier wait can run 120 (COP-207).
+    let check = WORKFLOW
+        .find("- name: Check all jobs (including the fast tier's own native results)")
+        .unwrap();
+    // rfind: the watchdog job earlier in the file mints its own token under the same name.
+    let mint = WORKFLOW
+        .rfind("- name: Mint a hagale-agent installation token for check-run writes")
+        .unwrap();
+    let retry = WORKFLOW
+        .rfind("- name: Retry minting a hagale-agent installation token if that failed")
+        .unwrap();
+    let relay = WORKFLOW
+        .find("- name: Relay this result onto the reviewed SHA's CI check-run")
+        .unwrap();
+    assert!(check < mint && mint < retry && retry < relay);
+    for step in [&WORKFLOW[mint..retry], &WORKFLOW[retry..relay]] {
+        assert!(step.contains("if: always() && github.event_name == 'workflow_dispatch'"));
+    }
+}
+#[test]
+fn fanin_retries_a_bad_check_run_response() {
+    // Poll 1 returns an error body without check_runs, poll 2 fails outright; both are retried.
+    let out = fast_tier_with(4, "7200", "1", "2");
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("lookup on d1ee7d15 failed; retrying"));
+}

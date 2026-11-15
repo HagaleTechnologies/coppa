@@ -2112,7 +2112,11 @@ complete exchange.
 | 2 | 1 | `fec_rate_num` | 1 | 1 |
 | 3 | 1 | `fec_rate_den` | 2 | 2 |
 | 4 | 1 | `arq_window` | 8 | 8 |
+<<<<<<< HEAD
 | 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bit 5 `windowed_arq` (COP-168), bit 6 `robust_floor`, bit 7 reserved | `0x00` | `0x46`; `0x56` with the WebSocket API on; `0x42` with `fade_protection = "off"`. Bit 6 is clear while a numbered speed level is pinned |
+=======
+| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bit 5 `windowed_arq` (COP-168), bit 6 `robust_floor`, bit 7 reserved | `0x00` | `0x06`; `0x16` with the WebSocket API on |
+>>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
 | 6 | 1 | `mcs_index` | 0 | 0 |
 
 The library default encodes as `00c80102080000` (P24). coppad sets
@@ -2750,7 +2754,10 @@ Informative reference behaviour (COP-172): inbound sessions use the dialled
 MYCALL as their local callsign. A host may set RETRIES n, from 0 to 20, to
 send 1+n ConnectReq frames separated by max twice request airtime plus two
 turnarounds, or five seconds. Repeats stop at 300 s. This changes no wire field.
+<<<<<<< HEAD
 Unset, coppad sends 1+3 while its speed level is automatic.
+=======
+>>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
 
 ### Negotiated low-rate floor session policy
 
@@ -2781,6 +2788,7 @@ RTO floor. With a 500 ms turnaround this is 20 seconds. Keepalives wait 60 secon
 capped at one third of the configured session timeout, to
 leave room for probe timeout and an eight-second recovery frame. Simultaneous
 call retries stagger by the local callsign; the lexically higher station
+<<<<<<< HEAD
 accepts the lower station's request. These deterministic rules do not imply a
 measured connection probability.
 
@@ -2800,3 +2808,7 @@ established on OFDM keeps the OFDM retransmission and fade-hold path when it
 fades, and RS(12,6) block ACKs stay on OFDM. It does not
 stagger discovery by callsign, keeps the 30 s inbound handshake timeout and does
 not replay a lost CONNECT_CFM.
+=======
+accepts the lower station's request. The daemon does not implement this policy
+yet. These deterministic rules do not imply a measured connection probability.
+>>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
