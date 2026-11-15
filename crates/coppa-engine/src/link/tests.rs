@@ -909,8 +909,6 @@ fn floor_capable_high_speed_binary_transfer() {
     assert_eq!(Cable::recv_all(&mut cable.b), payload);
     assert_eq!(cable.a.phy_mode().0, Some(LinkPhyMode::Ofdm { level: 8 }));
 }
-<<<<<<< HEAD
-=======
 
 #[test]
 fn floor_probe_chunk_fits_level_one_after_compression() {
@@ -973,4 +971,3 @@ fn floor_probe_chunk_fits_level_one_after_compression() {
         now
     ));
 }
->>>>>>> 76823db0e888d764dd23302cada71e5fe0895666

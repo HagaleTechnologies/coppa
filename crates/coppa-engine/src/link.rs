@@ -63,13 +63,8 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-<<<<<<< HEAD
 pub use coppa_protocol::floor_controller::LinkPhyMode;
 use coppa_protocol::floor_controller::{self as floor_policy, FloorController};
-=======
-use coppa_protocol::floor_controller::FloorController;
-pub use coppa_protocol::floor_controller::LinkPhyMode;
->>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
 
 use coppa_protocol::arq::{self, ArqConfig, ArqRx, ArqTx};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu};
@@ -579,19 +574,9 @@ impl Link {
             SESSION_ARQ_WINDOW,
             self.config.max_retransmit,
             if self.floor_negotiated() {
-<<<<<<< HEAD
                 self.config
                     .initial_rto
                     .max(floor_policy::floor_rto_floor(self.config.turnaround))
-=======
-                self.config.initial_rto.max(
-                    FloorController::response_window(
-                        LinkPhyMode::Floor,
-                        Duration::ZERO,
-                        self.config.turnaround,
-                    ) + Duration::from_secs(1),
-                )
->>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
             } else {
                 self.config.initial_rto
             },
@@ -650,15 +635,8 @@ impl Link {
         // retry arrives. Do not key a keepalive across that recovery window.
         if self.floor_negotiated() {
             if let Some(s) = self.session.as_mut() {
-<<<<<<< HEAD
                 s.keepalive_interval =
                     floor_policy::floor_keepalive_interval(s.keepalive_interval, s.session_timeout);
-=======
-                s.keepalive_interval = s
-                    .keepalive_interval
-                    .max(Duration::from_secs(60))
-                    .min(s.session_timeout / 3);
->>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
             }
         }
         self.phase = Phase::Connected;
@@ -714,7 +692,6 @@ impl Link {
             if pdu.dest != self.local {
                 continue;
             }
-<<<<<<< HEAD
             if mode == LinkPhyMode::Floor
                 && !floor_policy::admits_floor_pdu(
                     pdu.frame_type,
@@ -724,24 +701,6 @@ impl Link {
                 )
             {
                 continue;
-=======
-            if mode == LinkPhyMode::Floor {
-                let bootstrap = matches!(
-                    pdu.frame_type,
-                    MacFrameType::ConnectReq | MacFrameType::ConnectAck
-                ) && LinkCapabilities::from_bytes(&pdu.payload)
-                    .is_ok_and(|c| c.robust_floor);
-                let confirming = pdu.frame_type == MacFrameType::ConnectCfm
-                    && self.phase == Phase::Accepting
-                    && self.is_from_peer(&pdu)
-                    && self.session.as_ref().is_some_and(|s| {
-                        s.local_caps.robust_floor
-                            && s.remote_caps.as_ref().is_some_and(|c| c.robust_floor)
-                    });
-                if !bootstrap && !confirming && !self.floor_negotiated() {
-                    continue;
-                }
->>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
             }
             let from_peer = self.is_from_peer(&pdu);
             let connected = matches!(self.phase, Phase::Connected | Phase::Draining);
@@ -787,15 +746,7 @@ impl Link {
                 MacFrameType::ConnectReq | MacFrameType::ConnectAck | MacFrameType::ConnectCfm
             ) {
                 if let Ok(caps) = LinkCapabilities::from_bytes(&pdu.payload) {
-<<<<<<< HEAD
                     if self.config.robust_floor && floor_policy::floor_caps_unusable(&caps) {
-=======
-                    if self.config.robust_floor
-                        && caps.robust_floor
-                        && usize::from(caps.max_payload_size)
-                            <= MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE
-                    {
->>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
                         continue;
                     }
                 }
@@ -1029,16 +980,10 @@ impl Link {
                 };
                 // Keep the idle reaper beyond the retry and its turnaround
                 // hold. Retry exhaustion still bounds an unanswered call.
-<<<<<<< HEAD
                 handshake_timeout = handshake_timeout.max(floor_policy::calling_handshake_timeout(
                     retry_interval + stagger,
                     self.config.turnaround,
                 ));
-=======
-                handshake_timeout = handshake_timeout.max(
-                    retry_interval + stagger + self.config.turnaround + Duration::from_secs(1),
-                );
->>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
                 if now.saturating_duration_since(keyed) >= retry_interval + stagger {
                     self.floor.timeout(self.config.robust_floor);
                     if self.req_attempts <= self.config.connect_retries {
@@ -1245,15 +1190,7 @@ impl Link {
                     FrameKind::Data => {
                         self.data_keyed_at = Some(now);
                         if self.floor_negotiated() {
-<<<<<<< HEAD
                             let floor = floor_policy::floor_rto_floor(self.config.turnaround);
-=======
-                            let floor = FloorController::response_window(
-                                LinkPhyMode::Floor,
-                                Duration::ZERO,
-                                self.config.turnaround,
-                            ) + Duration::from_secs(1);
->>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
                             if let Some(arq) = self.arq.as_mut() {
                                 arq.tx.set_segment_floor(floor);
                             }
@@ -1284,14 +1221,8 @@ impl Link {
                 .session
                 .as_ref()
                 .and_then(|s| s.negotiated.as_ref())
-<<<<<<< HEAD
                 .map_or(40, |c| c.max_payload_size);
             floor_policy::floor_segment_limit(negotiated)
-=======
-                .map_or(40, |c| usize::from(c.max_payload_size));
-            40.min(negotiated)
-                .saturating_sub(MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE)
->>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
         } else {
             usize::MAX
         };

@@ -1,5 +1,4 @@
 //! Shared waveform policy for session adapters. Timers belong to the adapter.
-<<<<<<< HEAD
 //!
 //! Both session adapters, the library `Link` (coppa-engine) and coppad's
 //! event loop (coppa-daemon), own a [`FloorController`] and call the free
@@ -12,10 +11,6 @@ use crate::modem::floor::MAX_PAYLOAD as FLOOR_MAX_PAYLOAD;
 use crate::session::{LinkCapabilities, Session, SessionState, HANDSHAKE_TIMEOUT_SECS};
 use crate::transport::TRANSPORT_HEADER_SIZE;
 
-=======
-use std::time::Duration;
-
->>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
 /// Physical mode of a validated or transmitted session frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -51,7 +46,6 @@ impl FloorController {
         }
     }
 
-<<<<<<< HEAD
     /// Whether floor segment constraints still apply, including during an
     /// outstanding OFDM probe. Session adapters must keep that probe small
     /// enough to retransmit on the floor if its response window expires.
@@ -59,8 +53,6 @@ impl FloorController {
         self.floor
     }
 
-=======
->>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
     /// Select the waveform for the next transmission.
     pub fn mode(&self, level: u8) -> LinkPhyMode {
         if self.floor && self.probe.is_none() {
@@ -115,7 +107,6 @@ impl FloorController {
     }
 }
 
-<<<<<<< HEAD
 /// Whether a decoded floor PDU may reach the session handlers. Used by both
 /// the library `Link` and coppad's event loop.
 ///
@@ -326,11 +317,6 @@ mod tests {
         assert!(!c.floor_active());
     }
 
-=======
-#[cfg(test)]
-mod tests {
-    use super::*;
->>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
     #[test]
     fn floor_two_window_fallback() {
         let mut c = FloorController::default();

@@ -24,13 +24,9 @@ links:
 COP-187's batch header repair reduces experimental candidate errors on paired
 development seeds. COP-190 then moved the measured 16-FSK design into the
 production crates as air-protocol version 2. The library Link now uses it
-<<<<<<< HEAD
 for negotiated sessions, and coppad uses it for floor handshakes and floor
 session data through the same shared `FloorController` (COP-202); both meet
 the -6 dB connect bar in the recorded direction. The
-=======
-for negotiated sessions; the daemon controller remains open. The
->>>>>>> 76823db0e888d764dd23302cada71e5fe0895666
 remaining Poor failures on the frozen bench copy still violate the separate
 acquisition bar, despite a favorable FER crossing. See
 [measurements](../../BENCHMARKS.md#cop-187-experimental-header-repair)
