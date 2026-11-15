@@ -2,6 +2,7 @@
 
 pub mod adaptive_goodput;
 pub mod afsk_direwolf;
+pub mod compare;
 pub mod cp_arm;
 pub mod floor_candidate;
 pub mod floor_sweep;

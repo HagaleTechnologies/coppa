@@ -16,6 +16,11 @@ Older releases have no entry here. Their on-air breaks are listed in
 
 ## Unreleased: 0.16.0
 
+- Add `coppa-bench compare` (COP-170): runs coppa's library `Link` through
+  the WGN, MPG and MPP channels at the 2020 Winlink comparison's SNR grid for
+  2 KB and 16 KB transfers, records each trial in a resumable, seed-reproducible
+  CSV, and prints mean net bytes/min with a 95% interval per cell. Coppa rows
+  only; the published page and the black-box harness for other modems follow.
 - Add negotiated low-rate floor sessions to the Rust library Link. Discovery
   starts on OFDM, falls back after two unanswered windows, and probes OFDM
   after five distinct acknowledged floor exchanges. Set
