@@ -1234,21 +1234,29 @@ impl Link {
     /// algorithm in `coppa_daemon::tx_chunker::next_chunk_len`; unify after
     /// COP-110 (PR #204) lands.
     fn fit_chunk_len(&self, seq: u8) -> usize {
-        if self.floor_negotiated() {
+        let header = MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE;
+        let level_budget =
+            |level: u8| coppa_protocol::modem::max_payload_for_level(level).unwrap_or(0);
+        let level = self.core.speed_level();
+        let (budget, raw_cap) = if self.floor_negotiated() {
             let negotiated = self
                 .session
                 .as_ref()
                 .and_then(|s| s.negotiated.as_ref())
                 .map_or(40, |c| usize::from(c.max_payload_size));
-            return self.backlog.len().min(
-                40.min(negotiated)
-                    .saturating_sub(MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE),
-            );
-        }
-        let budget =
-            coppa_protocol::modem::max_payload_for_level(self.core.speed_level()).unwrap_or(0);
-        let header = MacPdu::HEADER_SIZE + TRANSPORT_HEADER_SIZE;
+            // A floor-session chunk may be keyed (or retransmitted) on the raw
+            // 40-byte floor waveform, on the level-1 OFDM recovery probe, or at
+            // the current level. It must fit all three, and the OFDM budgets
+            // apply after compression, which can expand incompressible bytes.
+            (
+                level_budget(1).min(level_budget(level)),
+                Some(40.min(negotiated).saturating_sub(header)),
+            )
+        } else {
+            (level_budget(level), None)
+        };
         let optimistic = budget.saturating_sub(header + 1).max(1);
+        let optimistic = raw_cap.map_or(optimistic, |cap| optimistic.min(cap).max(1));
         // Only the first `optimistic` bytes can go in one chunk; copying the
         // whole backlog here would make a large send() quadratic.
         let rest: Vec<u8> = self.backlog.iter().take(optimistic).copied().collect();
