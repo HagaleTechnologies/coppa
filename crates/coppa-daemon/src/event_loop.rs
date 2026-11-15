@@ -3729,11 +3729,11 @@ impl EventLoop {
     }
 
     /// COP-202 Decision 8: airtime of the level-1 station-ID frame a peer
-    /// may prepend to its reply, while automatic ID is on.
+    /// may prepend to its reply, sized from our own ID frame. The peer's ID
+    /// timer decides whether it prepends one, so this does not depend on our
+    /// `id_interval_secs`; an ID we prepend is counted separately by the
+    /// callers. Zero only when no local callsign is configured.
     fn station_id_allowance(&self) -> Duration {
-        if self.config.station_id.id_interval_secs == 0 {
-            return Duration::ZERO;
-        }
         self.encode_id_beacon_frame().map_or(Duration::ZERO, |id| {
             Duration::from_secs_f64(id.len() as f64 / self.engine.config().sample_rate as f64)
         })
@@ -27494,6 +27494,23 @@ mod tests {
             })
             .await;
             (keys, reaped)
+        }
+
+        /// COP-202 Decision 8: the station-ID allowance reserves the ID the
+        /// peer may prepend, which the peer's own timer decides, so a station
+        /// with automatic ID off (`id_interval_secs = 0`) still reserves it
+        /// in its floor request windows and floor RTO floors.
+        #[tokio::test]
+        async fn station_id_allowance_ignores_local_id_setting() {
+            let allowance = |id_interval_secs| {
+                let mut config = DaemonConfig::default();
+                config.engine.callsign = "VK3ABC".to_string();
+                config.station_id.id_interval_secs = id_interval_secs;
+                EventLoop::new(config).unwrap().station_id_allowance()
+            };
+            let with_local_id = allowance(540);
+            assert!(with_local_id > Duration::ZERO);
+            assert_eq!(allowance(0), with_local_id);
         }
 
         /// COP-202 AC4/AC5: an Auto dial whose host never sent RETRIES keys
