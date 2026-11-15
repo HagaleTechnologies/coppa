@@ -542,3 +542,4 @@ stall scenario does (`docs/testing/bpq-session.md`).
   production session result is claimed.
 
 - **Full-CI hosted verdict budget (COP-200).** Local optimized groups pass below 25 minutes, but three same-revision hosted workflow verdicts below 30 minutes remain unverified. Other required jobs, runner queue time and cold caches can affect the complete result. See [full-CI measurements](testing/full-ci.md).
+- **Fast-tier duration (COP-203).** ci.yml's platform and feature jobs take 40-63.5 minutes, mostly `cargo test --workspace --lib`. The required `CI` verdict waits for them, so it cannot arrive under 30 minutes. The fan-in waits up to 75 minutes. Cutting that wall time is not done. See [the fast-tier wait](testing/full-ci.md#fast-tier-wait).

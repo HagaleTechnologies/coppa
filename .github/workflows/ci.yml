@@ -148,7 +148,8 @@ jobs:
 
   test-features:
     name: Test with Features (fast, lib-only)
-    # COP-207: observed max 63m; ci-full's fan-in waits 120m for the fast tier.
+    # COP-207: observed max 63m; this cap frees a hung runner. ci-full's fan-in waits 75m
+    # from its own start (COP-203) and fails a check still running then, by name.
     timeout-minutes: 90
     runs-on: ubuntu-latest
     steps:
@@ -175,7 +176,8 @@ jobs:
 
   platform:
     name: Platform Check (${{ matrix.os }})
-    # COP-207: observed max 63m; ci-full's fan-in waits 120m for the fast tier.
+    # COP-207: observed max 63m; this cap frees a hung runner. ci-full's fan-in waits 75m
+    # from its own start (COP-203) and fails a check still running then, by name.
     timeout-minutes: 90
     strategy:
       matrix:

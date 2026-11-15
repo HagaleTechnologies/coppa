@@ -19,8 +19,8 @@ All commands use `--locked --profile ci`. The runner records compile,
 execution and doctest wall times, including nonzero exits. An error stops
 the group with Cargo's exit code. The matrix disables fail-fast, and the
 required `CI` fan-in requires the matrix aggregate to succeed. Its queue
-watchdog names every matrix job. Dispatch checkout attribution and the
-fast-tier polling logic are unchanged.
+watchdog names every matrix job. Dispatch checkout attribution is
+unchanged.
 
 ## Coverage boundaries
 
@@ -53,7 +53,9 @@ local execution record below.
 metadata and rejects an intentionally incomplete selection. It also
 executes the profile's debug checks, injects errors into every command
 position, executes the actual fan-in shell, and exercises the actual
-watchdog against queued, running and completed job fixtures.
+watchdog against queued, running and completed job fixtures. It also runs
+the fan-in's fast-tier poll against slow, never-completing, absent and
+failed fixtures.
 
 ## Measurement environment
 
@@ -71,6 +73,41 @@ The dropped-file-chunk test uses `start_paused = true`. Its 29.5/30-second
 Tokio sleeps advance virtual time. The unpaused event-loop RTO helper
 instead sleeps on the real thread. Optimizing DSP computation does not
 remove those real waits.
+
+## Fast-tier wait
+
+The `ci` fan-in also waits for ci.yml's six fast-tier checks on the same
+SHA. ci.yml's platform checks run for 40 to 63.5 minutes, so COP-203 sets
+the wait to 75 minutes (`fast_tier_wait_minutes` in
+`.github/workflows/ci-full.yml`). That covers the slowest run seen even
+when the fan-in starts at the same moment as ci.yml. Those durations
+exclude runner queue time; in practice the fan-in starts about 15 minutes
+after ci.yml, which absorbs a normal queue.
+
+The wait sits under two limits:
+
+- The `ci` job's `timeout-minutes` is 90, 15 minutes above the wait, so
+  the wait's own error fires before the job is cancelled. The Check step
+  itself is capped at 80 minutes, so a hung API call fails that step and
+  the relay steps after it still conclude `CI`.
+- The merge queue's `check_response_timeout_minutes` is 120. It is set in
+  the "Coppa - Native Merge Queue" ruleset (id 23405672), outside this
+  repository. The fan-in starts after the other full-CI jobs, usually
+  `test-full` with its 25-minute cap, so the verdict lands by about 100
+  minutes, 20 minutes under the queue's limit. Recheck this budget if the
+  ruleset changes.
+
+A check still running at the deadline fails as "still running". A check
+that never appeared fails as "Missing". Each annotation names the checks
+on one line. A check that completes with any conclusion other than
+`success` fails the step once all six checks have completed. The poll
+does not stop early for it: if another check is still running or missing
+at the deadline, the annotation names that check instead.
+
+The relay step's GitHub App token is minted after the wait, because an
+installation token expires after an hour. ci.yml's `test-features` and
+`platform` jobs keep their own 90-minute cap (COP-207), which frees a hung
+runner.
 
 ## Hosted confirmation
 
