@@ -8,7 +8,7 @@ platform=linux-x86_64
 rustc=1.98.0
 jobs=6
 rows=link-l2
-recorded_cells=2048 B on wgn, mpg, mpp at 30,25,20,15,10,5,0 dB
+recorded_cells=2048 B on wgn, mpg, mpp at 30,25,20,15,10,5,0 dB; 16384 B on wgn at 30,25,20,15,10,5,0 dB
 ```
 
 ## Commands
@@ -21,14 +21,24 @@ order from the repository root. Each run resumes from what is recorded.
 2. `target/release/coppa-bench compare --channel wgn --size 2048 --jobs 6 --no-render` (61 s wall)
 3. `target/release/coppa-bench compare --channel mpg --size 2048 --jobs 6 --no-render` (260 s wall)
 4. `target/release/coppa-bench compare --channel mpp --size 2048 --jobs 6 --no-render` (457 s wall, 48 trials)
-5. `target/release/coppa-bench compare --size 2048` renders `docs/benchmarks/comparison.md` (no trial runs)
+5. `target/release/coppa-bench compare --channel wgn --size 16384 --jobs 32 --no-render --out-dir <scratch>`
+   (COP-170 remediation, 21 minutes wall on the same 6-CPU quota, shared with the stopped MPP run and a debug build for most of it). The scratch
+   `link-l2.csv` held only these 56 rows. They were appended to
+   `results/compare/link-l2.csv`, and
+   `target/release/coppa-bench compare --channel wgn --size 16384 --no-render`
+   then ran no trial and rewrote the file sorted. Rows do not depend on
+   `--jobs` (`compare_link.rs` `jobs_do_not_change_the_csv`). An MPP 16 KB run
+   in a different out-dir was stopped unfinished and none of its rows were
+   kept.
+6. `target/release/coppa-bench compare --channel wgn --size 16384` renders
+   `docs/benchmarks/comparison.md` (no trial runs)
 
-Total wall time for the 168 trials: about 15 minutes on a 6-CPU cgroup quota.
+Total wall time for the 168 2 KB trials: about 15 minutes on a 6-CPU cgroup quota.
 `cargo test --release -p coppa-bench --test compare_results committed_trials_reproduce -- --ignored`
 re-ran WGN 0 dB, WGN 30 dB and MPG 20 dB trial 0 and matched the committed
 rows byte for byte.
 
-The 16 KB cells are not recorded. Record them with
+The MPG and MPP 16 KB cells are not recorded. Record them with
 `cargo run --release -p coppa-bench -- compare --size 16384 --no-render`, then
 render with `cargo run --release -p coppa-bench -- compare`.
 

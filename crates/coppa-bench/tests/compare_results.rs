@@ -51,6 +51,11 @@ fn rendering_the_committed_data_is_a_no_op() {
     assert_eq!(page, expected);
 }
 
+/// Channels whose seven 16 KB cells are recorded. The rest of the 16 KB
+/// column is open; when it is recorded, this lists all three channels and the
+/// audit covers all 42 cells.
+const RECORDED_16K: &[Channel] = &[Channel::Wgn];
+
 #[test]
 fn published_trials_follow_the_grid() {
     let text = read(&published_csv());
@@ -74,8 +79,9 @@ fn published_trials_follow_the_grid() {
         assert!(t.exact, "inexact delivery: {}", t.to_line());
         assert!(t.trial < 8, "{}", t.to_line());
     }
-    // A recorded cell holds exactly trials 0-7. Every WGN and MPG 2 KB cell
-    // is recorded; the remaining cells are open (see the page's Status).
+    // A recorded cell holds exactly trials 0-7. Every 2 KB cell and every
+    // 16 KB cell on RECORDED_16K is recorded; the other 16 KB cells are open
+    // (see the page's Status) and hold no trial.
     for cell in &grid {
         let mut idx: Vec<usize> = trials
             .iter()
@@ -87,16 +93,37 @@ fn published_trials_follow_the_grid() {
             .map(|t| t.trial)
             .collect();
         idx.sort_unstable();
-        let required = cell.size_bytes == 2048 && cell.channel != Channel::Mpp;
-        if required || !idx.is_empty() {
+        let required = cell.size_bytes == 2048 || RECORDED_16K.contains(&cell.channel);
+        if required {
             assert_eq!(idx, (0..8).collect::<Vec<_>>(), "{cell:?}");
+        } else {
+            assert!(idx.is_empty(), "open cell holds trials: {cell:?}");
         }
     }
+    let recorded_cells = SNRS_DB.len() * (Channel::ALL.len() + RECORDED_16K.len());
+    assert_eq!(trials.len(), recorded_cells * 8);
     // The file is sorted, so its bytes do not depend on --jobs.
     let mut sorted = trials.clone();
     coppa_bench::compare::runner::sort_rows(&mut sorted);
     assert_eq!(sorted, trials);
     assert!(trials.iter().any(|t| t.outcome == Outcome::Complete));
+}
+
+/// AC6: `compare --check` exits 0 on the committed tree.
+#[test]
+fn check_passes_on_the_committed_tree() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_coppa-bench"))
+        .args(["compare", "--check"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "compare --check failed ({:?}): {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("matches"), "{stderr}");
 }
 
 #[test]

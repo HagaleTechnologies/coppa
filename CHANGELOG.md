@@ -21,9 +21,9 @@ Older releases have no entry here. Their on-air breaks are listed in
   2 KB and 16 KB transfers, records each trial in a resumable, seed-reproducible
   CSV, and renders `docs/benchmarks/comparison.md`: mean net bytes/min with a
   95% interval, completed/n and a replay command per cell. `compare --check`
-  reports a stale page. Coppa rows only; the 2 KB cells are recorded, and the
-  16 KB cells, the black-box harness for other modems and the channel
-  cross-check follow.
+  reports a stale page. Coppa rows only; the 2 KB cells and the WGN 16 KB cells are
+  recorded, and the MPG and MPP 16 KB cells, the black-box harness for other
+  modems and the channel cross-check follow.
 - Add negotiated low-rate floor sessions to the Rust library Link. Discovery
   starts on OFDM, falls back after two unanswered windows, and probes OFDM
   after five distinct acknowledged floor exchanges. Set
