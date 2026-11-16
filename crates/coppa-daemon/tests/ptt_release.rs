@@ -10,8 +10,11 @@
 //! VARA command port, which uses the same `transmit_samples` path as real
 //! traffic, then stops the daemon while the 20 s tone is still playing.
 //!
-//! Each test owns its fake rigctld, its VARA ports (picked by the OS, never
-//! fixed) and its temporary directory, so the tests run in parallel.
+//! Each test owns its fake rigctld, its VARA ports and its temporary
+//! directory, so the tests run in parallel. coppad binds both VARA ports on
+//! port 0 and the test reads the ports it got from its log, so no other
+//! process can take one between the test choosing it and coppad binding it
+//! (COP-208).
 //!
 //! Unix only: the tests send real signals and use process groups. They are
 //! also skipped with `cpal-backend`: that build opens the host's default
@@ -34,7 +37,7 @@ use std::time::{Duration, Instant};
 
 mod support;
 use support::{
-    free_ports, process_alive, send_signal, stays_false, strip_ansi, wait_until, Event,
+    process_alive, send_signal, stays_false, strip_ansi, vara_ports_from, wait_until, Event,
     FakeRigctld, TempDir,
 };
 
@@ -53,6 +56,26 @@ const GUARDIAN_STARTED: &str = "PTT guardian started pid=";
 // ---------------------------------------------------------------------------
 // The daemon under test
 // ---------------------------------------------------------------------------
+
+/// The config coppad starts from: `radio` as the body of its `[radio]`
+/// table after `ptt_pre_delay_ms`, and the VARA server on port 0 for both
+/// ports, so coppad picks and binds each one itself (COP-208).
+fn coppad_config(radio: &str, ptt_pre_delay_ms: u64) -> String {
+    format!(
+        "[radio]\n\
+         ptt_pre_delay_ms = {ptt_pre_delay_ms}\n\
+         {radio}\
+         \n\
+         [host]\n\
+         vara_enabled = true\n\
+         vara_command_port = 0\n\
+         vara_data_port = 0\n\
+         \n\
+         [engine]\n\
+         # COP-37: no transmission without a valid callsign.\n\
+         callsign = \"N0CALL\"\n"
+    )
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Group {
@@ -107,21 +130,7 @@ impl Coppad {
     /// `ptt_pre_delay_ms`.
     fn start_with_radio_and_pre_delay(radio: &str, group: Group, ptt_pre_delay_ms: u64) -> Self {
         let dir = TempDir::new("daemon");
-        let (command_port, data_port) = free_ports();
-        let config = format!(
-            "[radio]\n\
-             ptt_pre_delay_ms = {ptt_pre_delay_ms}\n\
-             {radio}\
-             \n\
-             [host]\n\
-             vara_enabled = true\n\
-             vara_command_port = {command_port}\n\
-             vara_data_port = {data_port}\n\
-             \n\
-             [engine]\n\
-             # COP-37: no transmission without a valid callsign.\n\
-             callsign = \"N0CALL\"\n"
-        );
+        let config = coppad_config(radio, ptt_pre_delay_ms);
         let config_path = dir.path().join("coppad.toml");
         std::fs::write(&config_path, config).expect("write coppad.toml");
         let stdout = File::create(dir.path().join("stdout")).expect("create stdout capture");
@@ -146,11 +155,13 @@ impl Coppad {
         let mut daemon = Self {
             child,
             dir,
-            command_port,
+            // Read from coppad's log once it is ready.
+            command_port: 0,
             vara: None,
             reaped: false,
         };
         daemon.wait_for_log("Daemon ready", READY_DEADLINE);
+        daemon.command_port = vara_ports_from(&daemon.output()).0;
         daemon
     }
 
@@ -280,6 +291,15 @@ impl Drop for Coppad {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// COP-208: the config names no VARA port, so no other process can take one
+/// between the test choosing it and coppad binding it.
+#[test]
+fn coppad_config_leaves_both_vara_ports_to_coppad() {
+    let config = coppad_config("ptt_method = \"none\"\n", 0);
+    assert!(config.contains("\nvara_command_port = 0\n"), "{config}");
+    assert!(config.contains("\nvara_data_port = 0\n"), "{config}");
+}
 
 #[test]
 fn sigterm_mid_transmission_releases_ptt_before_exit() {

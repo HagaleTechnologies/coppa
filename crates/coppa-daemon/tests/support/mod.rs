@@ -1,7 +1,8 @@
 //! COP-85: helpers shared by the daemon integration tests that run the real
 //! `coppad` binary (`ptt_release.rs`, `reload.rs`, `runtime_smoke.rs`): a
-//! recording fake rigctld, temporary directories, free ports and a daemon
-//! runner. Each test crate uses a subset, hence the `dead_code` allowance.
+//! recording fake rigctld, temporary directories, a parser for the VARA
+//! ports coppad bound and a daemon runner. Each test crate uses a subset,
+//! hence the `dead_code` allowance.
 //! Only `process_alive` and `send_signal` are Unix-only.
 #![allow(dead_code)]
 
@@ -68,17 +69,33 @@ impl Drop for TempDir {
     }
 }
 
-/// Two distinct free TCP ports on loopback, picked by the OS. Both are
-/// released before this returns, so another process can bind one before
-/// coppad does (COP-163). For VARA ports coppad must bind, configure 0 and
-/// read the ports back with [`Daemon::vara_ports`].
-pub fn free_ports() -> (u16, u16) {
-    let a = TcpListener::bind("127.0.0.1:0").expect("bind free port");
-    let b = TcpListener::bind("127.0.0.1:0").expect("bind free port");
-    (
-        a.local_addr().unwrap().port(),
-        b.local_addr().unwrap().port(),
-    )
+/// The VARA `(command, data)` ports coppad actually bound, read from the
+/// `VARA TCP server listening` line in its captured `output`. Start coppad
+/// with both VARA ports set to 0 and connect to these. A port picked free
+/// and released before coppad starts can be taken by another process first:
+/// coppad then exits 1 with `Address already in use` (COP-163 on macOS CI,
+/// COP-208 on Linux). Panics with `output` if the line or either address is
+/// missing, malformed, not loopback or port 0.
+pub fn vara_ports_from(output: &str) -> (u16, u16) {
+    const LISTENING: &str = "VARA TCP server listening";
+    let Some(line) = output.lines().find(|line| line.contains(LISTENING)) else {
+        panic!("coppad did not log {LISTENING:?}\n{output}");
+    };
+    let addr = |key: &str| -> u16 {
+        let value = line
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} field in {line:?}\n{output}"));
+        let addr: SocketAddr = value
+            .parse()
+            .unwrap_or_else(|e| panic!("{key}{value} is not an address ({e})\n{output}"));
+        assert!(
+            addr.ip().is_loopback() && addr.port() != 0,
+            "{key}{addr} is not a bound loopback port\n{output}"
+        );
+        addr.port()
+    };
+    (addr("command_addr="), addr("data_addr="))
 }
 
 /// Remove ANSI escape sequences (tracing's colour codes) from `text`.
@@ -227,34 +244,11 @@ impl Daemon {
         self.wait_for_count(needle, 1, timeout);
     }
 
-    /// COP-163: the VARA `(command, data)` ports coppad actually bound, read
-    /// from its `VARA TCP server listening` line. Start the daemon with both
-    /// VARA ports set to 0 and connect to these: a port picked with
-    /// [`free_ports`] is released before coppad binds it, and another process
-    /// can take it in between (seen as `Address already in use` on macOS CI).
-    /// Panics with the captured output if the line or either address is
-    /// missing, malformed, not loopback or port 0.
+    /// COP-163: the VARA `(command, data)` ports coppad actually bound, from
+    /// its `VARA TCP server listening` line (see [`vara_ports_from`]). Start
+    /// the daemon with both VARA ports set to 0 and connect to these.
     pub fn vara_ports(&self) -> (u16, u16) {
-        const LISTENING: &str = "VARA TCP server listening";
-        let output = self.output();
-        let Some(line) = output.lines().find(|line| line.contains(LISTENING)) else {
-            panic!("coppad did not log {LISTENING:?}\n{output}");
-        };
-        let addr = |key: &str| -> u16 {
-            let value = line
-                .split_whitespace()
-                .find_map(|field| field.strip_prefix(key))
-                .unwrap_or_else(|| panic!("no {key} field in {line:?}\n{output}"));
-            let addr: SocketAddr = value
-                .parse()
-                .unwrap_or_else(|e| panic!("{key}{value} is not an address ({e})\n{output}"));
-            assert!(
-                addr.ip().is_loopback() && addr.port() != 0,
-                "{key}{addr} is not a bound loopback port\n{output}"
-            );
-            addr.port()
-        };
-        (addr("command_addr="), addr("data_addr="))
+        vara_ports_from(&self.output())
     }
 
     pub fn try_exit(&mut self) -> Option<ExitStatus> {
