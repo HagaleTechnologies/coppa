@@ -14,6 +14,28 @@ numbers separately, because they move independently:
 Older releases have no entry here. Their on-air breaks are listed in
 `docs/SPEC.md` §0.1.
 
+## Unreleased: 0.17.0
+
+- coppad reports the session waveform to WebSocket hosts and the dashboard
+  (COP-210). `status` gains an optional `phy_mode` object, `{"tx": .., "rx": ..}`,
+  each `null`, `"floor"` or `"ofdm:<level>"`. `tx` is the waveform of the last
+  session frame keyed. `rx` is the waveform of the last session frame a session
+  handler accepted, so frames for other stations, stale ACKs and replayed
+  handshakes do not move it. Both clear to `null` when the session ends. A new
+  reliable `phy_mode` push follows each change. The dashboard's Speed level card
+  shows `TX floor · auto` and `RX floor (last decoded frame)` during a floor
+  session. Clients that ignore the field keep working.
+- **Rust API, breaking for struct literals and exhaustive matches:** new
+  `coppa_host::websocket::PhyMode` (non-exhaustive) and `PhyModeReport`, a new
+  `WsStatus.phy_mode` field, a new `phy_mode` field on `WsServerMessage::Status`
+  and a new `WsServerMessage::PhyMode` variant.
+- **Crate version:** 0.17.0. Minor bump over 0.16.0 for the `coppa-host` struct
+  and enum changes above.
+- **Air-protocol version:** unchanged.
+- **Host-API version:** 1, unchanged. The `phy_mode` status field and push are
+  additive.
+- **C ABI version:** unchanged.
+
 ## Unreleased: 0.16.0
 
 - coppad's rate loop and `RateLoop::default_coppa()` now step up after one higher

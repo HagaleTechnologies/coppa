@@ -83,5 +83,14 @@ receiver in `coppa-protocol` (`modem/floor.rs`). The frozen parameters:
   multi-codeword size, and a session established on OFDM keeps the OFDM fade
   hold rather than moving to the floor mid-session; see
   `docs/LIMITATIONS.md`.
+- COP-210 amendment: coppad reports the active waveform to hosts. The
+  WebSocket `status` reply gains an optional `phy_mode` object (`tx`, `rx`,
+  each `null`, `"floor"` or `"ofdm:<level>"`), a reliable `phy_mode` push
+  follows each change, and the dashboard's Speed level card shows `floor`.
+  RX counts only frames a session handler accepted, as `Link::phy_mode()`
+  does, and both values clear when the session ends. Host API stays version
+  1; the `coppa-host` type additions take the workspace to 0.17.0. The
+  simultaneous-call tie break and discovery stagger remain open for the
+  daemon (`docs/LIMITATIONS.md`).
 - Version 2 spends one of the fourteen remaining version values; the next
   incompatible format allocates 3.

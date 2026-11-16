@@ -74,8 +74,8 @@ Then send a few commands. The `sleep`s give coppad time to answer each one:
 $ { echo VERSION; sleep 1; echo "MYCALL N1CALL"; sleep 1; echo "LISTEN ON"; sleep 1;
     echo FOOBAR; sleep 1; echo "CONNECT N1CALL N0CALL"; sleep 75; } \
     | nc -q 1 127.0.0.1 8300 | tr '\r' '\n'
-VERSION Coppa 0.16.0
-VERSION Coppa 0.16.0
+VERSION Coppa 0.17.0
+VERSION Coppa 0.17.0
 OK
 OK
 WRONG
@@ -121,7 +121,7 @@ either data port. The [two-station example](#a-two-station-session) shows what b
 
 **Framing.** Send one command per line, ended by `\r`, `\n` or `\r\n`. Empty lines are ignored.
 coppad ends every line it sends with a bare `\r`, as VARA does. On connect coppad speaks first,
-with `VERSION Coppa 0.16.0`. A line longer than 4096 bytes, or one that is not valid UTF-8,
+with `VERSION Coppa 0.17.0`. A line longer than 4096 bytes, or one that is not valid UTF-8,
 closes the connection.
 
 **Replies and pushed lines.** Each command gets exactly one reply, sent only to the client that
@@ -135,8 +135,8 @@ on a fixed delay.
 
 | You send | coppad replies | Effect |
 |---|---|---|
-| `VERSION` | `VERSION Coppa 0.16.0` | none |
-| `VERSIONINFO` (coppa extension) | `VERSIONINFO crate_version=0.16.0 air_protocol_version=1 host_api_version=1`; `WRONG` with any argument | none; see [Version discovery](#version-discovery) |
+| `VERSION` | `VERSION Coppa 0.17.0` | none |
+| `VERSIONINFO` (coppa extension) | `VERSIONINFO crate_version=0.17.0 air_protocol_version=1 host_api_version=1`; `WRONG` with any argument | none; see [Version discovery](#version-discovery) |
 | `MYCALL <call> [<call> ...]` | `OK` for one to five valid callsigns, otherwise `WRONG` | replaces the daemon-wide list; first identifies transmissions, all answer inbound calls; CONNECTED names the dialled call |
 | `RETRIES <n>` or `RETRIES=<n>` | `OK` for 0-20, otherwise `WRONG` | per-client count of additional connect requests on later dials; resets on client disconnect. Unset, a dial makes 3 additional requests while the speed level is automatic, so it can fall back to the low-rate floor; with a pinned speed level it makes none |
 | `BUSY` | `BUSY ON` or `BUSY OFF` | reliable reply with the current channel state |
@@ -181,11 +181,11 @@ On the command port the greeting and `VERSION` keep their old shape; `VERSIONINF
 query with no arguments. Each line below ends with a bare `\r`:
 
 ```text
-server greeting: VERSION Coppa 0.16.0\r
+server greeting: VERSION Coppa 0.17.0\r
 client: VERSION\r
-server: VERSION Coppa 0.16.0\r
+server: VERSION Coppa 0.17.0\r
 client: VERSIONINFO\r
-server: VERSIONINFO crate_version=0.16.0 air_protocol_version=1 host_api_version=1\r
+server: VERSIONINFO crate_version=0.17.0 air_protocol_version=1 host_api_version=1\r
 client: VERSIONINFO extra\r
 server: WRONG\r
 ```
@@ -361,7 +361,7 @@ silently.
 | `{"type":"connect","source":"N1CALL","destination":"N0CALL","id":2}` | `ack` | `source` is ignored; the outcome arrives as a `session` message, except when the dial is refused because another session already holds the link: that refusal sends a WebSocket client nothing, so check `status` |
 | `{"type":"disconnect","id":3}` | `ack` | then `session` with `"state":"disconnected"` if a session existed; with none, only the `ack` |
 | `{"type":"send","data":"hello","id":4}` | `ack` | `encoding` is `utf8` (the default) or `base64`; bad base64 gets `error`; with no session the bytes are dropped after the ack |
-| `{"type":"status","id":5}` | `{"type":"status","id":5,"connected":false,"cp_desync_episodes":0}` | `remote_call` appears while a session exists; `snr`, `level` and `cfo` describe the last decoded frame and stay after a session ends; `short_cp_ok` appears when `[engine] cp_gate_enabled` is on |
+| `{"type":"status","id":5}` | `{"type":"status","id":5,"connected":false,"cp_desync_episodes":0}` | `remote_call` appears while a session exists; `snr`, `level` and `cfo` describe the last decoded frame and stay after a session ends; `short_cp_ok` appears when `[engine] cp_gate_enabled` is on; from 0.17.0, `phy_mode` is `{"tx":..,"rx":..}`, each `null`, `"floor"` or `"ofdm:<level>"`: the waveform of the last session frame keyed and of the last session frame a session handler accepted, both `null` with no session |
 | `{"type":"spectrum","enabled":true,"id":6}` | `ack` | opt in to (or, with `false`, out of) `spectrum` messages |
 | `{"type":"audio_level","enabled":true,"id":7}` | `ack` | the same for `audio_level` |
 | `{"type":"log","enabled":true,"id":8}` | `ack` | the same for `log` |
@@ -384,6 +384,7 @@ also silent on WebSocket, as noted in the `connect` row.
 | `session` | `"state":"connected"` with `remote_call`, or `"state":"disconnected"` | reliable |
 | `data` | received session data, with `encoding` `utf8` or `base64`, every byte kept | reliable |
 | `ptt`, `busy`, `snr`, `level` | PTT edges, channel occupancy, SNR in dB, speed level | reliable |
+| `phy_mode` | from 0.17.0, `tx` or `rx` of `status.phy_mode` changed (within one 500 ms tick, and at once when the session ends), e.g. `{"type":"phy_mode","tx":"floor","rx":null}` | reliable |
 | `heard` | a full snapshot of up to 32 recent stations: session peers plus stations whose station-ID beacons were received (with the beacon's grid, when it carried one) | reliable |
 | `chat` | a message this station queued (`"direction":"out"`) or received (`"direction":"in"`) | reliable |
 | `chat_receipt` | an outgoing message's `"state"` became `delivered` or `failed` (`reason` with `failed`) | reliable |

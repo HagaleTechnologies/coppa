@@ -12,9 +12,11 @@ sources:
   - crates/coppa-protocol/src/modem/floor.rs
   - crates/coppa-daemon/src/event_loop.rs
   - crates/coppa-protocol/src/floor_controller.rs
+  - crates/coppa-host/src/websocket.rs
+  - crates/coppa-daemon/src/web/index.html
 verified:
-  commit: 032a8752b64a475a863738c734b6be66d6576330
-  date: 2026-11-14
+  commit: 31ae9e3a111f88006813bf31d5a9f4a28695b8f4
+  date: 2026-11-16
 links:
   - coppa-protocol
   - band-conventions
@@ -26,7 +28,8 @@ development seeds. COP-190 then moved the measured 16-FSK design into the
 production crates as air-protocol version 2. The library Link now uses it
 for negotiated sessions, and coppad uses it for floor handshakes and floor
 session data through the same shared `FloorController` (COP-202); both meet
-the -6 dB connect bar in the recorded direction. The
+the -6 dB connect bar in the recorded direction. coppad reports the active
+waveform to WebSocket hosts and the dashboard as `phy_mode` (COP-210). The
 remaining Poor failures on the frozen bench copy still violate the separate
 acquisition bar, despite a favorable FER crossing. See
 [measurements](../../BENCHMARKS.md#cop-187-experimental-header-repair)
@@ -72,8 +75,8 @@ two symbols. Reusing the old one-symbol recurrence breaks the +/-75 Hz cases.
 The bound is now sixteen sync candidates per hypothesis, or 208 per window.
 See [the regression and remaining work](../../BENCHMARKS.md#cop-189-cfo-acquisition-repair).
 COP-190 carries this search into the production floor receiver
-(`coppa-protocol::modem::floor`); session negotiation and fading tracking
-are still open.
+(`coppa-protocol::modem::floor`); session negotiation shipped in the library
+Link (COP-195) and coppad (COP-202), and fading tracking is still open.
 
 Clean SSB tests must flush the FIR tail. Truncating at the original frame
 length drops delayed payload samples and measures truncation as well as filtering.
@@ -82,8 +85,8 @@ length drops delayed payload samples and measures truncation as well as filterin
 COP-190 production development sweeps now exercise both floor receive paths
 on identical persistent-channel captures. Favorable crossings still fail the
 sync-share clause. See [the production measurements](../../BENCHMARKS.md#cop-190-production-floor-development-measurements)
-for seeds, accounting and remaining acceptance work. Session integration stays
-open; a decoded floor frame does not prove a connection.
+for seeds, accounting and remaining acceptance work. A decoded floor frame
+does not prove a connection.
 
 The library floor controller reserves streaming delivery time in addition to
 airtime. Keying interrupts capture, so Link breaks both OFDM and floor
@@ -110,3 +113,13 @@ retry and turnaround; retry exhaustion still ends silent calls. Keep these
 bounds together when changing discovery timing. See `Link::run_timers` in
 [link.rs](../../crates/coppa-engine/src/link.rs) and the boundary and exhaustion
 tests in [link/tests.rs](../../crates/coppa-engine/src/link/tests.rs).
+
+coppad keeps two RX waveform values. `phy_rx` is set when a frame is
+dispatched, before any handler validates it, because the floor controller
+reads it to pick the reply waveform. Hosts must never see it: a frame for
+another station or a replayed handshake would move it. The host value
+(`status.phy_mode.rx`, `EventLoop::phy_mode()`) comes from `rx_reported`, which
+only an accepting session handler sets, as `Link::phy_mode()` does. Both
+clear in `notify_session` once no session is live (COP-210). The daemon still
+has no simultaneous-call tie break or discovery stagger; see
+[LIMITATIONS](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-session-integration-open).
