@@ -220,16 +220,9 @@ Student t interval, completed/n, and a link to the exact command and seed range
 that produced it. The page follows this file's conventions: SNR in a 3 kHz
 noise bandwidth against the clean mean power of the transmitted frame. One
 command regenerates it: `cargo run -p coppa-bench --release -- compare`, and
-<<<<<<< HEAD
-`compare --check` tells whether it is stale. It publishes coppa rows only. The
-2 KB tables and the WGN 16 KB table are recorded; the MPG and MPP 16 KB cells,
-the black-box harness for other modems and the channel cross-check are open
-(`docs/LIMITATIONS.md`, COP-170).
-=======
 `compare --check` tells whether it is stale. It publishes coppa rows only. All
 42 cells are recorded, 8 trials each (COP-215); the black-box harness for other
 modems and the channel cross-check are open (`docs/LIMITATIONS.md`, COP-170).
->>>>>>> 7588b50f436da90bbd02106ba7582928c4d6e4d3
 
 ## Log index
 

@@ -6,15 +6,9 @@ seed_base=0x17000000
 trials_per_cell=8
 platform=linux-x86_64
 rustc=1.98.0
-<<<<<<< HEAD
-jobs=6
-rows=link-l2
-recorded_cells=2048 B on wgn, mpg, mpp at 30,25,20,15,10,5,0 dB; 16384 B on wgn at 30,25,20,15,10,5,0 dB
-=======
 jobs=per step, see Commands (rows do not depend on --jobs)
 rows=link-l2
 recorded_cells=2048 B and 16384 B on wgn, mpg, mpp at 30,25,20,15,10,5,0 dB
->>>>>>> 7588b50f436da90bbd02106ba7582928c4d6e4d3
 ```
 
 ## Commands
@@ -36,19 +30,6 @@ order from the repository root. Each run resumes from what is recorded.
    `--jobs` (`compare_link.rs` `jobs_do_not_change_the_csv`). An MPP 16 KB run
    in a different out-dir was stopped unfinished and none of its rows were
    kept.
-<<<<<<< HEAD
-6. `target/release/coppa-bench compare --channel wgn --size 16384` renders
-   `docs/benchmarks/comparison.md` (no trial runs)
-
-Total wall time for the 168 2 KB trials: about 15 minutes on a 6-CPU cgroup quota.
-`cargo test --release -p coppa-bench --test compare_results committed_trials_reproduce -- --ignored`
-re-ran WGN 0 dB, WGN 30 dB and MPG 20 dB trial 0 and matched the committed
-rows byte for byte.
-
-The MPG and MPP 16 KB cells are not recorded. Record them with
-`cargo run --release -p coppa-bench -- compare --size 16384 --no-render`, then
-render with `cargo run --release -p coppa-bench -- compare`.
-=======
 6. `target/release/coppa-bench compare --channel mpp --size 16384 --no-render`
    (COP-215, jobs 6, 1165 s wall for 56 trials on the 6-CPU quota, shared
    with debug builds and, for its last 5 minutes, with step 7)
@@ -70,7 +51,6 @@ Total wall time for the 168 2 KB trials: about 15 minutes on a 6-CPU cgroup quot
 `cargo test --release -p coppa-bench --test compare_results committed_trials_reproduce -- --ignored`
 re-ran WGN 0 dB, WGN 30 dB and MPG 20 dB 2 KB trial 0, and MPP 20 dB 16 KB
 trial 0 (COP-215), and matched the committed rows byte for byte.
->>>>>>> 7588b50f436da90bbd02106ba7582928c4d6e4d3
 
 ## Public sources
 

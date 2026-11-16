@@ -111,8 +111,6 @@ fn cost_rank(spec: &TrialSpec) -> (std::cmp::Reverse<usize>, std::cmp::Reverse<C
     )
 }
 
-<<<<<<< HEAD
-=======
 /// The entries of `specs` that `recorded` (read from `path`) lacks, in plan
 /// order. A recorded trial whose seed differs from the plan's is an error.
 fn pending_specs<'a>(
@@ -157,7 +155,6 @@ pub fn pending_trials(plan: &Plan) -> Result<Vec<TrialKey>> {
     Ok(out)
 }
 
->>>>>>> 7588b50f436da90bbd02106ba7582928c4d6e4d3
 /// Run every trial of `plan` that is not yet recorded. Progress goes to
 /// `log`. Test hooks in `options` apply to every trial.
 pub fn run_plan(
@@ -171,30 +168,6 @@ pub fn run_plan(
     for row in &plan.rows {
         let path = csv_path(&plan.out_dir, row);
         let recorded = read_csv(&path)?;
-<<<<<<< HEAD
-        let by_key: HashMap<TrialKey, &TrialRow> = recorded.iter().map(|r| (r.key(), r)).collect();
-        let specs = plan_specs(plan, row)?;
-        let ref_power = reference_power(row.level)?;
-        let mut jobs = Vec::new();
-        let mut already = 0;
-        for (key, spec) in &specs {
-            match by_key.get(key) {
-                Some(r) if r.seed != spec.seed => bail!(
-                    "{}: trial {:?} was recorded with seed 0x{:08x}, the plan gives 0x{:08x}; use another --out-dir or --seed-base",
-                    path.display(),
-                    key,
-                    r.seed,
-                    spec.seed
-                ),
-                Some(_) => already += 1,
-                None => jobs.push(Job {
-                    row: *row,
-                    spec: *spec,
-                    ref_power,
-                }),
-            }
-        }
-=======
         let specs = plan_specs(plan, row)?;
         let ref_power = reference_power(row.level)?;
         let pending = pending_specs(&path, &recorded, &specs)?;
@@ -207,7 +180,6 @@ pub fn run_plan(
                 ref_power,
             })
             .collect();
->>>>>>> 7588b50f436da90bbd02106ba7582928c4d6e4d3
         writeln!(
             log,
             "compare: plan {} x {} trials; {} recorded in {}; {} to run; jobs {}",
@@ -347,8 +319,6 @@ fn write_atomic(path: &Path, text: &str) -> Result<()> {
     debug_assert!(text.starts_with(HEADER));
     Ok(())
 }
-<<<<<<< HEAD
-=======
 
 #[cfg(test)]
 mod tests {
@@ -394,4 +364,3 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 }
->>>>>>> 7588b50f436da90bbd02106ba7582928c4d6e4d3
