@@ -187,6 +187,10 @@ const NO_CALLSIGN_TX_REFUSAL: &str = "Transmission refused: no valid local calls
 /// `audio_poll` cadence, so the ring never fills during the hold.
 const TURNAROUND_POLL: Duration = Duration::from_millis(20);
 
+/// `RateLoop` raise dwell for every daemon-built controller: one higher recommendation
+/// steps up one level (COP-183; BENCHMARKS.md's COP-183 log, which replaced dwell 5).
+const RATE_LOOP_RAISE_DWELL: u8 = 1;
+
 /// Smallest one-codeword payload budget on the whole speed ladder (COP-41,
 /// D4), derived rather than hardcoded: `min(max_payload_for_level(l))` for
 /// `l` in 1..=9. ARQ chunks are sized against THIS, not the current level,
@@ -1259,9 +1263,10 @@ impl EventLoop {
         // hardcoded level 1 -- otherwise a fresh daemon's very first outgoing
         // frame would silently force the engine down to level 1 via
         // `try_drain_tx_queue`'s unconditional `set_speed_level(rate_loop.
-        // current_level())`, even with probing disabled. `levels`/`raise_dwell`
-        // still match `default_coppa()`'s own choices -- only the initial
-        // level differs.
+        // current_level())`, even with probing disabled. `raise_dwell` is
+        // `RATE_LOOP_RAISE_DWELL`, the same dwell `default_coppa()` uses (1
+        // since COP-183); the levels are the engine's ladder and the initial
+        // level is the engine's own.
         let rate_loop = Self::build_rate_loop(&config, &engine, engine.speed_level())?;
 
         // Always constructed (cheap; mirrors RateLoop's own "hardcode the
@@ -1674,7 +1679,11 @@ impl EventLoop {
         engine: &CoppaCore,
         initial_level: u8,
     ) -> Result<RateLoop> {
-        let rate_loop = RateLoop::new(engine.available_speed_levels(), 5, initial_level)?;
+        let rate_loop = RateLoop::new(
+            engine.available_speed_levels(),
+            RATE_LOOP_RAISE_DWELL,
+            initial_level,
+        )?;
         Ok(if config.engine.rate_loop_probe_interval > 0 {
             rate_loop.with_probing(
                 config.engine.rate_loop_probe_interval,
@@ -12901,9 +12910,9 @@ mod tests {
         // Seed the confirmer's `RateLoop` at level 4 -- one step below the
         // HF/VHF boundary -- so the very next raise crosses it. Direct
         // assignment matches how every other `rate_loop` test in this file
-        // seeds a non-default starting level. `raise_dwell = 5` is
-        // `RateLoop::default_coppa`'s own swept value, so five consecutive
-        // higher recommendations is exactly what a real climb costs.
+        // seeds a non-default starting level. `raise_dwell = 5` is the
+        // pre-COP-183 dwell, kept explicit here so five consecutive higher
+        // recommendations is exactly what this test's climb costs.
         a.rate_loop = RateLoop::new(a.engine.available_speed_levels(), 5, 4).unwrap();
 
         // Five real ACKs, encoded under `hf_standard_short_cp` -- `a`'s REAL
@@ -15825,6 +15834,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cop183_one_higher_suggested_rate_raises_the_daemon_rate_loop_one_level() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()).unwrap());
+
+        let levels = event_loop.engine.available_speed_levels();
+        let before_level = event_loop.rate_loop.current_level();
+        let rank = levels
+            .iter()
+            .position(|&l| l == before_level)
+            .expect("the rate loop starts on a ladder level");
+        let next = levels[rank + 1];
+
+        // ONE peer ACK recommending level 9.
+        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
+        let ack_pdu = TransportPdu::new_ack_with_rate(0, 0, 0, 9);
+        let header = coppa_codec::ofdm::frame::CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: ack_pdu.to_bytes().len() as u16,
+            codewords: 1,
+        };
+        let samples = peer_tx
+            .transmit(&header, &ack_pdu.to_bytes())
+            .expect("peer transmit should succeed");
+        event_loop
+            .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+            .await;
+
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            next,
+            "one higher suggested_rate must raise one ladder step at RATE_LOOP_RAISE_DWELL = 1"
+        );
+        assert_eq!(
+            event_loop.engine.speed_level(),
+            event_loop.rate_loop.current_level(),
+            "the engine's configured speed level should track RateLoop's current level"
+        );
+    }
+
+    #[tokio::test]
     async fn incoming_ack_with_rate_updates_rate_loop_and_encoder() {
         let mut config = DaemonConfig::default();
         config.engine.arq_enabled = true;
@@ -15835,8 +15893,9 @@ mod tests {
 
         // A peer ACK recommending a level clearly different from the default
         // (RateLoop::default_coppa starts at level 1) -- enough consecutive
-        // higher recommendations to actually step, matching RateLoop's own
-        // "raise slow" semantics (raise_dwell = 5 by default).
+        // higher recommendations to actually step. Since COP-183 the daemon's
+        // dwell is 1 (`RATE_LOOP_RAISE_DWELL`), so the first ACK already
+        // steps; five still exercises repeated raises.
         let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
         let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
         for _ in 0..5 {
@@ -23308,7 +23367,7 @@ mod tests {
                 config
             }
 
-            /// Raise `RateLoop` the way peer ACKs do (raise_dwell = 5).
+            /// Raise `RateLoop` the way peer ACKs do (`RATE_LOOP_RAISE_DWELL`).
             fn climb_to(event_loop: &mut EventLoop, level: u8) {
                 while event_loop.rate_loop.current_level() < level {
                     event_loop.rate_loop.on_ack(9, true);

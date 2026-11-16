@@ -160,6 +160,15 @@ This is a channel-estimation/MCS-calibration-layer issue, not a `RateLoop` hyste
 same accepted-shortfall pattern as Phase 2's Task 1/7 (delay-domain estimator) and Task 4 (NR BG2
 LDPC). See BENCHMARKS.md's "Phase 3 Task 4" section for the full sweep table.
 
+**Update (2026-11-16, COP-183):** the shipped raise dwell is now 1, in both
+`RateLoop::default_coppa()` and coppad's daemon-built rate loop. The 3-15 sweep above scored
+delivered bits per frame slot with no probing and never tried 1 or 2. Re-measured under the
+airtime-normalized goodput `closed_loop_arq` has reported since COP-2, dwell 1 scored highest on
+development seeds and passed four pre-registered adoption gates on the acceptance seeds (standard
+arm B x1 / best-fixed 0.8911 to 1.1055, / oracle 0.6150 to 0.7630). The bar is still unmet. The
+text above is the original record and is left as written. Numbers and gates:
+`docs/benchmarks/2026-11-16-cop-183-rate-loop-dwell.md`.
+
 Two unrelated real bugs were found and fixed in the new closed-loop bench itself during this
 investigation: a constant `seq_num` corrupting IR-HARQ's per-seq accumulator across
 logically-independent simulated frames, and a shared transceiver risking the same

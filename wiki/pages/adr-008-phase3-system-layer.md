@@ -31,8 +31,14 @@ missed and documented — know them before "fixing" the wrong layer.
   `channel_capacity` metric not being invariant to which speed level the
   measured frame used — `SPEED_LEVEL_MIN_CAPACITY` was only ever calibrated at
   a fixed level-2 probe, so climbing higher self-reinforces. This is a
-  calibration/metric bug, NOT a `RateLoop` hysteresis bug; an 8-point
-  `raise_dwell` sweep confirmed the shipped default is a genuine peak.
+  calibration/metric bug, NOT a `RateLoop` hysteresis bug. The original
+  8-point `raise_dwell` sweep (3-15) that called dwell 5 a peak scored bits
+  per frame slot with no probing and never tried 1 or 2. COP-183 re-measured
+  under airtime-normalized goodput and adopted dwell 1 (all four
+  pre-registered gates held): standard arm B x1 / best-fixed 0.891 → 1.106,
+  / oracle 0.615 → 0.763. The bar is still unmet (oracle half and the robust
+  historical slot count). Numbers:
+  `docs/benchmarks/2026-11-16-cop-183-rate-loop-dwell.md`.
 - **Benchmark program misses its targets**: `milstd` clears 0/27 operating
   points (the borrowed MIL-STD reference-SNR ladder doesn't transfer onto
   Coppa's real thresholds — a calibration mismatch, not a regression);

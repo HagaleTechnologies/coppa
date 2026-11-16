@@ -16,6 +16,7 @@ Older releases have no entry here. Their on-air breaks are listed in
 
 ## Unreleased: 0.16.0
 
+<<<<<<< HEAD
 - Add `coppa-bench compare` (COP-170): runs coppa's library `Link` through
   the WGN, MPG and MPP channels at the 2020 Winlink comparison's SNR grid for
   2 KB and 16 KB transfers, records each trial in a resumable, seed-reproducible
@@ -24,6 +25,12 @@ Older releases have no entry here. Their on-air breaks are listed in
   reports a stale page. Coppa rows only; the 2 KB cells and the WGN 16 KB cells are
   recorded, and the MPG and MPP 16 KB cells, the black-box harness for other
   modems and the channel cross-check follow.
+=======
+- coppad's rate loop and `RateLoop::default_coppa()` now step up after one higher
+  recommendation instead of five (COP-183). On the simulated closed-loop bench this
+  lifts standard-profile adaptive goodput past the best fixed level; adaptive/oracle
+  stays below 0.8. Drops are unchanged. See BENCHMARKS.md's COP-183 log.
+>>>>>>> ab8862678f74270d4529ee4de06578a96d14711b
 - Add negotiated low-rate floor sessions to the Rust library Link. Discovery
   starts on OFDM, falls back after two unanswered windows, and probes OFDM
   after five distinct acknowledged floor exchanges. Set
