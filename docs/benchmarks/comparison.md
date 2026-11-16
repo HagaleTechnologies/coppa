@@ -112,7 +112,7 @@ Each cell reads "mean (95% interval) completed/n" in net bytes/min.
 
 | Row | 30 dB | 25 dB | 20 dB | 15 dB | 10 dB | 5 dB | 0 dB |
 |---|---|---|---|---|---|---|---|
-| coppa 0.16.0, library Link, level 2 (BPSK 1/2), floor off | - | - | - | - | - | - | - |
+| coppa 0.16.0, library Link, level 2 (BPSK 1/2), floor off | [240 (152-328) 0/8](#cell-link-l2-mpp-30-16384) | [205 (116-294) 0/8](#cell-link-l2-mpp-25-16384) | [134 (41-228) 0/8](#cell-link-l2-mpp-20-16384) | [107 (77-137) 0/8](#cell-link-l2-mpp-15-16384) | [19 (1-36) 0/8](#cell-link-l2-mpp-10-16384) | [5 (0-17) 0/8](#cell-link-l2-mpp-5-16384) | [0 (0-0) 0/8](#cell-link-l2-mpp-0-16384) |
 <!-- compare:end tables -->
 
 ## Replay
@@ -142,12 +142,19 @@ Each cell reads "mean (95% interval) completed/n" in net bytes/min.
 | <a id="cell-link-l2-mpg-5-2048"></a>link-l2, MPG, 5 dB, 2 KB | 8 | 0/8 (0.00-0.32) | 6 | 1 | 8.30 s | 0x17180000-0x17180007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpg --snr 5 --size 2048 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
 | <a id="cell-link-l2-mpg-0-2048"></a>link-l2, MPG, 0 dB, 2 KB | 8 | 0/8 (0.00-0.32) | 0 | 8 | - | 0x171a0000-0x171a0007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpg --snr 0 --size 2048 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
 | <a id="cell-link-l2-mpp-30-2048"></a>link-l2, MPP, 30 dB, 2 KB | 8 | 7/8 (0.53-0.98) | 1 | 0 | 5.80 s | 0x171c0000-0x171c0007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 30 --size 2048 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
+| <a id="cell-link-l2-mpp-30-16384"></a>link-l2, MPP, 30 dB, 16 KB | 8 | 0/8 (0.00-0.32) | 4 | 0 | 3.30 s | 0x171d0000-0x171d0007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 30 --size 16384 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
 | <a id="cell-link-l2-mpp-25-2048"></a>link-l2, MPP, 25 dB, 2 KB | 8 | 3/8 (0.14-0.69) | 3 | 0 | 3.30 s | 0x171e0000-0x171e0007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 25 --size 2048 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
+| <a id="cell-link-l2-mpp-25-16384"></a>link-l2, MPP, 25 dB, 16 KB | 8 | 0/8 (0.00-0.32) | 6 | 0 | 3.30 s | 0x171f0000-0x171f0007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 25 --size 16384 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
 | <a id="cell-link-l2-mpp-20-2048"></a>link-l2, MPP, 20 dB, 2 KB | 8 | 1/8 (0.02-0.47) | 2 | 1 | 3.30 s | 0x17200000-0x17200007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 20 --size 2048 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
+| <a id="cell-link-l2-mpp-20-16384"></a>link-l2, MPP, 20 dB, 16 KB | 8 | 0/8 (0.00-0.32) | 6 | 1 | 3.30 s | 0x17210000-0x17210007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 20 --size 16384 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
 | <a id="cell-link-l2-mpp-15-2048"></a>link-l2, MPP, 15 dB, 2 KB | 8 | 1/8 (0.02-0.47) | 3 | 0 | 5.80 s | 0x17220000-0x17220007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 15 --size 2048 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
+| <a id="cell-link-l2-mpp-15-16384"></a>link-l2, MPP, 15 dB, 16 KB | 8 | 0/8 (0.00-0.32) | 6 | 0 | 5.80 s | 0x17230000-0x17230007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 15 --size 16384 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
 | <a id="cell-link-l2-mpp-10-2048"></a>link-l2, MPP, 10 dB, 2 KB | 8 | 0/8 (0.00-0.32) | 6 | 1 | 8.30 s | 0x17240000-0x17240007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 10 --size 2048 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
+| <a id="cell-link-l2-mpp-10-16384"></a>link-l2, MPP, 10 dB, 16 KB | 8 | 0/8 (0.00-0.32) | 6 | 2 | 5.80 s | 0x17250000-0x17250007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 10 --size 16384 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
 | <a id="cell-link-l2-mpp-5-2048"></a>link-l2, MPP, 5 dB, 2 KB | 8 | 0/8 (0.00-0.32) | 2 | 6 | 5.80 s | 0x17260000-0x17260007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 5 --size 2048 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
+| <a id="cell-link-l2-mpp-5-16384"></a>link-l2, MPP, 5 dB, 16 KB | 8 | 0/8 (0.00-0.32) | 1 | 7 | 13.30 s | 0x17270000-0x17270007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 5 --size 16384 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
 | <a id="cell-link-l2-mpp-0-2048"></a>link-l2, MPP, 0 dB, 2 KB | 8 | 0/8 (0.00-0.32) | 0 | 8 | - | 0x17280000-0x17280007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 0 --size 2048 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
+| <a id="cell-link-l2-mpp-0-16384"></a>link-l2, MPP, 0 dB, 16 KB | 8 | 0/8 (0.00-0.32) | 0 | 8 | - | 0x17290000-0x17290007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 0 --size 16384 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
 <!-- compare:end replay -->
 
 ## Provenance and clean-room statement

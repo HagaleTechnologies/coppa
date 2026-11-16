@@ -54,7 +54,7 @@ fn rendering_the_committed_data_is_a_no_op() {
 /// Channels whose seven 16 KB cells are recorded. The rest of the 16 KB
 /// column is open; when it is recorded, this lists all three channels and the
 /// audit covers all 42 cells.
-const RECORDED_16K: &[Channel] = &[Channel::Wgn];
+const RECORDED_16K: &[Channel] = &[Channel::Wgn, Channel::Mpp];
 
 #[test]
 fn published_trials_follow_the_grid() {
@@ -195,7 +195,8 @@ fn docs_point_at_the_comparison_page() {
     assert!(changelog.contains("coppa-bench compare"));
 }
 
-/// Re-runs three committed trials and compares the rows byte for byte.
+/// Re-runs four committed trials, one of them a fading 16 KB trial (COP-215),
+/// and compares the rows byte for byte.
 /// Run with `cargo test --release -p coppa-bench --test compare_results
 /// committed_trials_reproduce -- --ignored`.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -208,17 +209,22 @@ fn committed_trials_reproduce() {
     let row = row_spec("link-l2").unwrap();
     let p = reference_power(row.level).unwrap();
     let trials = read_csv(&published_csv()).unwrap();
-    for (channel, snr) in [(Channel::Wgn, 0), (Channel::Wgn, 30), (Channel::Mpg, 20)] {
+    for (channel, snr, size) in [
+        (Channel::Wgn, 0, 2048),
+        (Channel::Wgn, 30, 2048),
+        (Channel::Mpg, 20, 2048),
+        (Channel::Mpp, 20, 16384),
+    ] {
         let committed = trials
             .iter()
             .find(|t| {
-                t.channel == channel && t.snr_db == snr && t.size_bytes == 2048 && t.trial == 0
+                t.channel == channel && t.snr_db == snr && t.size_bytes == size && t.trial == 0
             })
-            .unwrap_or_else(|| panic!("{channel:?} {snr} dB trial 0 is not committed"));
+            .unwrap_or_else(|| panic!("{channel:?} {snr} dB {size} B trial 0 is not committed"));
         let spec = TrialSpec {
             channel,
             snr_db: snr,
-            size_bytes: 2048,
+            size_bytes: size,
             trial: 0,
             seed: committed.seed,
         };

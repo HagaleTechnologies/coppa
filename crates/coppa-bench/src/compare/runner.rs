@@ -111,6 +111,50 @@ fn cost_rank(spec: &TrialSpec) -> (std::cmp::Reverse<usize>, std::cmp::Reverse<C
     )
 }
 
+/// The entries of `specs` that `recorded` (read from `path`) lacks, in plan
+/// order. A recorded trial whose seed differs from the plan's is an error.
+fn pending_specs<'a>(
+    path: &Path,
+    recorded: &[TrialRow],
+    specs: &'a [(TrialKey, TrialSpec)],
+) -> Result<Vec<&'a (TrialKey, TrialSpec)>> {
+    let by_key: HashMap<TrialKey, &TrialRow> = recorded.iter().map(|r| (r.key(), r)).collect();
+    let mut pending = Vec::new();
+    for entry in specs {
+        let (key, spec) = entry;
+        match by_key.get(key) {
+            Some(r) if r.seed != spec.seed => bail!(
+                "{}: trial {:?} was recorded with seed 0x{:08x}, the plan gives 0x{:08x}; use another --out-dir or --seed-base",
+                path.display(),
+                key,
+                r.seed,
+                spec.seed
+            ),
+            Some(_) => {}
+            None => pending.push(entry),
+        }
+    }
+    Ok(pending)
+}
+
+/// COP-215: the trials of `plan` that its rows' CSVs do not record yet, in
+/// plan order, without running any. A missing CSV records nothing. A recorded
+/// trial whose seed differs from the plan's is an error, as in [`run_plan`].
+pub fn pending_trials(plan: &Plan) -> Result<Vec<TrialKey>> {
+    let mut out = Vec::new();
+    for row in &plan.rows {
+        let path = csv_path(&plan.out_dir, row);
+        let recorded = read_csv(&path)?;
+        let specs = plan_specs(plan, row)?;
+        out.extend(
+            pending_specs(&path, &recorded, &specs)?
+                .into_iter()
+                .map(|(key, _)| key.clone()),
+        );
+    }
+    Ok(out)
+}
+
 /// Run every trial of `plan` that is not yet recorded. Progress goes to
 /// `log`. Test hooks in `options` apply to every trial.
 pub fn run_plan(
@@ -124,28 +168,18 @@ pub fn run_plan(
     for row in &plan.rows {
         let path = csv_path(&plan.out_dir, row);
         let recorded = read_csv(&path)?;
-        let by_key: HashMap<TrialKey, &TrialRow> = recorded.iter().map(|r| (r.key(), r)).collect();
         let specs = plan_specs(plan, row)?;
         let ref_power = reference_power(row.level)?;
-        let mut jobs = Vec::new();
-        let mut already = 0;
-        for (key, spec) in &specs {
-            match by_key.get(key) {
-                Some(r) if r.seed != spec.seed => bail!(
-                    "{}: trial {:?} was recorded with seed 0x{:08x}, the plan gives 0x{:08x}; use another --out-dir or --seed-base",
-                    path.display(),
-                    key,
-                    r.seed,
-                    spec.seed
-                ),
-                Some(_) => already += 1,
-                None => jobs.push(Job {
-                    row: *row,
-                    spec: *spec,
-                    ref_power,
-                }),
-            }
-        }
+        let pending = pending_specs(&path, &recorded, &specs)?;
+        let already = specs.len() - pending.len();
+        let mut jobs: Vec<Job> = pending
+            .into_iter()
+            .map(|(_, spec)| Job {
+                row: *row,
+                spec: *spec,
+                ref_power,
+            })
+            .collect();
         writeln!(
             log,
             "compare: plan {} x {} trials; {} recorded in {}; {} to run; jobs {}",
@@ -284,4 +318,49 @@ fn write_atomic(path: &Path, text: &str) -> Result<()> {
     fs::rename(&tmp, path).with_context(|| format!("renaming onto {}", path.display()))?;
     debug_assert!(text.starts_with(HEADER));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compare::grid::SEED_BASE;
+    use crate::compare::link_stack::row_spec;
+    use crate::compare::trial::tests::sample_row;
+
+    fn key(trial: usize) -> TrialKey {
+        ("link-l2".to_string(), Channel::Mpg, 20, 2048, trial)
+    }
+
+    /// COP-215: `pending_trials` reads the CSV, runs nothing, and keeps the
+    /// seed check of `run_plan`.
+    #[test]
+    fn pending_trials_lists_unrecorded_keys_in_plan_order() {
+        let dir = std::env::temp_dir().join(format!("coppa-pending-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let plan = Plan {
+            rows: vec![row_spec("link-l2").unwrap()],
+            channels: vec![Channel::Mpg],
+            snrs: vec![20],
+            sizes: vec![2048],
+            trials: 3,
+            seed_base: SEED_BASE,
+            jobs: 1,
+            out_dir: dir.clone(),
+        };
+        // No CSV: every trial is pending, and nothing is written.
+        assert_eq!(pending_trials(&plan).unwrap(), [key(0), key(1), key(2)]);
+        assert!(!dir.exists());
+
+        fs::create_dir_all(&dir).unwrap();
+        let path = csv_path(&dir, &plan.rows[0]);
+        fs::write(&path, to_csv(&[sample_row(1)])).unwrap();
+        assert_eq!(pending_trials(&plan).unwrap(), [key(0), key(2)]);
+
+        let mut wrong = sample_row(2);
+        wrong.seed += 1;
+        fs::write(&path, to_csv(&[sample_row(1), wrong])).unwrap();
+        let err = pending_trials(&plan).unwrap_err().to_string();
+        assert!(err.contains("was recorded with seed"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

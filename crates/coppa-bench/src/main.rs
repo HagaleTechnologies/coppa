@@ -11,7 +11,7 @@ use coppa_bench::compare::link_stack::{row_spec, RowSpec, TrialOptions, ROWS};
 use coppa_bench::compare::render::{
     first_difference, recorded_version, regions, render_page, render_tables, skeleton,
 };
-use coppa_bench::compare::runner::{csv_path, run_plan, Plan};
+use coppa_bench::compare::runner::{csv_path, pending_trials, run_plan, Plan};
 use coppa_bench::compare::trial::read_csv;
 
 use coppa_bench::report::{to_csv, to_markdown};
@@ -227,6 +227,22 @@ fn check_compare(args: &CompareArgs) -> anyhow::Result<i32> {
         .map_err(|e| anyhow::anyhow!("reading {}: {e}", page_path.display()))?;
     let expected = render_page(&page, &regions(&rows, &trials, &version))
         .map_err(|e| anyhow::anyhow!("{}: {e}", page_path.display()))?;
+    // COP-215: the page can match while the plan is only partly recorded;
+    // say so, since `compare` with these options would then run trials.
+    // The exit status still depends on the page alone, so a plan the CSVs
+    // reject (another --seed-base) is reported here, not returned.
+    match pending_trials(&plan) {
+        Ok(pending) => {
+            if let Some(first) = pending.first() {
+                eprintln!(
+                    "compare: note: {} trials of this plan are not recorded in {} (first {first:?}); compare with these options would run them",
+                    pending.len(),
+                    plan.out_dir.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("compare: note: {e:#}"),
+    }
     match first_difference(&page, &expected) {
         None => {
             eprintln!(
@@ -409,6 +425,25 @@ mod tests {
         assert!(coppa_bench::compare::repo_root()
             .join("crates/coppa-bench/Cargo.toml")
             .exists());
+    }
+
+    /// COP-215: the bare `compare` regenerates the page from the committed
+    /// CSV and runs no trial, so every trial of the published plan is recorded.
+    #[test]
+    fn bare_compare_has_nothing_left_to_run() {
+        let args = Args::try_parse_from(["coppa-bench", "compare"]).unwrap();
+        let Some(Cmd::Compare(compare)) = &args.cmd else {
+            panic!("expected the compare subcommand");
+        };
+        let plan = compare_plan(compare);
+        let pending = pending_trials(&plan).unwrap();
+        assert!(
+            pending.is_empty(),
+            "the bare compare would run {} unrecorded trials (first {:?}); record them in {} and update the Status section of docs/benchmarks/comparison.md",
+            pending.len(),
+            pending.first(),
+            plan.out_dir.display()
+        );
     }
 
     #[test]
