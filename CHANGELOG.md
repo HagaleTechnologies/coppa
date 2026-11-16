@@ -21,9 +21,8 @@ Older releases have no entry here. Their on-air breaks are listed in
   2 KB and 16 KB transfers, records each trial in a resumable, seed-reproducible
   CSV, and renders `docs/benchmarks/comparison.md`: mean net bytes/min with a
   95% interval, completed/n and a replay command per cell. `compare --check`
-  reports a stale page. Coppa rows only; the 2 KB cells and the WGN 16 KB cells are
-  recorded, and the MPG and MPP 16 KB cells, the black-box harness for other
-  modems and the channel cross-check follow.
+  reports a stale page. Coppa rows only; all 42 cells are recorded (COP-215),
+  and the black-box harness for other modems and the channel cross-check follow.
 - coppad's rate loop and `RateLoop::default_coppa()` now step up after one higher
   recommendation instead of five (COP-183). On the simulated closed-loop bench this
   lifts standard-profile adaptive goodput past the best fixed level; adaptive/oracle
