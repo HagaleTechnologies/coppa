@@ -69,9 +69,8 @@ up to 1800 s of channel time each, and together they cost several CPU-hours in
 a release build. Record them with
 `cargo run --release -p coppa-bench -- compare --size 16384` and commit the
 CSV and this page together. With 8 trials, an interval is wide wherever trials
-vary. Still to come (see `docs/LIMITATIONS.md`, COP-170 section): the
-black-box harness that drives unmodified modem binaries through the same
-channel, and the Watterson cross-check against documented simulators.
+vary. The black-box self-test is recorded separately below when available.
+The Watterson cross-check against documented presets is also below.
 
 ## Tables
 
@@ -150,9 +149,51 @@ Each cell reads "mean (95% interval) completed/n" in net bytes/min.
 | <a id="cell-link-l2-mpp-0-2048"></a>link-l2, MPP, 0 dB, 2 KB | 8 | 0/8 (0.00-0.32) | 0 | 8 | - | 0x17280000-0x17280007 | `cargo run --release -p coppa-bench -- compare --rows link-l2 --channel mpp --snr 0 --size 2048 --trials 8 --seed-base 0x17000000 --out-dir /tmp/coppa-replay` |
 <!-- compare:end replay -->
 
+## Black-box self-test
+
+The daemon self-test uses two unmodified `coppad` processes. These results
+test the audio cable and host interface; they are separate from the library
+`Link` rows above. Real-time scheduling means fixed seeds do not make these
+trials bit-reproducible. Connect time runs from dial to the caller's CONNECTED.
+Wall time runs from dial to trial end. Cable lead is measured by the integrity
+probe. Starved and overflow ticks count 20 ms relay intervals during the trial.
+Source: `results/compare/blackbox-coppad.csv`.
+
+<!-- compare:begin blackbox-selftest -->
+| Modem | Cell | n | completed | net B/min, mean (95% interval) | median connect | median wall | drops | cable lead | starved / overflow ticks |
+|---|---|---|---|---|---|---|---|---|---|
+| coppad 0.16.0, VARA-style host, HF_STANDARD | WGN, 30 dB, 2 KB | 3 | 3/3 | 1398 (0-3527) | 7.1 s | 143.2 s | 0 | 355 ms | 0 / 0 |
+| coppad 0.16.0, VARA-style host, HF_STANDARD | MPG, 20 dB, 2 KB | 3 | 3/3 | 227 (183-271) | 7.1 s | 548.3 s | 0 | 355 ms | 0 / 0 |
+<!-- compare:end blackbox-selftest -->
+
+## Channel cross-check
+
+The Watterson presets use the MPG, MPM and MPP settings from the 2020 study.
+codec2's `README_ofdm.md` describes its CCIR Poor preset as 1 Hz Doppler and
+1 ms delay. Its delay is half of coppa's MPP 2 ms. PathSim defines no matching
+delay presets, so that offset is not measured.
+
+<!-- compare:begin channel-check -->
+| Preset | Delay set / measured | Path power ratio | Doppler spread (2 sigma) set / measured | 3 kHz noise reference error | Within tolerance |
+|---|---|---|---|---|---|
+| Good (MPG) | 0.500 / 0.500 ms | -0.26 dB | 0.10 / 0.10 Hz | +0.01 dB | yes |
+| Moderate | 1.000 / 1.000 ms | +0.06 dB | 0.50 / 0.52 Hz | -0.00 dB | yes |
+| Poor (MPP) | 2.000 / 2.000 ms | +0.62 dB | 1.00 / 0.98 Hz | -0.01 dB | yes |
+<!-- compare:end channel-check -->
+
 ## Provenance and clean-room statement
 
 Built from this repository's own code and documents and from the published
 channel grid of the 2020 Winlink comparison. No other modem's source was read
 and no other modem was run for any number on this page. Recording platform,
 toolchain and commands are in `results/compare/metadata.md`.
+
+The host dialect definitions come from `docs/HOST-API.md` (VARA-style and
+KISS) and `docs/ARDOP.md` (ARDOP). KISS byte framing follows the
+[KISS TNC paper](https://www.ka9q.net/papers/kiss.html). Channel preset
+parameters come from the [IONOS manual](https://winlink.org/sites/default/files/downloads/ionos_sim_manual.pdf)
+and the [2020 comparison study](https://winlink.org/sites/default/files/downloads/a_winlink_digital_mode_performance_comparison_based_on_the_ionis_sim_hf_vhf_channel_simulator_-_november_2_2020_0.pdf).
+The documented offset uses codec2's
+[README_ofdm.md](https://github.com/drowe67/codec2/blob/main/README_ofdm.md).
+[PathSim's page](https://www.moetronix.com/ae4jy/pathsim.htm) has no
+corresponding preset delay table; no PathSim run was made.

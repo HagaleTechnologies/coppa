@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use coppa_bench::compare::grid::{Channel, SIZES, SNRS_DB};
 use coppa_bench::compare::link_stack::{row_spec, RowSpec, TrialOptions, ROWS};
 use coppa_bench::compare::render::{
-    first_difference, recorded_version, regions, render_page, render_tables, skeleton,
+    data_regions, first_difference, recorded_version, regions, render_page, render_tables, skeleton,
 };
 use coppa_bench::compare::runner::{csv_path, run_plan, Plan};
 use coppa_bench::compare::trial::read_csv;
@@ -73,7 +73,10 @@ enum Cmd {
 }
 
 #[derive(Debug, clap::Args)]
+#[command(args_conflicts_with_subcommands = true)]
 struct CompareArgs {
+    #[command(subcommand)]
+    sub: Option<CompareCmd>,
     /// Rows to measure, comma-separated (link-l2, link-l4, link-default).
     #[arg(long, default_value = "link-l2", value_delimiter = ',', value_parser = parse_row)]
     rows: Vec<String>,
@@ -110,6 +113,24 @@ struct CompareArgs {
     /// Measure nothing; exit 1 if the page differs from what the CSVs render.
     #[arg(long, default_value_t = false)]
     check: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum CompareCmd {
+    /// Drive unmodified modem binaries through a userspace audio cable.
+    Blackbox(coppa_bench::compare::blackbox::BlackboxArgs),
+    #[command(hide = true)]
+    BlackboxProbe,
+    /// Measure the Watterson channel presets at audio sample rate.
+    ChannelCheck(ChannelCheckArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ChannelCheckArgs {
+    #[arg(long, default_value_t = 48_000)]
+    sample_rate: u32,
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
 }
 
 fn parse_row(s: &str) -> Result<String, String> {
@@ -218,6 +239,17 @@ fn recorded(
     Ok((rows, trials, recorded_version(metadata.as_deref())))
 }
 
+fn page_regions(
+    rows: &[RowSpec],
+    trials: &[coppa_bench::compare::trial::TrialRow],
+    version: &str,
+    out_dir: &std::path::Path,
+) -> Vec<(&'static str, String)> {
+    let mut all = regions(rows, trials, version);
+    all.extend(data_regions(out_dir));
+    all
+}
+
 /// `compare --check`: 0 when the page matches the CSVs, 1 when it is stale.
 fn check_compare(args: &CompareArgs) -> anyhow::Result<i32> {
     let plan = compare_plan(args);
@@ -225,8 +257,11 @@ fn check_compare(args: &CompareArgs) -> anyhow::Result<i32> {
     let (rows, trials, version) = recorded(&plan)?;
     let page = fs::read_to_string(&page_path)
         .map_err(|e| anyhow::anyhow!("reading {}: {e}", page_path.display()))?;
-    let expected = render_page(&page, &regions(&rows, &trials, &version))
-        .map_err(|e| anyhow::anyhow!("{}: {e}", page_path.display()))?;
+    let expected = render_page(
+        &page,
+        &page_regions(&rows, &trials, &version, &plan.out_dir),
+    )
+    .map_err(|e| anyhow::anyhow!("{}: {e}", page_path.display()))?;
     match first_difference(&page, &expected) {
         None => {
             eprintln!(
@@ -267,8 +302,11 @@ fn run_compare(args: &CompareArgs) -> anyhow::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => skeleton(),
         Err(e) => anyhow::bail!("reading {}: {e}", page_path.display()),
     };
-    let rendered = render_page(&page, &regions(&rows, &trials, &version))
-        .map_err(|e| anyhow::anyhow!("{}: {e}", page_path.display()))?;
+    let rendered = render_page(
+        &page,
+        &page_regions(&rows, &trials, &version, &plan.out_dir),
+    )
+    .map_err(|e| anyhow::anyhow!("{}: {e}", page_path.display()))?;
     if rendered != page {
         fs::write(&page_path, &rendered)
             .map_err(|e| anyhow::anyhow!("writing {}: {e}", page_path.display()))?;
@@ -321,7 +359,26 @@ fn selected_modes(level: Option<u8>) -> impl Iterator<Item = &'static ModeInfo> 
 fn main() {
     let args = Args::parse();
     if let Some(Cmd::Compare(compare)) = &args.cmd {
-        let result = if compare.check {
+        let result = if let Some(sub) = &compare.sub {
+            match sub {
+                CompareCmd::Blackbox(args) => coppa_bench::compare::blackbox::run(args).map(|()| 0),
+                CompareCmd::BlackboxProbe => {
+                    coppa_bench::compare::blackbox::probe_child().map(|()| 0)
+                }
+                CompareCmd::ChannelCheck(args) => {
+                    let out_dir = args
+                        .out_dir
+                        .clone()
+                        .unwrap_or_else(coppa_bench::compare::default_out_dir);
+                    coppa_bench::compare::channel_check::run(args.sample_rate, &out_dir).map(
+                        |table| {
+                            print!("{table}");
+                            0
+                        },
+                    )
+                }
+            }
+        } else if compare.check {
             check_compare(compare)
         } else {
             run_compare(compare).map(|()| 0)
@@ -372,7 +429,77 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use coppa_bench::compare::grid::SEED_BASE;
+
+    #[test]
+    fn compare_lists_blackbox_and_channel_check() {
+        let help = Args::command()
+            .find_subcommand_mut("compare")
+            .unwrap()
+            .render_help()
+            .to_string();
+        assert!(help.contains("blackbox"), "{help}");
+        assert!(help.contains("channel-check"), "{help}");
+    }
+
+    #[test]
+    fn nested_commands_parse() {
+        let args = Args::try_parse_from(["coppa-bench", "compare", "channel-check"]).unwrap();
+        assert!(matches!(
+            args.cmd,
+            Some(Cmd::Compare(CompareArgs {
+                sub: Some(CompareCmd::ChannelCheck(_)),
+                ..
+            }))
+        ));
+        let args =
+            Args::try_parse_from(["coppa-bench", "compare", "blackbox", "--modem", "x.toml"])
+                .unwrap();
+        assert!(matches!(
+            args.cmd,
+            Some(Cmd::Compare(CompareArgs {
+                sub: Some(CompareCmd::Blackbox(_)),
+                ..
+            }))
+        ));
+    }
+
+    #[cfg(not(all(feature = "cpal-backend", target_os = "linux")))]
+    #[test]
+    fn blackbox_without_the_feature_explains_itself() {
+        let args =
+            Args::try_parse_from(["coppa-bench", "compare", "blackbox", "--modem", "x.toml"])
+                .unwrap();
+        let Some(Cmd::Compare(CompareArgs {
+            sub: Some(CompareCmd::Blackbox(blackbox)),
+            ..
+        })) = args.cmd
+        else {
+            panic!("blackbox command did not parse")
+        };
+        let error = coppa_bench::compare::blackbox::run(&blackbox).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("built without the black-box harness"));
+    }
+
+    #[test]
+    fn compare_flags_do_not_mix_with_nested_commands() {
+        assert!(Args::try_parse_from([
+            "coppa-bench",
+            "compare",
+            "--check",
+            "blackbox",
+            "--modem",
+            "x.toml"
+        ])
+        .is_err());
+        assert!(
+            Args::try_parse_from(["coppa-bench", "compare", "--snr", "20", "channel-check"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn level_one_selects_only_one_mode() {

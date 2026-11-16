@@ -212,6 +212,14 @@ parameters. No external modem source was read or copied.
 
 ## COP-170 same-simulator comparison
 
+COP-214 adds `compare channel-check`; its 48 kHz measurements of Good,
+Moderate and Poor are in `results/compare/channel-check.csv` and the comparison
+page. All three meet the documented tolerances.
+`compare blackbox` runs two unmodified coppad processes through the same
+channel model over a Linux ALSA FIFO cable. Its separate self-test rows in
+`results/compare/blackbox-coppad.csv` use measured data-frame TX power and
+record real-time wall time and cable tick counts.
+
 [docs/benchmarks/comparison.md](docs/benchmarks/comparison.md) measures coppa
 through the channel grid of the 2020 Winlink comparison: WGN, Watterson Good
 (MPG) and Poor (MPP) at 30 to 0 dB SNR, for 2 KB and 16 KB transfers. Each cell
@@ -222,7 +230,7 @@ noise bandwidth against the clean mean power of the transmitted frame. One
 command regenerates it: `cargo run -p coppa-bench --release -- compare`, and
 `compare --check` tells whether it is stale. It publishes coppa rows only. The
 2 KB tables and the WGN 16 KB table are recorded; the MPG and MPP 16 KB cells,
-the black-box harness for other modems and the channel cross-check are open
+  the black-box harness for other modems is open
 (`docs/LIMITATIONS.md`, COP-170).
 
 ## Log index

@@ -6,6 +6,8 @@
 //! and renders per-cell means with 95% Student t intervals. Only coppa rows
 //! are measured here (COP-170 rescope, 2026-11-09).
 
+pub mod blackbox;
+pub mod channel_check;
 pub mod grid;
 pub mod link_stack;
 pub mod render;

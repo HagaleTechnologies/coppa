@@ -117,6 +117,8 @@ docs/superpowers/
 /results/compare/**
 !/results/compare/link-l2.csv
 !/results/compare/metadata.md
+!/results/compare/blackbox-coppad.csv
+!/results/compare/channel-check.csv
 # Catalyst orchestrator runtime state (worktree-local; never committed — see
 # catalyst's execution-core/worktree-safety.mjs MACHINE_LOCAL_NOISE list)
 .catalyst/.workflow-context.json
