@@ -90,7 +90,11 @@ receiver in `coppa-protocol` (`modem/floor.rs`). The frozen parameters:
   RX counts only frames a session handler accepted, as `Link::phy_mode()`
   does, and both values clear when the session ends. Host API stays version
   1; the `coppa-host` type additions take the workspace to 0.17.0. The
-  simultaneous-call tie break and discovery stagger remain open for the
-  daemon (`docs/LIMITATIONS.md`).
+  simultaneous-call tie break and retry stagger move into
+  `coppa_protocol::floor_controller` (`answers_simultaneous_call`,
+  `calling_retry_stagger`) and both adapters call them: a daemon that hears
+  the station it is dialing call it back answers when its callsign sorts
+  higher, even with `LISTEN OFF`, and its host sees the call complete as its
+  own `CONNECTED`.
 - Version 2 spends one of the fourteen remaining version values; the next
   incompatible format allocates 3.

@@ -104,6 +104,10 @@ struct PendingDial {
     /// COP-202: whether the dial started with the floor enabled (Auto speed
     /// level). Fed to `FloorController::timeout` on every unanswered window.
     floor: bool,
+    /// COP-210: the simultaneous-call stagger
+    /// (`floor_policy::calling_retry_stagger`) added to `interval` before
+    /// the next repeat keys.
+    stagger: Duration,
 }
 
 /// Map of connected VARA command-port clients' response senders
@@ -1138,6 +1142,11 @@ pub struct EventLoop {
     extra_callsigns: Vec<Callsign>,
     vara_clients: HashMap<u32, VaraClientState>,
     pending_dial: Option<PendingDial>,
+    /// COP-210: the inbound session that replaced our own dial to the same
+    /// station (a crossed call, `floor_policy::answers_simultaneous_call`).
+    /// Its host saw `CONNECTING`, not `PENDING`, so it completes as the
+    /// host's own call and ends with `DISCONNECTED`, never `CANCELPENDING`.
+    crossed_dial: Option<u8>,
     /// Bounded broadcast datagrams waiting for the transmitter.
     kiss_datagrams: VecDeque<Vec<u8>>,
     /// Fan-out exclusively to KISS clients, separate from host DataOut.
@@ -1405,6 +1414,7 @@ impl EventLoop {
             extra_callsigns: Vec::new(),
             vara_clients: HashMap::new(),
             pending_dial: None,
+            crossed_dial: None,
             vara_keepalive_period: VARA_KEEPALIVE_PERIOD,
             listening: false,
             cw_id_on,
@@ -2732,7 +2742,7 @@ impl EventLoop {
             .pending_dial
             .as_ref()
             .filter(|d| d.left > 0)
-            .map(|d| (d.session_id, d.interval));
+            .map(|d| (d.session_id, d.interval + d.stagger));
         let turnaround = self.turnaround();
         let removed: Vec<u8> = self
             .session_mgr
@@ -2776,13 +2786,20 @@ impl EventLoop {
     }
 
     /// COP-44: the sessions in `Accepting`, the inbound handshakes a host
-    /// was told were `PENDING`.
+    /// was told were `PENDING` (COP-210: a crossed call is not one).
     fn accepting_sessions(&self) -> Vec<u8> {
         self.session_mgr
             .active_sessions()
             .into_iter()
-            .filter(|&id| self.is_accepting(id))
+            .filter(|&id| self.host_pending(id))
             .collect()
+    }
+
+    /// COP-210: an inbound handshake whose host was told `PENDING`. A
+    /// crossed call (`crossed_dial`) is `Accepting` too, but its host saw
+    /// its own `CONNECTING`, so it never gets `CANCELPENDING`.
+    fn host_pending(&self, session_id: u8) -> bool {
+        self.is_accepting(session_id) && self.crossed_dial != Some(session_id)
     }
 
     fn is_accepting(&self, session_id: u8) -> bool {
@@ -3769,6 +3786,7 @@ impl EventLoop {
         self.phy_tx = None;
         self.phy_rx = None;
         self.rx_reported = None;
+        self.crossed_dial = None;
     }
 
     /// COP-210: the session waveform pair hosts see, shaped like
@@ -3977,7 +3995,22 @@ impl EventLoop {
                                 + own_id,
                         );
                     }
-                    dial.next_at = keyed + dial.interval;
+                    // COP-210: re-evaluated after every repeat, so the
+                    // stagger stops once a request has gone on the floor.
+                    dial.stagger =
+                        self.session_mgr
+                            .get(dial.session_id)
+                            .map_or(Duration::ZERO, |s| {
+                                floor_policy::calling_retry_stagger(
+                                    s.local.as_str(),
+                                    s.remote.as_str(),
+                                    dial.floor,
+                                    mode,
+                                    dial.interval,
+                                    self.turnaround(),
+                                )
+                            });
+                    dial.next_at = keyed + dial.interval + dial.stagger;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to encode repeat CONNECT_REQ");
@@ -4269,7 +4302,7 @@ impl EventLoop {
     /// `DISCONNECT` of any other session drains first and ends through
     /// `end_local_disconnect` (COP-43).
     async fn end_session(&mut self, session_id: u8, client_id: u32) {
-        let was_pending = self.is_accepting(session_id);
+        let was_pending = self.host_pending(session_id);
         self.discard_session_tx(session_id).await;
         if let Some(session) = self.session_mgr.get_mut(session_id) {
             match session.disconnect(clock_now()) {
@@ -4517,7 +4550,7 @@ impl EventLoop {
             return;
         };
         tracing::info!(session_id = id, "ABORT: ending the session now");
-        let was_pending = self.is_accepting(id);
+        let was_pending = self.host_pending(id);
         // COP-43: ABORT also ends a DISCONNECT drain at once. Dropping its
         // record means the drain never sends its DISCONNECT frame or a
         // second `DISCONNECTED` later.
@@ -5014,7 +5047,7 @@ impl EventLoop {
                                 .session_mgr
                                 .active_sessions()
                                 .into_iter()
-                                .filter(|&id| self.is_accepting(id))
+                                .filter(|&id| self.host_pending(id))
                                 .collect();
                             for id in pending {
                                 self.discard_session_tx(id).await;
@@ -5226,6 +5259,7 @@ impl EventLoop {
                 let caps = local_link_caps(&self.config, floor);
                 let now = clock_now();
                 self.reset_floor();
+                let local_call = local.clone();
                 match self.session_mgr.create(local, remote.clone(), 0, caps, now) {
                     Ok(id) => {
                         if let Some(session) = self.session_mgr.get_mut(id) {
@@ -5272,6 +5306,14 @@ impl EventLoop {
                                                 .map(|t| t.into_std())
                                                 .unwrap_or_else(clock_now);
                                             if retries > 0 && sent > 0 {
+                                                // COP-210: the reaper measures the
+                                                // staggered repeat from key-up, as
+                                                // `repeat_pending_dial` does, not
+                                                // from before a busy-channel wait.
+                                                if let Some(session) = self.session_mgr.get_mut(id)
+                                                {
+                                                    session.touch(keyed);
+                                                }
                                                 let sr = self.engine.config().sample_rate as f64;
                                                 let mut interval = coppa_protocol::session::connect_req_retry_interval(
                                                     Duration::from_secs_f64(samples.len() as f64 / sr),
@@ -5287,16 +5329,31 @@ impl EventLoop {
                                                             / sr,
                                                     ) + self.station_id_allowance();
                                                 }
+                                                // COP-210: the lexically higher
+                                                // floor-enabled caller listens
+                                                // through the peer's OFDM and
+                                                // first floor requests.
+                                                let stagger = floor_policy::calling_retry_stagger(
+                                                    local_call.as_str(),
+                                                    remote.as_str(),
+                                                    floor,
+                                                    LinkPhyMode::Ofdm {
+                                                        level: self.engine.speed_level(),
+                                                    },
+                                                    interval,
+                                                    self.turnaround(),
+                                                );
                                                 self.pending_dial = Some(PendingDial {
                                                     session_id: id,
                                                     request: pdu_bytes.clone(),
                                                     left: retries,
                                                     total: retries,
-                                                    next_at: keyed + interval,
+                                                    next_at: keyed + interval + stagger,
                                                     interval,
                                                     give_up_at: keyed + Duration::from_secs(300),
                                                     window_expired: false,
                                                     floor,
+                                                    stagger,
                                                 });
                                             }
                                         }
@@ -7962,7 +8019,40 @@ impl EventLoop {
     }
 
     async fn handle_incoming_connect(&mut self, pdu: MacPdu) {
-        if !self.listening {
+        // COP-210: a simultaneous call. We are dialing the station whose
+        // CONNECT_REQ this is, and our callsign sorts after its callsign
+        // (`floor_policy::answers_simultaneous_call`), so we drop our own
+        // dial and answer its request, as the library `Link` does. The call
+        // is the host's own, so `LISTEN OFF` does not refuse it. The other
+        // station keeps calling and ignores our request.
+        let crossed = self.session_id_for_frame(&pdu).filter(|&id| {
+            self.session_mgr.get(id).is_some_and(|s| {
+                s.state == SessionState::Connecting
+                    && floor_policy::answers_simultaneous_call(s.local.as_str(), s.remote.as_str())
+            })
+        });
+        let crossed = match crossed {
+            Some(_) if LinkCapabilities::from_bytes(&pdu.payload).is_err() => {
+                tracing::debug!(remote = %pdu.src, "Unreadable crossed CONNECT_REQ; ignoring");
+                return;
+            }
+            Some(id) => {
+                tracing::info!(
+                    remote = %pdu.src, session_id = id,
+                    "Simultaneous call; answering the peer's CONNECT_REQ"
+                );
+                self.session_mgr.remove(id);
+                self.pending_dial = None;
+                true
+            }
+            None => false,
+        };
+        // A repeat REQ for a crossed session (its caller missed our ACK) is
+        // still the host's own call.
+        let crossed_repeat = self
+            .session_id_for_frame(&pdu)
+            .is_some_and(|id| self.is_accepting(id) && self.crossed_dial == Some(id));
+        if !self.listening && !crossed && !crossed_repeat {
             tracing::debug!("CONNECT_REQ received but not listening; ignoring");
             return;
         }
@@ -7984,6 +8074,9 @@ impl EventLoop {
         let pending_id = self
             .session_id_for_frame(&pdu)
             .filter(|&id| self.is_accepting(id));
+        // A repeat REQ that replaces a crossed session keeps the crossed
+        // reporting on the new session.
+        let crossed = crossed || pending_id.is_some_and(|id| self.crossed_dial == Some(id));
         let replaced = match pending_id {
             Some(_) if LinkCapabilities::from_bytes(&pdu.payload).is_err() => {
                 tracing::debug!(remote = %pdu.src, "Unreadable repeat CONNECT_REQ; ignoring");
@@ -8028,13 +8121,18 @@ impl EventLoop {
                 if let Some(mode) = rx_mode {
                     self.floor.received(mode);
                 }
+                if crossed {
+                    self.crossed_dial = Some(id);
+                }
                 if let Some(session) = self.session_mgr.get_mut(id) {
                     match session.handle_connect_req(&pdu.payload, now) {
                         Ok(ack_pdu) => {
                             self.note_validated_rx();
                             // COP-44: announce the attempt before the ACK,
                             // whose busy-channel wait can last seconds.
-                            if !replaced {
+                            // COP-210: a crossed call's host already saw
+                            // its own CONNECTING.
+                            if !replaced && !crossed {
                                 self.notify_session(
                                     0,
                                     SessionNotice::Pending {
@@ -8061,7 +8159,10 @@ impl EventLoop {
                             tracing::warn!(error = %e, "Failed to handle CONNECT_REQ");
                             self.session_mgr.remove(id);
                             // The session this REQ replaced is gone too.
-                            if replaced {
+                            // COP-210: so is a crossed call's own dial.
+                            if crossed {
+                                self.notify_session(0, SessionNotice::Disconnected).await;
+                            } else if replaced {
                                 self.notify_session(0, SessionNotice::PendingCancelled)
                                     .await;
                             }
@@ -8123,6 +8224,8 @@ impl EventLoop {
     async fn handle_connect_cfm_rx(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
         let session_id = self.session_id_for_frame(&pdu);
+        // COP-210: a crossed call completes as the host's own outgoing call.
+        let crossed = session_id.is_some() && self.crossed_dial == session_id;
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             match session.handle_connect_cfm(&pdu.payload, clock_now()) {
                 Ok(()) => {
@@ -8131,7 +8234,7 @@ impl EventLoop {
                     let notice = SessionNotice::Connected {
                         local: session.local.clone(),
                         remote,
-                        we_called: false,
+                        we_called: crossed,
                     };
                     // COP-38 (D2): the new session starts at seq 0.
                     let session_id = session.id;
@@ -8149,8 +8252,12 @@ impl EventLoop {
                         let session_id = session.id;
                         self.session_mgr.remove(session_id);
                         self.discard_session_tx(session_id).await;
-                        self.notify_session(0, SessionNotice::PendingCancelled)
-                            .await;
+                        let notice = if crossed {
+                            SessionNotice::Disconnected
+                        } else {
+                            SessionNotice::PendingCancelled
+                        };
+                        self.notify_session(0, notice).await;
                     }
                 }
             }
@@ -8165,7 +8272,7 @@ impl EventLoop {
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(id) = session_id {
             // Read before `handle_disconnect` sets the session `Idle`.
-            let was_pending = self.is_accepting(id);
+            let was_pending = self.host_pending(id);
             if let Some(session) = self.session_mgr.get_mut(id) {
                 session.handle_disconnect();
             }
@@ -27196,6 +27303,11 @@ mod tests {
             air_in: coppa_audio::AudioRingProducer,
             air_out: coppa_audio::AudioRingConsumer,
             channel: PersistentChannel,
+            /// COP-210: model "no OFDM response arrives". `move_block` sends
+            /// silence for this station's transmit block while its last
+            /// keyed session frame (`phy_tx`) is not a floor frame, like the
+            /// library trial's `pump(.., erase_ofdm)`.
+            erase_ofdm: bool,
         }
 
         impl FloorStation {
@@ -27233,6 +27345,7 @@ mod tests {
                     air_in,
                     air_out,
                     channel,
+                    erase_ofdm: false,
                 }
             }
 
@@ -27321,6 +27434,11 @@ mod tests {
             let n_b = b.air_out.read(tx_b);
             tx_a[n_a..].fill(0.0);
             tx_b[n_b..].fill(0.0);
+            for (station, tx) in [(&*a, &mut *tx_a), (&*b, &mut *tx_b)] {
+                if station.erase_ofdm && station.station.phy_tx != Some(LinkPhyMode::Floor) {
+                    tx.fill(0.0);
+                }
+            }
             let heard_by_b = if muted {
                 vec![0.0; BLOCK]
             } else {
@@ -28476,6 +28594,183 @@ mod tests {
                 );
                 assert_eq!(phy_mode_pushes(station).last(), Some(&(None, None)));
             }
+        }
+
+        /// COP-210: what one simultaneous-call run saw.
+        struct CrossedRun {
+            a_lines: Vec<String>,
+            b_lines: Vec<String>,
+            b_data: Vec<u8>,
+            floor_keyed: bool,
+            connected_at: Duration,
+        }
+
+        /// COP-210: VK3ABC and W1AW dial each other in the same tick; once
+        /// both ends confirm, VK3ABC writes `payload`. Stops when W1AW has
+        /// received `payload.len()` bytes or `limit` of virtual time passes.
+        async fn crossed_run(
+            a: &mut FloorStation,
+            b: &mut FloorStation,
+            payload: &[u8],
+            limit: Duration,
+        ) -> CrossedRun {
+            let (a_tx, mut a_host) = mpsc::unbounded_channel();
+            a.station.set_response_tx(a_tx);
+            let (b_tx, mut b_host) = mpsc::unbounded_channel();
+            b.station.set_response_tx(b_tx);
+            let drain = |rx: &mut mpsc::UnboundedReceiver<HostResponse>,
+                         data: &mut Vec<u8>,
+                         lines: &mut Vec<String>| {
+                while let Ok(resp) = rx.try_recv() {
+                    match resp {
+                        HostResponse::DataOut { data: d, .. } => data.extend_from_slice(&d),
+                        HostResponse::StatusUpdate { status, .. } => lines.push(status),
+                    }
+                }
+            };
+            let (mut a_data, mut a_lines) = (Vec::new(), Vec::new());
+            let (mut b_data, mut b_lines) = (Vec::new(), Vec::new());
+            for (station, source, destination) in [
+                (&mut a.station, "VK3ABC", "W1AW"),
+                (&mut b.station, "W1AW", "VK3ABC"),
+            ] {
+                station
+                    .handle_host_event(HostEvent::ConnectRequest {
+                        client_id: 1,
+                        source: source.into(),
+                        destination: destination.into(),
+                    })
+                    .await;
+            }
+            let start = tokio::time::Instant::now();
+            let mut clock = PairClock::new(start);
+            let (mut tx_a, mut tx_b) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+            let mut floor_keyed = false;
+            let mut connected_at = None;
+            while start.elapsed() < limit && b_data.len() < payload.len() {
+                step_stations(a, b, &mut clock).await;
+                floor_keyed |= [&a.station, &b.station]
+                    .iter()
+                    .any(|s| s.phy_tx == Some(LinkPhyMode::Floor));
+                move_block(a, b, &mut tx_a, &mut tx_b, false);
+                drain(&mut a_host, &mut a_data, &mut a_lines);
+                drain(&mut b_host, &mut b_data, &mut b_lines);
+                if connected_at.is_none()
+                    && both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC")
+                {
+                    connected_at = Some(start.elapsed());
+                    a.station
+                        .handle_host_event(HostEvent::DataReceived {
+                            client_id: 1,
+                            data: payload.to_vec(),
+                        })
+                        .await;
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            println!(
+                "crossed run: connected at {connected_at:?}, {} bytes by {:?}; \
+                 a_lines={a_lines:?} b_lines={b_lines:?}",
+                b_data.len(),
+                start.elapsed()
+            );
+            assert!(
+                both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC"),
+                "both ends confirmed one session: a_lines={a_lines:?} b_lines={b_lines:?}"
+            );
+            assert_eq!(
+                (
+                    a.station.session_mgr.active_sessions().len(),
+                    b.station.session_mgr.active_sessions().len()
+                ),
+                (1, 1),
+                "one session each"
+            );
+            CrossedRun {
+                a_lines,
+                b_lines,
+                b_data,
+                floor_keyed,
+                connected_at: connected_at.expect("connected"),
+            }
+        }
+
+        /// COP-210 AC2 (ticket scenario 2, "both sides call at once"): two
+        /// Auto daemons with `LISTEN OFF` dial each other in the same tick on
+        /// floor-only air (every OFDM session frame is erased). W1AW sorts
+        /// after VK3ABC, so it staggers its repeats, hears VK3ABC's first
+        /// floor request, drops its own dial and answers. Each host sees one
+        /// `CONNECTED` for its own call and no `PENDING`; a 40-byte write
+        /// arrives exactly once. Also AC1's floor-only fallback proof.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_simultaneous_calls() {
+            let reference_power = floor_reference_power();
+            let mut a = FloorStation::with_snr("VK3ABC", SEED_BASE, 0, reference_power, 60.0);
+            let mut b = FloorStation::with_snr("W1AW", SEED_BASE, 1, reference_power, 60.0);
+            for station in [&mut a, &mut b] {
+                station.station.listening = false;
+                station.erase_ofdm = true;
+            }
+            let payload: Vec<u8> = (0..40).collect();
+            let run = crossed_run(&mut a, &mut b, &payload, Duration::from_secs(240)).await;
+            assert!(
+                run.floor_keyed,
+                "OFDM never arrives, so the floor carries the call"
+            );
+            for lines in [&run.a_lines, &run.b_lines] {
+                assert_eq!(
+                    lines.iter().filter(|l| l.starts_with("CONNECTED ")).count(),
+                    1,
+                    "{lines:?}"
+                );
+                assert!(!lines.iter().any(|l| l == "PENDING"), "{lines:?}");
+                assert!(!lines.iter().any(|l| l == "CANCELPENDING"), "{lines:?}");
+            }
+            assert!(
+                run.a_lines.iter().any(|l| l == "CONNECTED W1AW"),
+                "{:?}",
+                run.a_lines
+            );
+            assert!(
+                run.b_lines.iter().any(|l| l == "CONNECTED VK3ABC"),
+                "{:?}",
+                run.b_lines
+            );
+            assert_eq!(run.b_data, payload, "the write arrived once and in order");
+            assert!(
+                run.connected_at > Duration::from_secs(16),
+                "{:?}",
+                run.connected_at
+            );
+        }
+
+        /// COP-210 AC2, clean channel: the same crossed dial at 60 dB with
+        /// `LISTEN ON` connects on OFDM without any floor key-up, one
+        /// session and one `CONNECTED` per host, no `PENDING`, and a 40-byte
+        /// write arrives exactly once.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_simultaneous_calls_clean_channel() {
+            let reference_power = floor_reference_power();
+            let mut a = FloorStation::with_snr("VK3ABC", SEED_BASE, 0, reference_power, 60.0);
+            let mut b = FloorStation::with_snr("W1AW", SEED_BASE, 1, reference_power, 60.0);
+            let payload: Vec<u8> = (0..40).collect();
+            let run = crossed_run(&mut a, &mut b, &payload, Duration::from_secs(120)).await;
+            assert!(!run.floor_keyed, "a clean channel never keys the floor");
+            for lines in [&run.a_lines, &run.b_lines] {
+                assert_eq!(
+                    lines.iter().filter(|l| l.starts_with("CONNECTED ")).count(),
+                    1,
+                    "{lines:?}"
+                );
+                assert!(!lines.iter().any(|l| l == "PENDING"), "{lines:?}");
+            }
+            assert_eq!(run.b_data, payload, "the write arrived once and in order");
+            assert!(
+                run.connected_at < Duration::from_secs(16),
+                "{:?}",
+                run.connected_at
+            );
         }
 
         /// COP-210 AC3: handshake frames that repeat after establishment

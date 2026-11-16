@@ -511,12 +511,6 @@ impl Browser {
     /// Starts `binary` and returns it with its browser-level DevTools URL.
     /// Panics if the browser exits first, or prints no URL within `STARTUP`.
     fn launch(binary: &Path) -> (Self, String) {
-<<<<<<< HEAD
-        // COP-210: one profile per launch, since this file's tests run in
-        // parallel in one process.
-        static LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let launch = LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-=======
         Self::start(Command::new(binary), STARTUP).unwrap_or_else(|message| panic!("{message}"))
     }
 
@@ -526,7 +520,6 @@ impl Browser {
     fn start(mut command: Command, startup: Duration) -> Result<(Self, String), String> {
         let name = Path::new(command.get_program()).display().to_string();
         let launch = LAUNCHES.fetch_add(1, Ordering::Relaxed);
->>>>>>> 5244d4e2534428748155b10810d5835685d1c029
         let profile = std::env::temp_dir().join(format!(
             "coppa-dashboard-touch-{}-{launch}",
             std::process::id()

@@ -182,6 +182,40 @@ pub fn calling_handshake_timeout(retry_interval: Duration, turnaround: Duration)
         .max(retry_interval + turnaround + Duration::from_secs(1))
 }
 
+/// Simultaneous-call tie-break: a calling station that hears its own
+/// peer's CONNECT_REQ answers it when its local callsign sorts after the
+/// peer's (plain byte order of the callsign strings). The other station
+/// keeps calling. Used by both adapters (COP-195, COP-210).
+pub fn answers_simultaneous_call(local: &str, remote: &str) -> bool {
+    local > remote
+}
+
+/// Extra delay a calling station adds before repeating its connect request.
+/// A floor-enabled caller that sorts after its peer (the station
+/// [`answers_simultaneous_call`] makes the answerer) waits one more retry
+/// interval plus one floor response window while its last request was not
+/// on the floor, so it listens through the peer's two OFDM requests and its
+/// first complete floor request. Zero otherwise. These complementary roles
+/// cannot give two distinct callsigns equal delays. Used by both adapters.
+pub fn calling_retry_stagger(
+    local: &str,
+    remote: &str,
+    floor_enabled: bool,
+    last_request: LinkPhyMode,
+    retry_interval: Duration,
+    turnaround: Duration,
+) -> Duration {
+    if floor_enabled
+        && last_request != LinkPhyMode::Floor
+        && answers_simultaneous_call(local, remote)
+    {
+        retry_interval
+            + FloorController::response_window(LinkPhyMode::Floor, Duration::ZERO, turnaround)
+    } else {
+        Duration::ZERO
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +392,38 @@ mod tests {
         c.prepare_data(10);
         c.acknowledged(10, LinkPhyMode::Ofdm { level: 1 });
         assert_eq!(c.mode(2), LinkPhyMode::Ofdm { level: 2 });
+    }
+
+    #[test]
+    fn simultaneous_call_answerer_is_the_higher_callsign() {
+        assert!(answers_simultaneous_call("W1AW", "VK3ABC"));
+        assert!(!answers_simultaneous_call("VK3ABC", "W1AW"));
+        assert!(!answers_simultaneous_call("W1AW", "W1AW"));
+    }
+
+    #[test]
+    fn retry_stagger_applies_only_to_the_floor_enabled_answerer_before_the_floor() {
+        let interval = Duration::from_secs(8);
+        let turnaround = Duration::from_millis(250);
+        let ofdm = LinkPhyMode::Ofdm { level: 1 };
+        let window =
+            FloorController::response_window(LinkPhyMode::Floor, Duration::ZERO, turnaround);
+        assert_eq!(
+            calling_retry_stagger("W1AW", "VK3ABC", true, ofdm, interval, turnaround),
+            interval + window
+        );
+        // The lower station, a pinned (floor-disabled) caller and a caller
+        // whose last request went on the floor do not stagger.
+        for (local, remote, enabled, last) in [
+            ("VK3ABC", "W1AW", true, ofdm),
+            ("W1AW", "VK3ABC", false, ofdm),
+            ("W1AW", "VK3ABC", true, LinkPhyMode::Floor),
+        ] {
+            assert_eq!(
+                calling_retry_stagger(local, remote, enabled, last, interval, turnaround),
+                Duration::ZERO,
+                "{local} -> {remote}, enabled {enabled}, last {last:?}"
+            );
+        }
     }
 }

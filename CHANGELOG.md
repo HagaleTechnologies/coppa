@@ -25,6 +25,14 @@ Older releases have no entry here. Their on-air breaks are listed in
   reliable `phy_mode` push follows each change. The dashboard's Speed level card
   shows `TX floor · auto` and `RX floor (last decoded frame)` during a floor
   session. Clients that ignore the field keep working.
+- Two coppads that dial each other at once now make one session each
+  (COP-210). As in the library Link, the station whose callsign sorts higher
+  drops its own dial and answers the other's request, even with `LISTEN OFF`,
+  and its host sees the call complete as its own `CONNECTED` with no
+  `PENDING`. A lexically higher Auto caller waits one more retry interval plus
+  one floor response window before each OFDM repeat. New shared helpers
+  `coppa_protocol::floor_controller::answers_simultaneous_call` and
+  `calling_retry_stagger` carry the rule for both adapters.
 - **Rust API, breaking for struct literals and exhaustive matches:** new
   `coppa_host::websocket::PhyMode` (non-exhaustive) and `PhyModeReport`, a new
   `WsStatus.phy_mode` field, a new `phy_mode` field on `WsServerMessage::Status`

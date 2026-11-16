@@ -560,7 +560,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:760b9c2e873342261626598b50b4f1585bc6d3b8b96d5d4b03eb65e7527f58d3",
+      "hash": "sha256:a312996287acc43dde393ac2f340540eeb72b54ed773d8ceb35f7d8651bd4626",
       "id": "low-rate-floor",
       "kind": "gotcha",
       "links": [
@@ -583,7 +583,7 @@
       ],
       "status": "current",
       "title": "What has the low-rate floor experiment measured?",
-      "verified_commit": "31ae9e3a111f88006813bf31d5a9f4a28695b8f4",
+      "verified_commit": "5244d4e2534428748155b10810d5835685d1c029",
       "verified_date": "2026-11-16",
       "visibility": "public"
     },

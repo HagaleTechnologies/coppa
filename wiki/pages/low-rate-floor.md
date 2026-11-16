@@ -15,7 +15,7 @@ sources:
   - crates/coppa-host/src/websocket.rs
   - crates/coppa-daemon/src/web/index.html
 verified:
-  commit: 31ae9e3a111f88006813bf31d5a9f4a28695b8f4
+  commit: 5244d4e2534428748155b10810d5835685d1c029
   date: 2026-11-16
 links:
   - coppa-protocol
@@ -120,6 +120,14 @@ reads it to pick the reply waveform. Hosts must never see it: a frame for
 another station or a replayed handshake would move it. The host value
 (`status.phy_mode.rx`, `EventLoop::phy_mode()`) comes from `rx_reported`, which
 only an accepting session handler sets, as `Link::phy_mode()` does. Both
-clear in `notify_session` once no session is live (COP-210). The daemon still
-has no simultaneous-call tie break or discovery stagger; see
-[LIMITATIONS](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-session-integration-open).
+clear in `notify_session` once no session is live (COP-210).
+
+coppad shares Link's simultaneous-call rules through
+`floor_controller::answers_simultaneous_call` and `calling_retry_stagger`
+(COP-210). The answering daemon replaces its own Connecting session with an
+inbound one and records it in `crossed_dial`. That session is `Accepting`
+like any inbound handshake, so every CANCELPENDING decision goes through
+`host_pending()`, which excludes it: its host saw `CONNECTING`, never
+`PENDING`. A crossed call bypasses `LISTEN OFF`. See
+[LIMITATIONS](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-session-integration-open)
+for the stagger's cost.

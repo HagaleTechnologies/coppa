@@ -1133,6 +1133,13 @@ station's host gets every byte once, in order.
   The one exception is a repeat from a caller whose inbound attempt is still
   pending (it did not hear the first answer): coppad answers it again (see
   "Inbound connect attempts" below).
+  A second exception is a crossed call (COP-210): while coppad is dialing a
+  station and hears that station's `CONNECT_REQ` to it, the station whose
+  callsign sorts higher drops its own dial and answers, even with
+  `LISTEN OFF`. Its host sees no `PENDING`; it gets `CONNECTED` for its own
+  `CONNECT`, or `DISCONNECTED` if that handshake fails. In Auto the higher
+  caller waits longer between its OFDM repeats, so it hears the lower
+  station's floor request.
   A host `CONNECT` is answered `DISCONNECTED`, to the dialling host only. Send
   `DISCONNECT` to end the current session before dialling again. A session
   nobody ends blocks every caller: an idle connected session does not time
