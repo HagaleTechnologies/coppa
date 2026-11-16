@@ -13,13 +13,16 @@
 //! it). `COPPA_CHROME` names the browser binary when it is not on `PATH`.
 
 #![cfg(feature = "websocket")]
+// COP-142: the std-clock ban in clippy.toml targets event_loop only.
+#![allow(clippy::disallowed_methods)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use coppa_daemon::web::INDEX_HTML;
 use futures_util::{SinkExt, StreamExt};
@@ -35,10 +38,15 @@ const HEIGHT: f64 = 844.0;
 /// Apple's guidance, and the ticket's figure).
 const MIN_TARGET: f64 = 44.0;
 
-/// How long the browser may take to print its DevTools URL.
-const STARTUP: Duration = Duration::from_secs(30);
-/// How long any one DevTools command or awaited event may take.
-const STEP: Duration = Duration::from_secs(10);
+/// How long the browser may take to print its DevTools URL. A cold start
+/// on a loaded CI runner took longer than 30 s (COP-209). A browser that
+/// exits before it listens is reported at once, not at this deadline.
+const STARTUP: Duration = Duration::from_secs(120);
+/// How long any one DevTools command or awaited event may take. The load
+/// that slows the browser's start slows its first replies too (COP-209).
+const STEP: Duration = Duration::from_secs(60);
+/// How often the startup wait checks whether the browser has exited.
+const POLL: Duration = Duration::from_millis(100);
 /// How long the browser's helper processes may take to exit after the kill.
 const SHUTDOWN: Duration = Duration::from_secs(10);
 
@@ -495,13 +503,30 @@ struct Browser {
     stderr_closed: mpsc::Receiver<()>,
 }
 
+/// Numbers each launch, so tests running in parallel in one process never
+/// share, or remove, each other's profile directory.
+static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+
 impl Browser {
     /// Starts `binary` and returns it with its browser-level DevTools URL.
+    /// Panics if the browser exits first, or prints no URL within `STARTUP`.
     fn launch(binary: &Path) -> (Self, String) {
+<<<<<<< HEAD
         // COP-210: one profile per launch, since this file's tests run in
         // parallel in one process.
         static LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let launch = LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+=======
+        Self::start(Command::new(binary), STARTUP).unwrap_or_else(|message| panic!("{message}"))
+    }
+
+    /// Runs `command` with the headless browser flags and waits up to
+    /// `startup` for its DevTools URL. Fails at once if the process exits
+    /// first, and with the stderr it wrote either way.
+    fn start(mut command: Command, startup: Duration) -> Result<(Self, String), String> {
+        let name = Path::new(command.get_program()).display().to_string();
+        let launch = LAUNCHES.fetch_add(1, Ordering::Relaxed);
+>>>>>>> 5244d4e2534428748155b10810d5835685d1c029
         let profile = std::env::temp_dir().join(format!(
             "coppa-dashboard-touch-{}-{launch}",
             std::process::id()
@@ -510,13 +535,13 @@ impl Browser {
         // `create_dir`, not `create_dir_all`: a path that survived the
         // removal (another user's directory or symlink in a shared temp
         // dir) fails here instead of becoming the browser's profile.
-        std::fs::create_dir(&profile).unwrap_or_else(|error| {
-            panic!(
+        std::fs::create_dir(&profile).map_err(|error| {
+            format!(
                 "create the browser profile directory {}: {error}",
                 profile.display()
             )
-        });
-        let mut child = Command::new(binary)
+        })?;
+        let spawned = command
             .args([
                 "--headless=new",
                 "--no-sandbox",
@@ -528,24 +553,33 @@ impl Browser {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|error| panic!("start {}: {error}", binary.display()));
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&profile);
+                return Err(format!("start {name}: {error}"));
+            }
+        };
         let stderr = child.stderr.take().expect("the browser's stderr is piped");
         let (stderr_open, stderr_closed) = mpsc::channel::<()>();
-        let browser = Self {
+        let mut browser = Self {
             child,
             profile,
             stderr_closed,
         };
 
         // Read stderr on a thread so the wait is bounded, and keep draining
-        // it afterwards so a full pipe never stalls the browser.
-        let (sender, receiver) = mpsc::channel();
+        // it afterwards so a full pipe never stalls the browser. The thread
+        // sends the URL, or `None` at EOF without one, and keeps every line
+        // before the URL for the failure message.
+        let before = Arc::new(Mutex::new(Vec::new()));
+        let lines = Arc::clone(&before);
+        let (sender, receiver) = mpsc::channel::<Option<String>>();
         std::thread::spawn(move || {
             // Dropped when this thread ends, at EOF: see `stderr_closed`.
             let _stderr_open = stderr_open;
             let mut sent = false;
-            let mut before = Vec::new();
             let mut reader = BufReader::new(stderr);
             for line in reader.by_ref().lines() {
                 let Ok(line) = line else { break };
@@ -554,30 +588,46 @@ impl Browser {
                 }
                 match line.strip_prefix("DevTools listening on ") {
                     Some(url) => {
-                        let _ = sender.send(Ok(url.trim().to_string()));
+                        let _ = sender.send(Some(url.trim().to_string()));
                         sent = true;
                     }
-                    None => before.push(line),
+                    None => lines.lock().expect("the stderr lines").push(line),
                 }
             }
             if !sent {
-                let _ = sender.send(Err(before.join("\n")));
+                let _ = sender.send(None);
             }
             // A line that is not UTF-8 ends the loop early; read on to EOF.
             let _ = std::io::copy(&mut reader, &mut std::io::sink());
         });
-        let url = match receiver.recv_timeout(STARTUP) {
-            Ok(Ok(url)) => url,
-            Ok(Err(output)) => panic!(
-                "{} exited before DevTools listened:\n{output}",
-                binary.display()
-            ),
-            Err(_) => panic!(
-                "{} printed no DevTools URL within {STARTUP:?}",
-                binary.display()
-            ),
+
+        let deadline = Instant::now() + startup;
+        let failure = loop {
+            match receiver.recv_timeout(POLL) {
+                Ok(Some(url)) => return Ok((browser, url)),
+                Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break "exited before DevTools listened".to_string()
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            // The stderr pipe closes only once every helper process has
+            // exited too, so poll the browser process itself.
+            let exited = browser
+                .child
+                .try_wait()
+                .unwrap_or_else(|error| panic!("poll {name}: {error}"));
+            if let Some(status) = exited {
+                break format!("exited with {status} before DevTools listened");
+            }
+            if Instant::now() >= deadline {
+                break format!("printed no DevTools URL within {startup:?}");
+            }
         };
-        (browser, url)
+        // `Drop` kills the browser and waits for its stderr to close, so the
+        // message below carries every line it wrote.
+        drop(browser);
+        let output = before.lock().expect("the stderr lines").join("\n");
+        Err(format!("{name} {failure}; its stderr:\n{output}"))
     }
 }
 
@@ -712,5 +762,97 @@ impl Cdp {
                 return serde_json::from_str(text).expect("DevTools sends JSON");
             }
         }
+    }
+}
+
+/// The startup wait against fake browsers: `/bin/sh` scripts that print a
+/// DevTools URL late, exit early, or never listen, so each outcome is
+/// proven in seconds without a real browser.
+#[cfg(unix)]
+mod startup {
+    use super::*;
+
+    /// A fake browser: `/bin/sh` running `script`, with the browser flags as
+    /// `$@`. `sh -c` writes no script file, so a test thread forking at the
+    /// same moment can never make it fail with `ETXTBSY`.
+    fn fake(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script, "fake-browser"]);
+        command
+    }
+
+    #[test]
+    fn a_browser_that_listens_late_is_waited_for() {
+        let url = "ws://127.0.0.1:9/devtools/browser/fake";
+        let script = format!("sleep 2; echo 'DevTools listening on {url}' >&2; exec sleep 60");
+        let started = Instant::now();
+        let (browser, devtools_url) = Browser::start(fake(&script), Duration::from_secs(20))
+            .unwrap_or_else(|message| panic!("a browser that listens after 2 s: {message}"));
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "returned after {:?}, before the fake printed its URL",
+            started.elapsed()
+        );
+        assert_eq!(devtools_url, url);
+        let profile = browser.profile.clone();
+        assert!(
+            profile.is_dir(),
+            "the profile {} exists while the browser runs",
+            profile.display()
+        );
+        drop(browser);
+        assert!(
+            !profile.exists(),
+            "closing the browser left its profile directory {} behind",
+            profile.display()
+        );
+    }
+
+    #[test]
+    fn a_browser_that_exits_is_reported_at_once_while_a_helper_holds_stderr() {
+        // The background `sleep` keeps stderr open after the main process
+        // exits, as a Chromium helper process does.
+        let script = "echo 'fake: giving up' >&2; sleep 4 & exit 7";
+        let budget = Duration::from_secs(30);
+        let started = Instant::now();
+        let Err(message) = Browser::start(fake(script), budget) else {
+            panic!("a browser that exits 7 was reported as listening");
+        };
+        assert!(
+            started.elapsed() < budget,
+            "an exit took {:?} to report, the whole {budget:?} budget: {message}",
+            started.elapsed()
+        );
+        assert!(
+            message.contains("exited with exit status: 7"),
+            "the message names the exit status: {message}"
+        );
+        assert!(
+            message.contains("fake: giving up"),
+            "the message carries the browser's stderr: {message}"
+        );
+    }
+
+    #[test]
+    fn a_browser_that_never_listens_fails_at_the_deadline() {
+        let script = "echo 'fake: still starting' >&2; exec sleep 60";
+        let budget = Duration::from_secs(2);
+        let started = Instant::now();
+        let Err(message) = Browser::start(fake(script), budget) else {
+            panic!("a browser that never listens was reported as listening");
+        };
+        assert!(
+            started.elapsed() >= budget,
+            "failed after {:?}, before the {budget:?} deadline: {message}",
+            started.elapsed()
+        );
+        assert!(
+            message.contains("printed no DevTools URL within 2s"),
+            "the message names the deadline: {message}"
+        );
+        assert!(
+            message.contains("fake: still starting"),
+            "the message carries the browser's stderr: {message}"
+        );
     }
 }
