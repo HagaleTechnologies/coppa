@@ -20,6 +20,7 @@ Design decisions for coppa, one file per decision. Process and owner calls live 
 | [ADR-012 (COP-119)](012-cop119-session-outer-code.md) | negotiated session erasure protection | Accepted | 2026-11-06 (merge date) |  |
 | [ADR-012 (COP-128)](012-cop128-cfo-hypothesis-search.md) | Fine-stage CFO hypothesis search | Accepted | 2026-11-04 | Widens ADR-003's ±50 Hz acquisition range |
 | [ADR-013 (COP-121)](013-cop121-session-app-messages.md) | chat as a negotiated second stream inside the session ARQ | Accepted | 2026-11-08 (merge date) |  |
+| [ADR-014 (COP-190)](014-cop190-low-rate-floor.md) | COP-190 low-rate floor — air-protocol version 2 framing | Accepted | 2026-11-12 | Carries COP-202 and COP-210 amendments |
 
 The status column uses three values: `Accepted`, `Accepted, partly superseded` (a later ADR or
 an inline update replaces one claim, and the rest stands) and `Superseded by ADR-N` (the

@@ -2800,3 +2800,12 @@ established on OFDM keeps the OFDM retransmission and fade-hold path when it
 fades, and RS(12,6) block ACKs stay on OFDM. It does not
 stagger discovery by callsign, keeps the 30 s inbound handshake timeout and does
 not replay a lost CONNECT_CFM.
+
+Host waveform reporting (COP-210, informative): coppad reports the session
+waveform pair to WebSocket hosts as `status.phy_mode` and a reliable
+`phy_mode` push (`docs/HOST-API.md`). `tx` is the waveform of the last session
+frame keyed. `rx` is the waveform of the last session frame a session handler
+accepted: frames for other stations, stale ACKs and replayed handshakes leave
+it unchanged. Each is `null`, `"floor"` or `"ofdm:<level>"`, and both clear to
+`null` when the session ends. This host field is unrelated to the 4-bit PHY
+header `phy_mode` field (§4); it carries nothing on air.

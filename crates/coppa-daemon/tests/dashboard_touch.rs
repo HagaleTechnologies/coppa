@@ -142,71 +142,12 @@ const TAP_RESULT: &str = "Speed level 3: refused: not connected";
 
 #[tokio::test]
 async fn every_dashboard_control_is_a_44px_touch_target_at_390px() {
-    let Some(binary) = find_browser() else {
-        let required = std::env::var("COPPA_REQUIRE_BROWSER").is_ok_and(|value| value == "1");
-        assert!(
-            !required,
-            "COPPA_REQUIRE_BROWSER=1 but no browser was found: set COPPA_CHROME to a Chrome or \
-             Chromium binary, or put one of {BROWSERS:?} on PATH"
-        );
-        eprintln!(
-            "skipping dashboard_touch: no Chrome or Chromium found (set COPPA_CHROME to a browser \
-             binary, or COPPA_REQUIRE_BROWSER=1 to fail instead of skipping)"
-        );
+    let Some(binary) = browser_or_skip() else {
         return;
     };
 
-    let url = serve_page();
-    let (browser, devtools_url) = Browser::launch(&binary);
-    let mut cdp = Cdp::connect(&devtools_url).await;
-
-    let target = cdp
-        .call(None, "Target.createTarget", json!({ "url": "about:blank" }))
-        .await;
-    let target_id = target["targetId"]
-        .as_str()
-        .expect("Target.createTarget returns a targetId")
-        .to_string();
-    let attached = cdp
-        .call(
-            None,
-            "Target.attachToTarget",
-            json!({ "targetId": target_id, "flatten": true }),
-        )
-        .await;
-    let session = attached["sessionId"]
-        .as_str()
-        .expect("Target.attachToTarget returns a sessionId")
-        .to_string();
+    let (browser, mut cdp, session) = open_dashboard(&binary).await;
     let session = Some(session.as_str());
-
-    cdp.call(
-        session,
-        "Emulation.setDeviceMetricsOverride",
-        json!({ "width": WIDTH, "height": HEIGHT, "deviceScaleFactor": 3, "mobile": true }),
-    )
-    .await;
-    cdp.call(
-        session,
-        "Emulation.setTouchEmulationEnabled",
-        json!({ "enabled": true, "maxTouchPoints": 5 }),
-    )
-    .await;
-    cdp.call(session, "Page.enable", json!({})).await;
-    cdp.events.clear();
-    let navigated = cdp
-        .call(session, "Page.navigate", json!({ "url": url }))
-        .await;
-    assert!(
-        navigated.get("errorText").is_none(),
-        "Page.navigate to {url} failed: {navigated}"
-    );
-    cdp.wait_event(session, "Page.loadEventFired").await;
-    let ready = format!(
-        "document.readyState === \"complete\" && location.href === {} && typeof handle === \"function\"",
-        json!(url)
-    );
-    cdp.wait_until(session, &ready).await;
 
     let measured = cdp.evaluate(session, MEASURE).await;
     let states = measured
@@ -235,6 +176,138 @@ async fn every_dashboard_control_is_a_44px_touch_target_at_390px() {
         !profile.exists(),
         "closing the browser left its profile directory {} behind",
         profile.display()
+    );
+}
+
+/// Launches the browser, opens the served page in a 390 px mobile tab with
+/// touch emulation, and waits until the page's `handle()` exists. Returns the
+/// browser, the DevTools connection and the tab's session id.
+async fn open_dashboard(binary: &Path) -> (Browser, Cdp, String) {
+    let url = serve_page();
+    let (browser, devtools_url) = Browser::launch(binary);
+    let mut cdp = Cdp::connect(&devtools_url).await;
+
+    let target = cdp
+        .call(None, "Target.createTarget", json!({ "url": "about:blank" }))
+        .await;
+    let target_id = target["targetId"]
+        .as_str()
+        .expect("Target.createTarget returns a targetId")
+        .to_string();
+    let attached = cdp
+        .call(
+            None,
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+        )
+        .await;
+    let session_id = attached["sessionId"]
+        .as_str()
+        .expect("Target.attachToTarget returns a sessionId")
+        .to_string();
+    let session = Some(session_id.as_str());
+
+    cdp.call(
+        session,
+        "Emulation.setDeviceMetricsOverride",
+        json!({ "width": WIDTH, "height": HEIGHT, "deviceScaleFactor": 3, "mobile": true }),
+    )
+    .await;
+    cdp.call(
+        session,
+        "Emulation.setTouchEmulationEnabled",
+        json!({ "enabled": true, "maxTouchPoints": 5 }),
+    )
+    .await;
+    cdp.call(session, "Page.enable", json!({})).await;
+    cdp.events.clear();
+    let navigated = cdp
+        .call(session, "Page.navigate", json!({ "url": url }))
+        .await;
+    assert!(
+        navigated.get("errorText").is_none(),
+        "Page.navigate to {url} failed: {navigated}"
+    );
+    cdp.wait_event(session, "Page.loadEventFired").await;
+    let ready = format!(
+        "document.readyState === \"complete\" && location.href === {} && typeof handle === \"function\"",
+        json!(url)
+    );
+    cdp.wait_until(session, &ready).await;
+    (browser, cdp, session_id)
+}
+
+/// The browser to drive, or `None` (after saying why) when none is found and
+/// `COPPA_REQUIRE_BROWSER=1` is not set.
+fn browser_or_skip() -> Option<PathBuf> {
+    let binary = find_browser();
+    if binary.is_none() {
+        let required = std::env::var("COPPA_REQUIRE_BROWSER").is_ok_and(|value| value == "1");
+        assert!(
+            !required,
+            "COPPA_REQUIRE_BROWSER=1 but no browser was found: set COPPA_CHROME to a Chrome or \
+             Chromium binary, or put one of {BROWSERS:?} on PATH"
+        );
+        eprintln!(
+            "skipping dashboard_touch: no Chrome or Chromium found (set COPPA_CHROME to a browser \
+             binary, or COPPA_REQUIRE_BROWSER=1 to fail instead of skipping)"
+        );
+    }
+    binary
+}
+
+/// COP-210: plays `hello`, a `status` with `phy_mode`, then `speed_level` and
+/// `phy_mode` pushes through the page's `handle()`, a socket loss
+/// (`resetLive()`), and a `status` from a daemon without `phy_mode`, and
+/// returns the Speed level card's two lines after each step.
+const WAVEFORM_STEPS: &str = r##"(() => {
+  const lines = () => [
+    document.getElementById("tx-level").textContent,
+    document.getElementById("rx-level").textContent,
+  ];
+  const levels = [1, 2, 3, 4, 5, 6, 7, 8];
+  const steps = [];
+  handle({ type: "hello", version: 1 });
+  handle({ type: "status", speed_levels: levels, speed_level: 2, speed_level_mode: "auto",
+           level: 2, phy_mode: { tx: "floor", rx: "floor" } });
+  steps.push(lines());
+  handle({ type: "speed_level", level: 2, mode: "manual" });
+  steps.push(lines());
+  handle({ type: "phy_mode", tx: "ofdm:2", rx: "ofdm:2" });
+  steps.push(lines());
+  handle({ type: "speed_level", level: 2, mode: "auto" });
+  handle({ type: "phy_mode", tx: null, rx: null });
+  steps.push(lines());
+  handle({ type: "phy_mode", tx: "floor", rx: null });
+  steps.push(lines());
+  resetLive();
+  handle({ type: "status", speed_levels: levels, speed_level: 3, speed_level_mode: "auto", level: 3 });
+  steps.push(lines());
+  return steps;
+})()"##;
+
+/// COP-210 AC8: the Speed level card names the floor while the session is
+/// on it, shows the pinned level after a numbered selection, and falls back
+/// to the integer text when `phy_mode` is null or absent.
+#[tokio::test]
+async fn speed_card_shows_the_active_waveform() {
+    let Some(binary) = browser_or_skip() else {
+        return;
+    };
+    let (browser, mut cdp, session) = open_dashboard(&binary).await;
+    let steps = cdp.evaluate(Some(session.as_str()), WAVEFORM_STEPS).await;
+    drop(browser);
+    assert_eq!(
+        steps,
+        json!([
+            ["TX floor · auto", "RX floor (last decoded frame)"],
+            ["TX 2 · manual", "RX floor (last decoded frame)"],
+            ["TX 2 · manual", "RX 2 (last decoded frame)"],
+            ["TX 2 · auto", "RX 2 (last decoded frame)"],
+            ["TX floor · auto", "RX 2 (last decoded frame)"],
+            ["TX 3 · auto", "RX 3 (last decoded frame)"],
+        ]),
+        "the Speed level card's TX and RX lines after each step"
     );
 }
 
@@ -425,8 +498,14 @@ struct Browser {
 impl Browser {
     /// Starts `binary` and returns it with its browser-level DevTools URL.
     fn launch(binary: &Path) -> (Self, String) {
-        let profile =
-            std::env::temp_dir().join(format!("coppa-dashboard-touch-{}", std::process::id()));
+        // COP-210: one profile per launch, since this file's tests run in
+        // parallel in one process.
+        static LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let launch = LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let profile = std::env::temp_dir().join(format!(
+            "coppa-dashboard-touch-{}-{launch}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&profile);
         // `create_dir`, not `create_dir_all`: a path that survived the
         // removal (another user's directory or symlink in a shared temp
