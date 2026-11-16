@@ -494,6 +494,7 @@ dependencies = [
  "coppa-audio",
  "coppa-channel",
  "coppa-codec",
+ "coppa-engine",
  "coppa-ml",
  "coppa-protocol",
  "crc",

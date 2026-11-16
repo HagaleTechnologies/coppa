@@ -112,6 +112,11 @@ docs/superpowers/
 !/results/cop-187/dev-cfo-plus150-poor/
 !/results/cop-187/dev-cfo-plus150-poor/metadata.txt
 !/results/cop-187/dev-cfo-plus150-poor/sweep.csv
+# COP-170 published comparison data, audited by compare_results.rs.
+!/results/compare/
+/results/compare/**
+!/results/compare/link-l2.csv
+!/results/compare/metadata.md
 # Catalyst orchestrator runtime state (worktree-local; never committed — see
 # catalyst's execution-core/worktree-safety.mjs MACHINE_LOCAL_NOISE list)
 .catalyst/.workflow-context.json
