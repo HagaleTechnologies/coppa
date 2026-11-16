@@ -1,8 +1,11 @@
 //! COP-85: SIGHUP reloads the configuration of the real `coppad` binary.
 //!
-//! Each test owns its VARA ports (picked by the OS) and its temporary
-//! directory, so the tests run in parallel. Unix only (SIGHUP), and skipped
-//! with `cpal-backend` for the same reason as `ptt_release.rs`.
+//! Each test owns its VARA ports and its temporary directory, so the tests
+//! run in parallel. coppad binds both VARA ports on port 0 and the test
+//! reads the ports it got from its log, so no other process can take one
+//! between the test choosing it and coppad binding it (COP-208). Unix only
+//! (SIGHUP), and skipped with `cpal-backend` for the same reason as
+//! `ptt_release.rs`.
 #![cfg(all(unix, not(feature = "cpal-backend")))]
 // COP-142: the std-clock ban in clippy.toml targets event_loop only.
 #![allow(clippy::disallowed_methods)]
@@ -11,7 +14,7 @@ use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 mod support;
-use support::{connect, free_ports, send_signal, Daemon};
+use support::{connect, send_signal, Daemon};
 
 const READY_DEADLINE: Duration = Duration::from_secs(30);
 const LOG_DEADLINE: Duration = Duration::from_secs(10);
@@ -21,9 +24,10 @@ const RELOADED: &str = "Configuration reloaded";
 const RELOAD_FAILED: &str =
     "Configuration reload failed; coppad keeps running on its current settings";
 
-/// A config with VARA on `ports`, no PTT, and the given extra lines in
-/// `[radio]` and `[engine]`.
-fn config(ports: (u16, u16), radio: &str, engine: &str) -> String {
+/// A config with VARA on port 0 for both ports (coppad picks and binds
+/// each one; read them with `Daemon::vara_ports`), no PTT, and the given
+/// extra lines in `[radio]` and `[engine]`.
+fn config(radio: &str, engine: &str) -> String {
     format!(
         "[radio]\n\
          ptt_method = \"none\"\n\
@@ -31,13 +35,12 @@ fn config(ports: (u16, u16), radio: &str, engine: &str) -> String {
          \n\
          [host]\n\
          vara_enabled = true\n\
-         vara_command_port = {}\n\
-         vara_data_port = {}\n\
+         vara_command_port = 0\n\
+         vara_data_port = 0\n\
          \n\
          [engine]\n\
          callsign = \"N0CALL\"\n\
-         {engine}\n",
-        ports.0, ports.1
+         {engine}\n"
     )
 }
 
@@ -85,10 +88,9 @@ fn line_with(daemon: &Daemon, needle: &str) -> String {
 
 #[test]
 fn sighup_applies_live_settings_and_coppad_keeps_running() {
-    let ports = free_ports();
-    let mut daemon = Daemon::start("reload-live", &config(ports, "", ""), READY_DEADLINE);
+    let mut daemon = Daemon::start("reload-live", &config("", ""), READY_DEADLINE);
 
-    let edited = config(ports, "ptt_tail_delay_ms = 300\nturnaround_ms = 400", "")
+    let edited = config("ptt_tail_delay_ms = 300\nturnaround_ms = 400", "")
         .replace("callsign = \"N0CALL\"", "callsign = \"N1CALL\"");
     daemon.rewrite_config(&edited);
     sighup(&daemon);
@@ -117,7 +119,7 @@ fn sighup_applies_live_settings_and_coppad_keeps_running() {
         daemon.output()
     );
     assert!(daemon.try_exit().is_none(), "{}", daemon.output());
-    assert!(version_reply(ports.0).starts_with("VERSION "));
+    assert!(version_reply(daemon.vara_ports().0).starts_with("VERSION "));
 
     send_signal("-TERM", &daemon.pid().to_string());
     let status = daemon.wait_exit(EXIT_DEADLINE);
@@ -126,10 +128,9 @@ fn sighup_applies_live_settings_and_coppad_keeps_running() {
 
 #[test]
 fn sighup_with_an_invalid_file_keeps_the_running_settings() {
-    let ports = free_ports();
-    let mut daemon = Daemon::start("reload-invalid", &config(ports, "", ""), READY_DEADLINE);
+    let mut daemon = Daemon::start("reload-invalid", &config("", ""), READY_DEADLINE);
 
-    daemon.rewrite_config(&config(ports, "", "profile = \"HF_STANDRD\""));
+    daemon.rewrite_config(&config("", "profile = \"HF_STANDRD\""));
     sighup(&daemon);
     daemon.wait_for_count(RELOAD_FAILED, 1, LOG_DEADLINE);
     assert!(
@@ -139,7 +140,7 @@ fn sighup_with_an_invalid_file_keeps_the_running_settings() {
     );
     assert!(daemon.try_exit().is_none(), "{}", daemon.output());
 
-    daemon.rewrite_config(&config(ports, "", "").replace("\"none\"", "\"bogus\""));
+    daemon.rewrite_config(&config("", "").replace("\"none\"", "\"bogus\""));
     sighup(&daemon);
     daemon.wait_for_count(RELOAD_FAILED, 2, LOG_DEADLINE);
     assert!(
@@ -149,7 +150,7 @@ fn sighup_with_an_invalid_file_keeps_the_running_settings() {
     );
     assert!(daemon.try_exit().is_none(), "{}", daemon.output());
 
-    daemon.rewrite_config(&config(ports, "ptt_tail_delay_ms = 250", ""));
+    daemon.rewrite_config(&config("ptt_tail_delay_ms = 250", ""));
     sighup(&daemon);
     daemon.wait_for_log(&format!("{RELOADED} applied="), LOG_DEADLINE);
     assert!(
@@ -157,19 +158,17 @@ fn sighup_with_an_invalid_file_keeps_the_running_settings() {
         "{}",
         daemon.output()
     );
-    assert!(version_reply(ports.0).starts_with("VERSION "));
+    assert!(version_reply(daemon.vara_ports().0).starts_with("VERSION "));
 }
 
 #[test]
 fn sighup_names_restart_only_changes_and_keeps_the_old_listener() {
-    let ports = free_ports();
-    let mut daemon = Daemon::start("reload-restart", &config(ports, "", ""), READY_DEADLINE);
+    let mut daemon = Daemon::start("reload-restart", &config("", ""), READY_DEADLINE);
 
-    let (other, _) = free_ports();
-    let moved = config(ports, "", "").replace(
-        &format!("vara_command_port = {}", ports.0),
-        &format!("vara_command_port = {other}"),
-    );
+    // coppad never binds 8310 here, whether or not another process holds it:
+    // a restart-only change keeps the old listener, so the number only has
+    // to differ from the running value.
+    let moved = config("", "").replace("vara_command_port = 0", "vara_command_port = 8310");
     daemon.rewrite_config(&moved);
     sighup(&daemon);
     let warning = "Configuration reload kept the running values of settings that change only \
@@ -181,13 +180,12 @@ fn sighup_names_restart_only_changes_and_keeps_the_old_listener() {
         line.contains("restart_required=[host] vara_command_port"),
         "{line}"
     );
-    assert!(version_reply(ports.0).starts_with("VERSION "));
+    assert!(version_reply(daemon.vara_ports().0).starts_with("VERSION "));
 }
 
 #[test]
 fn sighup_with_an_unchanged_file_reports_no_changes() {
-    let ports = free_ports();
-    let mut daemon = Daemon::start("reload-same", &config(ports, "", ""), READY_DEADLINE);
+    let mut daemon = Daemon::start("reload-same", &config("", ""), READY_DEADLINE);
 
     let unchanged = format!("{RELOADED}; no settings changed");
     sighup(&daemon);
@@ -201,8 +199,7 @@ fn sighup_with_an_unchanged_file_reports_no_changes() {
 /// kill the daemon either; the orderly stop still exits 0.
 #[test]
 fn sighup_during_shutdown_is_ignored() {
-    let ports = free_ports();
-    let mut daemon = Daemon::start("reload-stop", &config(ports, "", ""), READY_DEADLINE);
+    let mut daemon = Daemon::start("reload-stop", &config("", ""), READY_DEADLINE);
     send_signal("-TERM", &daemon.pid().to_string());
     sighup(&daemon);
     let status = daemon.wait_exit(EXIT_DEADLINE);
