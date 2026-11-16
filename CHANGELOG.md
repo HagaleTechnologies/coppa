@@ -16,13 +16,22 @@ Older releases have no entry here. Their on-air breaks are listed in
 
 ## Unreleased: 0.16.0
 
+- Add `coppa-bench compare channel-check` (COP-214). It measures the three
+  Watterson presets through `PersistentChannel` at 48 kHz and records delay,
+  path-power balance, Doppler spread and 3 kHz noise-reference error in
+  `results/compare/channel-check.csv`.
+- Add `coppa-bench compare blackbox` (COP-214) on Linux with the
+  `cpal-backend` feature. It drives two unmodified modem processes through an
+  ALSA FIFO cable and rejects a failed 10 s signal integrity probe before
+  writing trials. The published CSV holds coppad self-test trials only.
+
 - Add `coppa-bench compare` (COP-170): runs coppa's library `Link` through
   the WGN, MPG and MPP channels at the 2020 Winlink comparison's SNR grid for
   2 KB and 16 KB transfers, records each trial in a resumable, seed-reproducible
   CSV, and renders `docs/benchmarks/comparison.md`: mean net bytes/min with a
   95% interval, completed/n and a replay command per cell. `compare --check`
-  reports a stale page. Coppa rows only; all 42 cells are recorded (COP-215),
-  and the black-box harness for other modems and the channel cross-check follow.
+  reports a stale page. Coppa rows only; all 42 cells are recorded (COP-215).
+  COP-214 adds the black-box harness and the channel cross-check.
 - coppad's rate loop and `RateLoop::default_coppa()` now step up after one higher
   recommendation instead of five (COP-183). On the simulated closed-loop bench this
   lifts standard-profile adaptive goodput past the best fixed level; adaptive/oracle

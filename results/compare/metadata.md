@@ -52,6 +52,36 @@ Total wall time for the 168 2 KB trials: about 15 minutes on a 6-CPU cgroup quot
 re-ran WGN 0 dB, WGN 30 dB and MPG 20 dB 2 KB trial 0, and MPP 20 dB 16 KB
 trial 0 (COP-215), and matched the committed rows byte for byte.
 
+## COP-214 channel cross-check
+
+Built with `cargo build --release -p coppa-bench`, then ran
+`target/release/coppa-bench compare channel-check` on Linux x86_64 with
+rustc 1.98.0. It wrote `channel-check.csv` at 48 kHz. The three preset rows
+use seeds `0x17f00000` through `0x17f00002`. All measured parameters met
+their stated tolerances. Run
+`target/release/coppa-bench compare --channel wgn --size 16384` to render
+the page from the CSV without adding a link trial.
+
+The Linux black-box command is
+`target/release/coppa-bench compare blackbox --modem tools/compare/coppad.toml`.
+Build it with `cargo build --release -p coppa-bench --features cpal-backend`
+and build the daemon with
+`cargo build --release -p coppa-daemon --bin coppad --features cpal-backend,ardop,kiss-tnc`.
+The command defaults to a single WGN 30 dB 2 KB smoke trial and writes under
+`target/compare-foreign/coppad/` unless `--out-dir` is set.
+
+The published coppad self-test was recorded with release builds on Linux
+x86_64 using the two-CPU container quota. Both runs used `--trials 3` and
+`--jobs 3`. WGN 30 dB, 2048 bytes wrote to `results/compare`; MPG 20 dB,
+2048 bytes wrote to a separate scratch directory so its lines could be checked
+before appending them to `blackbox-coppad.csv`. The 10 s integrity probe
+measured correlation 1.000000, level error +0.00 dB and 355 ms lead; it
+counted no starved or overflow tick. A noiseless 40-byte link exchange in
+both directions measured active TX reference powers of 0.022691 and
+0.020689. All six trial rows completed exactly. Parallel scheduling affected
+the WGN throughput, so these are real-time self-test numbers, not
+bit-reproducible link rows.
+
 ## Public sources
 
 - The channel names (WGN, MPG, MPP) and the SNR grid (30 to 0 dB in 5 dB

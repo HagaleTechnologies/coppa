@@ -197,7 +197,89 @@ pub fn render_cell_tables(rows: &[RowSpec], trials: &[TrialRow], version: &str) 
 }
 
 /// Names of the generated regions of the page, in page order.
-pub const REGIONS: [&str; 2] = ["tables", "replay"];
+pub const REGIONS: [&str; 4] = ["tables", "replay", "blackbox-selftest", "channel-check"];
+
+/// Render separately recorded black-box and channel measurements. Missing
+/// recordings are explicit rather than silently filled with model settings.
+pub fn data_regions(out_dir: &std::path::Path) -> Vec<(&'static str, String)> {
+    let blackbox = std::fs::read_to_string(out_dir.join("blackbox-coppad.csv"))
+        .ok()
+        .filter(|csv| csv.lines().count() > 1)
+        .map_or_else(
+            || "Not recorded yet.".to_string(),
+            |csv| render_blackbox(&csv),
+        );
+    let channel = super::channel_check::read_csv(&out_dir.join("channel-check.csv"))
+        .ok()
+        .filter(|rows| !rows.is_empty())
+        .map_or_else(
+            || "Not recorded yet.".to_string(),
+            |rows| super::channel_check::table(&rows).trim_end().to_string(),
+        );
+    vec![("blackbox-selftest", blackbox), ("channel-check", channel)]
+}
+
+fn render_blackbox(csv: &str) -> String {
+    let mut cells: std::collections::BTreeMap<(Channel, i32, usize), Vec<Vec<&str>>> =
+        std::collections::BTreeMap::new();
+    for row in csv.lines().skip(1) {
+        let fields: Vec<_> = row.split(',').collect();
+        if fields.len() < 24 || fields[0] != "coppad" || !fields[2].starts_with("VERSION Coppa") {
+            continue;
+        }
+        if let (Some(channel), Ok(snr), Ok(size)) = (
+            Channel::parse(fields[5]),
+            fields[6].parse(),
+            fields[7].parse(),
+        ) {
+            cells.entry((channel, snr, size)).or_default().push(fields);
+        }
+    }
+    if cells.is_empty() {
+        return "Not recorded yet.".to_string();
+    }
+    let mut out = String::from("| Modem | Cell | n | completed | net B/min, mean (95% interval) | median connect | median wall | drops | cable lead | starved / overflow ticks |\n|---|---|---|---|---|---|---|---|---|---|\n");
+    for ((channel, snr, size), rows) in cells {
+        let n = rows.len();
+        let complete = rows.iter().filter(|r| r[13] == "complete").count();
+        let drops = rows.iter().filter(|r| r[13] == "drop").count();
+        let rates: Vec<f64> = rows.iter().map(|r| r[18].parse().unwrap_or(0.0)).collect();
+        let ci = t_interval(&rates).expect("nonempty cell");
+        let hi = if ci.hi.is_finite() {
+            format!("{:.0}", ci.hi)
+        } else {
+            "inf".into()
+        };
+        let connect_times: Vec<f64> = rows.iter().filter_map(|r| r[14].parse().ok()).collect();
+        let connect_text = if connect_times.is_empty() {
+            "-".to_string()
+        } else {
+            format!("{:.1} s", median(connect_times))
+        };
+        let wall = median(rows.iter().filter_map(|r| r[20].parse().ok()).collect());
+        let lead = median(rows.iter().filter_map(|r| r[21].parse().ok()).collect());
+        let starved: u64 = rows.iter().filter_map(|r| r[22].parse::<u64>().ok()).sum();
+        let overflow: u64 = rows.iter().filter_map(|r| r[23].parse::<u64>().ok()).sum();
+        let version = rows[0][2].trim_start_matches("VERSION Coppa ");
+        let mode = rows[0][4];
+        let size = size_label(size);
+        let _ = writeln!(out, "| coppad {version}, VARA-style host, {mode} | {}, {} dB, {} | {n} | {complete}/{n} | {:.0} ({:.0}-{hi}) | {connect_text} | {:.1} s | {drops} | {:.0} ms | {starved} / {overflow} |", channel.name().to_uppercase(), snr, size, ci.mean, ci.lo, wall, lead);
+    }
+    out.trim_end().to_string()
+}
+
+fn median(mut values: Vec<f64>) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    }
+}
 
 fn begin_marker(name: &str) -> String {
     format!("<!-- compare:begin {name} -->")
@@ -307,6 +389,61 @@ mod tests {
     use super::*;
     use crate::compare::link_stack::row_spec;
     use crate::compare::trial::tests::sample_row;
+
+    #[test]
+    fn four_regions_in_page_order() {
+        assert_eq!(
+            REGIONS,
+            ["tables", "replay", "blackbox-selftest", "channel-check"]
+        );
+        let page = skeleton();
+        let mut last = 0;
+        for region in REGIONS {
+            let pos = page.find(&begin_marker(region)).unwrap();
+            assert!(pos >= last);
+            last = pos;
+        }
+    }
+
+    #[test]
+    fn missing_data_renders_the_empty_state() {
+        let dir = std::env::temp_dir().join(format!("coppa-render-empty-{}", std::process::id()));
+        let rendered = data_regions(&dir);
+        assert_eq!(rendered[0].1, "Not recorded yet.");
+        assert_eq!(rendered[1].1, "Not recorded yet.");
+    }
+
+    #[test]
+    fn blackbox_region_has_one_row_per_cell() {
+        let header = "modem,adapter,version_reply,binary_sha256,mode,channel,snr_db,size_bytes,trial,seed,ref_power_a,ref_power_b,cap_s,outcome,connect_s,delivered_bytes,exact,transfer_s,net_bytes_per_min,drops,wall_s,cable_latency_ms,starved_ticks,overflow_ticks\n";
+        let row = "coppad,vara,VERSION Coppa 0.16.0,abc,HF_STANDARD,wgn,30,2048,0,0x17000000,1,1,600,complete,7,2048,true,50,2457,0,58,370,0,0\n";
+        let text = render_blackbox(&format!("{header}{row}{row}"));
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("| coppad "))
+                .count(),
+            1
+        );
+        assert!(text.contains("2/2"));
+    }
+
+    #[test]
+    fn channel_csv_change_makes_page_stale() {
+        let dir = std::env::temp_dir().join(format!("coppa-render-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = render_page(&skeleton(), &data_regions(&dir)).unwrap();
+        let csv = format!(
+            "{}\ngood,48000,0x17f00000,600,1200,0.500,0.500,0.0,0.100,0.100,0.0,true\n",
+            super::super::channel_check::HEADER
+        );
+        std::fs::write(dir.join("channel-check.csv"), csv).unwrap();
+        let expected = render_page(&page, &data_regions(&dir)).unwrap();
+        assert_eq!(
+            first_difference(&page, &expected).unwrap().1,
+            "region \"channel-check\""
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn six_tables_with_seven_snr_columns() {
