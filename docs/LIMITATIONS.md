@@ -383,10 +383,16 @@ update. **UPDATE (2026-11-16, COP-183): re-measured on main; one controller cand
   carries data, ACKs, keepalives and DISCONNECT through the controller:
   floor-sized segments with no outer code while it is on the floor or
   probing, the floor RTO floor, and one level-1 OFDM probe after five
-  acknowledged floor segments. Still open for the daemon: a session
-  established on OFDM keeps the COP-68 retransmit and fade-hold path when it
-  fades and does not move to the floor mid-session; RS(12,6) block ACKs stay
-  on OFDM; no `phy_mode` host reporting (COP-210), so the dashboard shows the OFDM level
+  acknowledged floor segments. Two unanswered data windows move a
+  floor-negotiated session to the floor mid-session (COP-211), but only an
+  in-flight segment whose frame fits one floor frame and carries no outer code
+  is resent there. Still open for the daemon: an OFDM-sized or RS(12,6)
+  outer-coded segment keeps the COP-68 retransmit and fade-hold path,
+  so a session that fades with one in flight ends 180 s after the hold starts
+  without peer evidence (measured after a successful probe for a 273-byte
+  frame and an 8-byte outer-coded segment; COP-222). A session that moves to
+  the floor mid-session keeps its 30 s keepalive interval; RS(12,6) block ACKs
+  stay on OFDM; no `phy_mode` host reporting (COP-210), so the dashboard shows the OFDM level
   while the floor is in use; no lost-CONNECT_CFM replay; no
   simultaneous-call tie break or discovery stagger. With a turnaround above
   about 5.5 s, the last floor request's reply window and the inbound floor

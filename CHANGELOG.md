@@ -40,6 +40,11 @@ Older releases have no entry here. Their on-air breaks are listed in
   A session established on the floor sends floor-sized data segments on it,
   probes OFDM level 1 after five acknowledged floor segments, and keys its
   ACKs, keepalives and DISCONNECT through the same controller.
+- A coppad session that negotiated the floor returns to it after two unanswered
+  data windows, as the library Link does, including after a successful OFDM
+  probe (COP-211). Before, only a lost probe could return it, so a session
+  whose probe succeeded during a signal peak ended in the COP-68 fade hold
+  when the signal fell back.
 - An unset VARA `RETRIES` now means 3 additional connect requests while the
   speed level is automatic (none with a pinned level). An explicit
   `RETRIES n` is honoured exactly.

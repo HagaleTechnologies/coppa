@@ -3941,11 +3941,11 @@ impl EventLoop {
             return;
         };
         let seqs = link.tx.get_retransmits(now);
-        // COP-202: one expired response window per retransmit pass, fed to
-        // the shared controller before it picks the retransmission's
-        // waveform. A lost probe returns a floor session to the floor. Data
-        // windows never start the floor: a session established on OFDM keeps
-        // the COP-68 fade hold when it fades.
+        // COP-202, COP-211: one expired response window per retransmit
+        // pass, fed to the shared controller before it picks the
+        // retransmission's waveform. As in Link, two unanswered windows
+        // return a floor-negotiated session to the floor (also after a
+        // successful probe), and a lost probe returns it at once.
         let expired = !seqs.is_empty();
         let link = &*link;
         let frames: Vec<(u8, Vec<u8>)> = seqs
@@ -3957,7 +3957,7 @@ impl EventLoop {
             })
             .collect();
         if expired {
-            self.floor.timeout(false);
+            self.floor.timeout(floor_negotiated && self.floor_enabled());
         }
         for (seq, frame) in frames {
             let attempt = self
@@ -11132,6 +11132,26 @@ mod tests {
         (a, b, a_consumer, b_consumer)
     }
 
+    /// COP-211: pin both speed levels before the handshake so these COP-68
+    /// tests exercise an OFDM session with no negotiated floor.
+    async fn connected_ofdm_pair(
+        turnaround_ms: u64,
+    ) -> (
+        EventLoop,
+        EventLoop,
+        coppa_audio::AudioRingConsumer,
+        coppa_audio::AudioRingConsumer,
+    ) {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) =
+            unconnected_pair(turnaround_ms, |_| {}, |_| {});
+        for station in [&mut a, &mut b] {
+            station.manual_speed_level = Some(station.engine.speed_level());
+        }
+        handshake_pair(&mut a, &mut b, &mut a_consumer, &mut b_consumer).await;
+        assert!(!a.session_floor_negotiated() && !b.session_floor_negotiated());
+        (a, b, a_consumer, b_consumer)
+    }
+
     /// Two listening stations, VK3ABC (`a`) and W1AW (`b`), each with an
     /// audio sink, before any session.
     fn unconnected_pair(
@@ -11696,7 +11716,7 @@ mod tests {
     /// after exhaustion.)
     #[tokio::test]
     async fn exhausted_session_link_sends_disconnect_and_reports_disconnected() {
-        let (mut a, mut b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, mut b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         let mut status_rx = vara_lines(&mut a);
         let mut b_status_rx = vara_lines(&mut b);
         fast_session_rto(&mut a);
@@ -11762,7 +11782,7 @@ mod tests {
     /// the no-evidence bound once the peer goes quiet.
     #[tokio::test]
     async fn session_link_holds_while_peer_still_decodable_and_fails_after_quiet() {
-        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         let mut status_rx = vara_lines(&mut a);
         fast_session_rto(&mut a);
         a.handle_host_event(HostEvent::DataReceived {
@@ -11832,7 +11852,7 @@ mod tests {
     /// hold and restores the standard budget.
     #[tokio::test]
     async fn fade_hold_retransmits_at_fittest_level_and_recovers() {
-        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
         a.handle_host_event(HostEvent::DataReceived {
             client_id: 1,
@@ -11885,13 +11905,54 @@ mod tests {
         assert_eq!(a.buffered_tx_bytes(), 0);
     }
 
+    /// COP-211: two expired data windows return a floor-negotiated session
+    /// to the floor even after its level-1 probe succeeded.
+    #[tokio::test]
+    async fn post_probe_window_expiry_returns_to_the_floor() {
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        assert!(
+            a.session_floor_negotiated(),
+            "both stations advertise bit 6"
+        );
+        a.floor.received(LinkPhyMode::Floor);
+        for seq in 0..5 {
+            a.floor.prepare_data(seq);
+            a.floor.acknowledged(seq, LinkPhyMode::Floor);
+        }
+        a.floor.prepare_data(5);
+        a.floor.acknowledged(5, LinkPhyMode::Ofdm { level: 1 });
+        assert!(!a.floor.floor_active(), "the probe succeeded");
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"tiny".to_vec(),
+        })
+        .await;
+        read_all(&mut a_consumer);
+        let mut modes = Vec::new();
+        for _ in 0..2 {
+            a.handle_ptt_change(false).await;
+            sleep_past_session_rto(&a);
+            a.check_session_retransmits().await;
+            read_all(&mut a_consumer);
+            modes.push(a.phy_tx);
+        }
+        assert_eq!(
+            modes,
+            vec![
+                Some(LinkPhyMode::Ofdm { level: 2 }),
+                Some(LinkPhyMode::Floor)
+            ]
+        );
+    }
+
     /// COP-68: a segment whose encoded frame exceeds level 2's 117-byte
     /// budget has no lower level to drop to -- the honest "nothing lower
     /// fits" branch: the link still holds (no teardown at the old death
     /// point) and retransmits at the current level.
     #[tokio::test]
     async fn oversized_segment_holds_at_current_level() {
-        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
         // COP-110: one codeword per frame, so the 120 B segment stays a
         // 1-codeword frame too big for any lower level (with 2 codewords,
@@ -11944,7 +12005,7 @@ mod tests {
     /// bounded after the refreshed bound with no further evidence.
     #[tokio::test]
     async fn header_only_decode_counts_as_evidence() {
-        let (mut a, b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
         a.handle_host_event(HostEvent::DataReceived {
             client_id: 1,
@@ -12029,7 +12090,7 @@ mod tests {
     /// robust-level frame ever went out.
     #[tokio::test]
     async fn fade_hold_no_evidence_bound_starts_at_hold_entry() {
-        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
         a.handle_host_event(HostEvent::DataReceived {
             client_id: 1,
@@ -12094,7 +12155,7 @@ mod tests {
     /// field to 0 in release.
     #[tokio::test]
     async fn fade_hold_attempt_calculation_saturates_past_u8_max() {
-        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
         a.handle_host_event(HostEvent::DataReceived {
             client_id: 1,

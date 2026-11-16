@@ -2795,8 +2795,12 @@ ACKs, keepalives and DISCONNECT then follow the same controller: while it is on
 the floor or probing, a data segment is cut so its MAC PDU fits one floor frame
 and its encoded payload fits one level-1 codeword, with no outer code, and a
 floor key-up's retransmission timeout is at least the floor RTO floor plus the
-station-ID allowance. Only a lost probe returns a session to the floor: a session
-established on OFDM keeps the OFDM retransmission and fade-hold path when it
-fades, and RS(12,6) block ACKs stay on OFDM. It does not
+station-ID allowance. Two unanswered data windows return a floor-negotiated
+session to the floor, also after a successful probe or when it was established
+on OFDM. A lost probe returns it at once (COP-211). Only a segment whose frame
+fits one floor
+frame and carries no outer code is retransmitted there. An in-flight segment
+cut at OFDM size, or sent as an RS(12,6) outer block, keeps the OFDM
+retransmission and fade-hold path, and RS(12,6) block ACKs stay on OFDM. It does not
 stagger discovery by callsign, keeps the 30 s inbound handshake timeout and does
 not replay a lost CONNECT_CFM.
