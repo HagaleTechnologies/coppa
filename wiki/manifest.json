@@ -466,7 +466,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:1310fd27302f68df34fbd91fe181e0759953074f6d6e16d1286c89ee706a948e",
+      "hash": "sha256:4eede69da1386af49448b44015b7857cbc4abb6bafc3f59b9f0aad92561e9733",
       "id": "daemon-test-ports",
       "kind": "gotcha",
       "links": [
@@ -478,13 +478,15 @@
       "sources": [
         "crates/coppa-daemon/tests/support/mod.rs",
         "crates/coppa-daemon/tests/runtime_smoke.rs",
+        "crates/coppa-daemon/tests/ptt_release.rs",
+        "crates/coppa-daemon/tests/reload.rs",
         "crates/coppa-daemon/tests/cli.rs",
         "crates/coppa-daemon/src/vara_wiring.rs"
       ],
       "status": "current",
       "title": "What will bite you when a test hands coppad a port?",
-      "verified_commit": "2662e93",
-      "verified_date": "2026-11-09",
+      "verified_commit": "06a2987",
+      "verified_date": "2026-11-16",
       "visibility": "public"
     },
     {

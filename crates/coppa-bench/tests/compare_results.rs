@@ -7,7 +7,13 @@ use std::path::{Path, PathBuf};
 
 use coppa_bench::compare::grid::{cells, Channel, SEED_BASE, SIZES, SNRS_DB};
 use coppa_bench::compare::link_stack::row_spec;
+<<<<<<< HEAD
 use coppa_bench::compare::render::{first_difference, recorded_version, regions, render_page};
+=======
+use coppa_bench::compare::render::{
+    anchor, first_difference, recorded_version, regions, render_page,
+};
+>>>>>>> 7588b50f436da90bbd02106ba7582928c4d6e4d3
 use coppa_bench::compare::trial::{read_csv, Outcome, HEADER};
 use coppa_bench::compare::{default_out_dir, default_page, repo_root};
 
@@ -51,11 +57,14 @@ fn rendering_the_committed_data_is_a_no_op() {
     assert_eq!(page, expected);
 }
 
+<<<<<<< HEAD
 /// Channels whose seven 16 KB cells are recorded. The rest of the 16 KB
 /// column is open; when it is recorded, this lists all three channels and the
 /// audit covers all 42 cells.
 const RECORDED_16K: &[Channel] = &[Channel::Wgn];
 
+=======
+>>>>>>> 7588b50f436da90bbd02106ba7582928c4d6e4d3
 #[test]
 fn published_trials_follow_the_grid() {
     let text = read(&published_csv());
@@ -79,9 +88,15 @@ fn published_trials_follow_the_grid() {
         assert!(t.exact, "inexact delivery: {}", t.to_line());
         assert!(t.trial < 8, "{}", t.to_line());
     }
+<<<<<<< HEAD
     // A recorded cell holds exactly trials 0-7. Every 2 KB cell and every
     // 16 KB cell on RECORDED_16K is recorded; the other 16 KB cells are open
     // (see the page's Status) and hold no trial.
+=======
+    // Every one of the 42 cells (3 channels x 7 SNRs x 2 sizes) holds exactly
+    // trials 0-7 (COP-215 recorded the last 16 KB cells), so the bare
+    // `compare` has no trial left to run.
+>>>>>>> 7588b50f436da90bbd02106ba7582928c4d6e4d3
     for cell in &grid {
         let mut idx: Vec<usize> = trials
             .iter()
@@ -93,6 +108,7 @@ fn published_trials_follow_the_grid() {
             .map(|t| t.trial)
             .collect();
         idx.sort_unstable();
+<<<<<<< HEAD
         let required = cell.size_bytes == 2048 || RECORDED_16K.contains(&cell.channel);
         if required {
             assert_eq!(idx, (0..8).collect::<Vec<_>>(), "{cell:?}");
@@ -102,6 +118,15 @@ fn published_trials_follow_the_grid() {
     }
     let recorded_cells = SNRS_DB.len() * (Channel::ALL.len() + RECORDED_16K.len());
     assert_eq!(trials.len(), recorded_cells * 8);
+=======
+        assert_eq!(idx, (0..8).collect::<Vec<_>>(), "{cell:?}");
+    }
+    assert_eq!(grid.len(), SNRS_DB.len() * Channel::ALL.len() * SIZES.len());
+    assert_eq!(
+        trials.len(),
+        SNRS_DB.len() * Channel::ALL.len() * SIZES.len() * 8
+    );
+>>>>>>> 7588b50f436da90bbd02106ba7582928c4d6e4d3
     // The file is sorted, so its bytes do not depend on --jobs.
     let mut sorted = trials.clone();
     coppa_bench::compare::runner::sort_rows(&mut sorted);
@@ -109,7 +134,12 @@ fn published_trials_follow_the_grid() {
     assert!(trials.iter().any(|t| t.outcome == Outcome::Complete));
 }
 
+<<<<<<< HEAD
 /// AC6: `compare --check` exits 0 on the committed tree.
+=======
+/// AC6: `compare --check` exits 0 on the committed tree. COP-215 AC3: it
+/// renders all 336 trials of the 42-cell grid.
+>>>>>>> 7588b50f436da90bbd02106ba7582928c4d6e4d3
 #[test]
 fn check_passes_on_the_committed_tree() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_coppa-bench"))
@@ -124,6 +154,54 @@ fn check_passes_on_the_committed_tree() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("matches"), "{stderr}");
+<<<<<<< HEAD
+=======
+    let all = SNRS_DB.len() * Channel::ALL.len() * SIZES.len() * 8;
+    assert!(stderr.contains(&format!("({all} trials)")), "{stderr}");
+}
+
+/// The body of the page's generated region `name`.
+fn region<'a>(page: &'a str, name: &str) -> &'a str {
+    let begin = format!("<!-- compare:begin {name} -->");
+    let end = format!("<!-- compare:end {name} -->");
+    let start = page
+        .find(&begin)
+        .unwrap_or_else(|| panic!("comparison.md has no {begin}"))
+        + begin.len();
+    let stop = page[start..]
+        .find(&end)
+        .unwrap_or_else(|| panic!("comparison.md has no {end}"))
+        + start;
+    &page[start..stop]
+}
+
+/// COP-215 AC3: the published page has a value in all 42 cells. No table
+/// cell is the dash an unrecorded cell renders as, every cell's value ends
+/// in `k/8` and links to its cell anchor, and the replay region holds that
+/// anchor.
+#[test]
+fn published_page_has_a_value_in_every_cell() {
+    let page = read(&default_page());
+    let tables = region(&page, "tables");
+    let replay = region(&page, "replay");
+    let dashed: Vec<_> = tables.lines().filter(|l| l.contains("| - ")).collect();
+    assert!(
+        dashed.is_empty(),
+        "{} table rows show an unrecorded cell: {dashed:?}",
+        dashed.len()
+    );
+    for cell in cells(&Channel::ALL, &SNRS_DB, &SIZES) {
+        let id = anchor("link-l2", cell.channel, cell.snr_db, cell.size_bytes);
+        assert!(
+            tables.contains(&format!("/8](#{id})")),
+            "no 8-trial value links to #{id}"
+        );
+        assert!(
+            replay.contains(&format!("<a id=\"{id}\"></a>")),
+            "no replay row for #{id}"
+        );
+    }
+>>>>>>> 7588b50f436da90bbd02106ba7582928c4d6e4d3
 }
 
 #[test]
@@ -195,7 +273,12 @@ fn docs_point_at_the_comparison_page() {
     assert!(changelog.contains("coppa-bench compare"));
 }
 
+<<<<<<< HEAD
 /// Re-runs three committed trials and compares the rows byte for byte.
+=======
+/// Re-runs four committed trials, one of them a fading 16 KB trial (COP-215),
+/// and compares the rows byte for byte.
+>>>>>>> 7588b50f436da90bbd02106ba7582928c4d6e4d3
 /// Run with `cargo test --release -p coppa-bench --test compare_results
 /// committed_trials_reproduce -- --ignored`.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -208,6 +291,7 @@ fn committed_trials_reproduce() {
     let row = row_spec("link-l2").unwrap();
     let p = reference_power(row.level).unwrap();
     let trials = read_csv(&published_csv()).unwrap();
+<<<<<<< HEAD
     for (channel, snr) in [(Channel::Wgn, 0), (Channel::Wgn, 30), (Channel::Mpg, 20)] {
         let committed = trials
             .iter()
@@ -219,6 +303,24 @@ fn committed_trials_reproduce() {
             channel,
             snr_db: snr,
             size_bytes: 2048,
+=======
+    for (channel, snr, size) in [
+        (Channel::Wgn, 0, 2048),
+        (Channel::Wgn, 30, 2048),
+        (Channel::Mpg, 20, 2048),
+        (Channel::Mpp, 20, 16384),
+    ] {
+        let committed = trials
+            .iter()
+            .find(|t| {
+                t.channel == channel && t.snr_db == snr && t.size_bytes == size && t.trial == 0
+            })
+            .unwrap_or_else(|| panic!("{channel:?} {snr} dB {size} B trial 0 is not committed"));
+        let spec = TrialSpec {
+            channel,
+            snr_db: snr,
+            size_bytes: size,
+>>>>>>> 7588b50f436da90bbd02106ba7582928c4d6e4d3
             trial: 0,
             seed: committed.seed,
         };
