@@ -165,8 +165,9 @@ fn sighup_with_an_invalid_file_keeps_the_running_settings() {
 fn sighup_names_restart_only_changes_and_keeps_the_old_listener() {
     let mut daemon = Daemon::start("reload-restart", &config("", ""), READY_DEADLINE);
 
-    // Nothing binds 8310: a restart-only change keeps the old listener, so
-    // the number only has to differ from the running value.
+    // coppad never binds 8310 here, whether or not another process holds it:
+    // a restart-only change keeps the old listener, so the number only has
+    // to differ from the running value.
     let moved = config("", "").replace("vara_command_port = 0", "vara_command_port = 8310");
     daemon.rewrite_config(&moved);
     sighup(&daemon);
