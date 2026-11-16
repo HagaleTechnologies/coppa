@@ -16,6 +16,10 @@ Older releases have no entry here. Their on-air breaks are listed in
 
 ## Unreleased: 0.16.0
 
+- coppad's rate loop and `RateLoop::default_coppa()` now step up after one higher
+  recommendation instead of five (COP-183). On the simulated closed-loop bench this
+  lifts standard-profile adaptive goodput past the best fixed level; adaptive/oracle
+  stays below 0.8. Drops are unchanged. See BENCHMARKS.md's COP-183 log.
 - Add negotiated low-rate floor sessions to the Rust library Link. Discovery
   starts on OFDM, falls back after two unanswered windows, and probes OFDM
   after five distinct acknowledged floor exchanges. Set

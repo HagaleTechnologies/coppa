@@ -81,6 +81,7 @@ means the waterfall moved and the anchors need re-measuring.
 - **COP-133, 2026-11-04:** The same-frame residual candidate was not adopted; the rate-loop bar remains unmet. [Log](docs/benchmarks/2026-11-04-cop-133-same-frame-residual.md).
 - **COP-132, 2026-11-04:** Synthetic impulse, clipping, AGC and tilt presets use independent-frame decoding, including the control; they are distinct from the legacy transfer baseline. [Log](docs/benchmarks/2026-11-05-cop-132-synthetic-transfer-impairments.md).
 - **COP-152, 2026-11-06 merge date:** Bounded-prefix residual screening improved held-out scores, but production adoption was withdrawn after full-loop failure. [Log](docs/benchmarks/2026-11-06-cop-152-bounded-prefix-residual.md).
+- **COP-183, 2026-11-16:** The re-measure on main equals COP-152's baseline; raise dwell 1 was adopted after passing all four pre-registered gates on both profiles. The best-fixed half is met on standard (1.1055), and the oracle half (0.7630) and the robust historical comparison stay unmet. [Log](docs/benchmarks/2026-11-16-cop-183-rate-loop-dwell.md).
 
 ## Unmet bars
 
@@ -88,7 +89,7 @@ These are tracked in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md), which is
 the authority; see these bullets there:
 
 - "Phase 3's closed-loop rate adaptation (Task 4) does not meet its own
-  acceptance bar." (`RateLoop`)
+  acceptance bar." (`RateLoop`) Tracked as COP-183.
 - "The Phase 3 benchmark program (Task 8: `milstd`, `session`) does not clear
   its own acceptance targets"
 - "Decision 4's block-ACK cadence (Phase 3 Task 2) was never implemented."
@@ -254,6 +255,7 @@ Every section title of the pre-COP-146 file, in its original order. Grouped logs
 | COP-133: Same-frame residual experiment | 2026-11-04 | [log](docs/benchmarks/2026-11-04-cop-133-same-frame-residual.md) |
 | Synthetic transfer impairments (COP-132) | 2026-11-04 | [log](docs/benchmarks/2026-11-05-cop-132-synthetic-transfer-impairments.md) |
 | COP-152: Bounded-prefix payload residual | 2026-11-06 (merge date) | [log](docs/benchmarks/2026-11-06-cop-152-bounded-prefix-residual.md) |
+| COP-183: rate-loop re-measure and raise-dwell candidate | 2026-11-16 | [log](docs/benchmarks/2026-11-16-cop-183-rate-loop-dwell.md) |
 
 ## COP-168 PHY HARQ schedule
 
