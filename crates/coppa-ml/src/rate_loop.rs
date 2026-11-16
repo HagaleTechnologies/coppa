@@ -94,22 +94,26 @@ impl RateLoop {
         self
     }
 
-    /// The standard coppa level set, starting at the most robust level. `raise_dwell = 5` is the
-    /// value found by sweeping 3/4/5/6/8/10/12/15 against `crates/coppa-bench/diagnostics/
-    /// closed_loop_arq.rs`'s time-varying-channel bench (`robust` profile): 5 was the peak
-    /// (adaptive/best-fixed and adaptive/oracle both highest there and falling off on both
-    /// sides), not just a monotonic "more dwell is safer" choice -- see that bench's module doc
-    /// for the measured numbers and the deeper reason this configuration still falls short of
-    /// the plan's acceptance bar.
+    /// The standard coppa level set, starting at the most robust level, with
+    /// `raise_dwell = 1`: one higher recommendation steps up one level.
+    ///
+    /// COP-183 replaced the earlier `raise_dwell = 5`. That value was the peak of a 3-15
+    /// sweep scored in delivered bits per frame slot, with no probing. Under the
+    /// airtime-normalized goodput `closed_loop_arq` now reports, dwell 1 scored highest
+    /// on development seeds and passed the pre-registered adoption gates on the
+    /// acceptance seeds (BENCHMARKS.md, COP-183 log). With probing enabled, dwell 1 also
+    /// means the probe stall gate never engages, because every ACK leaves `raise_run`
+    /// at zero.
     ///
     /// Probing stays disabled. The daemon builds its controller from the engine's
-    /// available levels instead of calling this fixed-ladder constructor.
+    /// available levels instead of calling this fixed-ladder constructor, and uses
+    /// the same dwell.
     ///
     /// # Panics
     /// Panics only if the built-in `VALID_SPEED_LEVELS` table is empty or ceases
     /// to be strictly ascending.
     pub fn default_coppa() -> Self {
-        Self::new(VALID_SPEED_LEVELS.to_vec(), 5, 1)
+        Self::new(VALID_SPEED_LEVELS.to_vec(), 1, 1)
             .expect("built-in speed levels are non-empty and strictly ascending")
     }
 
@@ -395,6 +399,21 @@ mod tests {
     /// COP-183 pins the mechanism its candidate depends on: at `raise_dwell = 1`, every ACK
     /// leaves `raise_run` at zero, so the probe stall gate never engages and, with probing
     /// (2, 1), every second transmission is a probe one level up.
+    #[test]
+    fn cop183_default_coppa_raises_after_one_higher_recommendation() {
+        let mut r = RateLoop::default_coppa();
+        assert_eq!(r.current_level(), 1);
+        r.on_ack(9, true);
+        assert_eq!(r.current_level(), 2);
+        for _ in 0..3 {
+            r.on_ack(9, true);
+        }
+        assert_eq!(r.current_level(), 5);
+        // Drops are unchanged: a lower recommendation drops straight to it.
+        r.on_ack(2, true);
+        assert_eq!(r.current_level(), 2);
+    }
+
     #[test]
     fn cop183_dwell_one_never_stall_gates_a_probe() {
         let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 1, 1)

@@ -190,6 +190,13 @@
 //! - **Arms A-d1 and B-d1** are arms A and B with `ControllerSpec::CANDIDATE`. They run after every
 //!   pre-existing arm, and every pre-existing arm keeps `ControllerSpec::BASELINE`, so all output
 //!   above the first `=== COP-183` header is what this bench printed before COP-183.
+//! - **Verdict: adopted.** All four gates held on both profiles, so raise dwell 1 ships in
+//!   `RateLoop::default_coppa()` and coppad. **Arms A-d1 and B-d1 are now the shipped controller;
+//!   arms A and B (and C, C', B0, P, which share their controller) are the pre-COP-183 control.**
+//!   THE BAR block and the historical sections above still describe arm B, i.e. the control; the
+//!   shipped controller's bar numbers are the `COP-183` lines. The bar stays unmet: standard
+//!   arm B-d1 x1 is 1.1055 of best-fixed but 0.7630 of the oracle, and the robust historical
+//!   slot-count comparison falls to 0.8389 / 0.7013.
 //! - **Replay.** Every frame here is independent (its own channel seed, its IR-HARQ accumulator
 //!   evicted after decode), so an adaptive arm's frame at `(CP mode, level)` is the fixed cell's
 //!   frame at the same pair. `coppa_bench::rate_replay::replay` therefore scores any `RateLoop`
@@ -479,7 +486,8 @@ enum ArmKind {
     Fixed { level: u8, mode: CpMode },
     /// Adaptive rate, one fixed CP mode for the whole run. `LongCp` is arm A (the control);
     /// `ShortCp` is arm C, B's CP-isolation control -- see `SeedResult::arm_c`'s doc. With
-    /// `spec: ControllerSpec::CANDIDATE` and `LongCp` it is COP-183's arm A-d1.
+    /// `spec: ControllerSpec::CANDIDATE` and `LongCp` it is COP-183's arm A-d1, the shipped
+    /// controller since COP-183; with `ControllerSpec::BASELINE` it is the pre-COP-183 control.
     FixedCpAdaptiveRate { mode: CpMode, spec: ControllerSpec },
     /// Arm P: identical to arm A, but rebuilds the transceiver on exactly the frames arm B
     /// switched on, with the SAME profile. Isolates the rebuild from the CP change.
@@ -488,7 +496,9 @@ enum ArmKind {
         spec: ControllerSpec,
     },
     /// Arms B / B0: `CpGate`-driven CP switching at the given switch latency. With
-    /// `spec: ControllerSpec::CANDIDATE` and `SWITCH_LATENCY_FRAMES` it is COP-183's arm B-d1.
+    /// `spec: ControllerSpec::CANDIDATE` and `SWITCH_LATENCY_FRAMES` it is COP-183's arm B-d1, the
+    /// shipped controller since COP-183; arm B with `ControllerSpec::BASELINE` is the pre-COP-183
+    /// control.
     CpAdaptive {
         latency: usize,
         spec: ControllerSpec,
@@ -1012,6 +1022,16 @@ fn main() {
     // (offset 5 runs seeds 5..=9, frame seeds 5120..=9515). Every decisional predicate below
     // requires `seeds == SEEDS`, so an offset run is screening only.
     let seed_offset = env_usize("COPPA_CL_SEED_OFFSET", 0) as u64;
+    // An offset below `SEEDS.len()` would mix acceptance seeds into a "development" run, and a
+    // huge one would overflow `frame_seed`'s `run_seed * SEED_STRIDE + f`. Refuse both.
+    assert!(
+        seed_offset == 0
+            || (seed_offset >= SEEDS.len() as u64
+                && seed_offset < u64::MAX / SEED_STRIDE - SEEDS.len() as u64),
+        "COPPA_CL_SEED_OFFSET={seed_offset} is out of range: use 0, or an offset of at least {} \
+         so the development seeds stay disjoint from the acceptance seeds {SEEDS:?}",
+        SEEDS.len()
+    );
     let seeds: Vec<u64> = SEEDS[..n_seeds].iter().map(|s| s + seed_offset).collect();
 
     println!("=== Closed-loop adaptive rate + CP contrast (COP-2) ===");
@@ -1163,6 +1183,9 @@ fn main() {
     }
 
     // ---- Ratios against the bar -------------------------------------------------
+    // Since COP-183 this block measures arm B, the pre-COP-183 control (raise dwell 5). The shipped
+    // controller is arm B-d1; its bar operands are the `COP-183 standard arm-B-d1-x1` line. The
+    // printed text is left unchanged so the pre-COP-183 output stays byte-identical.
     println!("\n=== THE BAR (adaptive/best-fixed > 1.0, adaptive/oracle >= 0.8) ===");
     println!(
         "Each ratio is printed at BOTH switch-cost multipliers: x0 (arm B's data airtime only) and\n\
@@ -1533,7 +1556,13 @@ fn main() {
     // D9 sense, and printing it as a DIRECTIONAL result turns a wiring smoke test
     // into an apparently valid experimental conclusion. Only emit the D9 verdict
     // language for a full run; label anything smaller as non-decisional.
-    if n_seeds_run == SEEDS.len() {
+    if seed_offset != 0 {
+        println!(
+            "  NON-DECISIONAL: development seeds {seeds:?} (COPPA_CL_SEED_OFFSET) -- the D9\n\
+             sign-consistency rule is defined on the pre-committed seeds {SEEDS:?}. This run is\n\
+             COP-183 screening only; it is not evidence of a directional result either way."
+        );
+    } else if n_seeds_run == SEEDS.len() {
         println!(
             "  Sign-consistent (all {} seeds one way) => a DIRECTIONAL result. Mixed signs => no result,\n\
              and the write-up must say the delta is inside this bench's own run-to-run band rather than\n\
@@ -1803,7 +1832,16 @@ fn cop183_report(
                 .filter(|(a, b)| a != b)
                 .count()
                 + rp.switches.len().abs_diff(arm.switches.len());
-            let first = rp.slots.iter().zip(&arm.slots).position(|(a, b)| a != b);
+            // A length-only mismatch has no differing frame in the shared prefix; report the
+            // first frame past it instead of `None`.
+            let first = rp
+                .slots
+                .iter()
+                .zip(&arm.slots)
+                .position(|(a, b)| a != b)
+                .or_else(|| {
+                    (rp.slots.len() != arm.slots.len()).then(|| rp.slots.len().min(arm.slots.len()))
+                });
             println!(
                 "COP-183 replay-check seed={} arm={name} slot_mismatches={slot_mismatches} switch_mismatches={switch_mismatches} first_mismatch_frame={first:?}",
                 seeds[si]
@@ -1889,15 +1927,21 @@ fn cop183_report(
          sum does not fall below arm A's; G4 the replayed coppad default does not fall. All four, on\n\
          both profiles, adopt raise dwell 1. None = non-decisional (not the five-seed 300-frame run)."
     );
-    let gates = adoption_gates(&AdoptionInputs {
-        seeds,
-        frames: n,
-        arm_b_x1: [&b_x1[0], &b_x1[1]],
-        good_x1: pooled[0],
-        poor_x1: pooled[1],
-        arm_a: [&a_gp[0], &a_gp[1]],
-        coppad_default: [&coppad[0], &coppad[1]],
-    });
+    // A non-exact replay voids G4's inputs (pre-registered stop condition), so the gates are
+    // non-decisional on such a run rather than printed as if they held.
+    let gates = if total_mismatches == 0 {
+        adoption_gates(&AdoptionInputs {
+            seeds,
+            frames: n,
+            arm_b_x1: [&b_x1[0], &b_x1[1]],
+            good_x1: pooled[0],
+            poor_x1: pooled[1],
+            arm_a: [&a_gp[0], &a_gp[1]],
+            coppad_default: [&coppad[0], &coppad[1]],
+        })
+    } else {
+        None
+    };
     println!(
         "COP-183 gates base={base} gates={gates:?} all={:?}",
         gates.map(|g| g.all())

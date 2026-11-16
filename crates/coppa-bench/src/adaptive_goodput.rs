@@ -105,8 +105,8 @@ impl AdoptionGates {
 ///
 /// `None` (non-decisional) off the full schedule (seeds other than `[0, 1, 2, 3, 4]`, or a
 /// frame count other than 300), for a per-seed slice whose length differs from the seed
-/// count, or for any non-finite or negative input. Like [`standard_rate_bars`], no value is
-/// rounded before it is compared.
+/// count, or for any non-finite or negative input or per-seed sum. Like
+/// [`standard_rate_bars`], no value is rounded before it is compared.
 pub fn adoption_gates(inputs: &AdoptionInputs<'_>) -> Option<AdoptionGates> {
     if inputs.seeds != [0, 1, 2, 3, 4] || inputs.frames != 300 {
         return None;
@@ -128,6 +128,15 @@ pub fn adoption_gates(inputs: &AdoptionInputs<'_>) -> Option<AdoptionGates> {
     }
     let sum = |v: &[f64]| -> f64 { v.iter().sum() };
     let [b_base, b_cand] = inputs.arm_b_x1;
+    // Finite inputs can still sum to infinity; an infinite sum compares arbitrarily, so it is
+    // non-decisional, as in `standard_rate_bars`.
+    let sums_finite = [inputs.arm_b_x1, inputs.arm_a, inputs.coppad_default]
+        .iter()
+        .flatten()
+        .all(|v| sum(v).is_finite());
+    if !sums_finite {
+        return None;
+    }
     let g1 = sum(b_cand) > sum(b_base) && b_cand.iter().zip(b_base).all(|(c, b)| c > b);
     let g2 = inputs.good_x1[1] >= inputs.good_x1[0] && inputs.poor_x1[1] >= inputs.poor_x1[0];
     let g3 = sum(inputs.arm_a[1]) >= sum(inputs.arm_a[0]);
@@ -953,6 +962,10 @@ mod rate_bar_tests {
             assert_eq!(cop183_gates(&seeds, 300, &v, [bad, 1.0], poor), None);
             assert_eq!(cop183_gates(&seeds, 300, &v, good, [1.0, bad]), None);
         }
+        // Finite values whose sum overflows to infinity.
+        let mut w = v;
+        w[2] = [f64::MAX; 5];
+        assert_eq!(cop183_gates(&seeds, 300, &w, good, poor), None);
         // A per-seed slice whose length differs from the seed count.
         let short = [1.0; 4];
         let inputs = AdoptionInputs {

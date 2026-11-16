@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-12T14:31:47Z",
-  "head_commit": "67eca7b",
+  "generated_at": "2026-11-16T00:52:17Z",
+  "head_commit": "364be57",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -157,7 +157,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:2b6fe19d394f76e72085327e426b11bd13e3a106e4f4de70ff3ae142977d0224",
+      "hash": "sha256:5e455eceae7b0a701c93fe40bd9a434644aea828efdacbe9dcb11a6bb033d337",
       "id": "adr-008-phase3-system-layer",
       "kind": "decision-digest",
       "links": [

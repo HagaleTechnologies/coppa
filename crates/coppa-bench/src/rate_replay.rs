@@ -23,8 +23,11 @@
 //! planning dumps confirmed it: arms A, B, B0, C and P matched their cells with 0 mismatches in
 //! level, CP mode, delivery, receiver recommendation and delay spread over 7,500 frames per
 //! profile, and replaying `RateLoop` and `CpPolicy` from the cells reproduced arms A, B and B0
-//! frame for frame. `closed_loop_arq` re-checks this on every run (its `COP-183 replay-check`
-//! lines), so a drift shows up as a non-zero mismatch count rather than a silently wrong sweep.
+//! frame for frame. `closed_loop_arq` re-checks the end-to-end result on every run (its
+//! `COP-183 replay-check` lines): it replays arms A, B, A-d1 and B-d1 and compares every
+//! `FrameSlot` (level, payload bits, airtime and so CP mode, delivery) and every `CpSwitch`. It
+//! does not compare the recommendation and delay spread frame by frame; a difference there shows
+//! up only once it moves a replayed trajectory, which is why four arms at two dwells are checked.
 //!
 //! # When it is not valid
 //!
@@ -155,7 +158,8 @@ pub struct ReplayRun {
 /// validity limit.
 ///
 /// Returns `None` for a table that is not 18 cells of equal length (slots and observations
-/// alike), or if the controller ever asks for a level outside `VALID_SPEED_LEVELS`.
+/// alike), if the controller ever asks for a level outside `VALID_SPEED_LEVELS`, or if a cell
+/// holds a slot of a different level than its position says (a mis-ordered table).
 pub fn replay(table: &CellTable<'_>, spec: ControllerSpec, cp: CpShape) -> Option<ReplayRun> {
     let n = table.frames()?;
     let mut rate = spec.build();
@@ -176,10 +180,11 @@ pub fn replay(table: &CellTable<'_>, spec: ControllerSpec, cp: CpShape) -> Optio
         let c = cell_index(mode, level)?;
         let slot = table.slots[c][f];
         let obs = table.obs[c][f];
-        debug_assert_eq!(
-            slot.level, level,
-            "cell {c} frame {f} holds the wrong level"
-        );
+        // A table whose cells are not in `[LongCp L1..L9, ShortCp L1..L9]` order would be
+        // scored silently; a level mismatch is the one ordering error a slot can reveal.
+        if slot.level != level {
+            return None;
+        }
         slots.push(slot);
 
         if let Some(p) = policy.as_mut() {
@@ -284,6 +289,14 @@ mod tests {
         bad_slots[11].pop();
         let t = CellTable {
             slots: &bad_slots,
+            obs: &obs,
+        };
+        assert!(replay(&t, spec, cp).is_none());
+        // Cells out of order: the level-1 and level-2 long-CP cells swapped.
+        let mut swapped = slots.clone();
+        swapped.swap(0, 1);
+        let t = CellTable {
+            slots: &swapped,
             obs: &obs,
         };
         assert!(replay(&t, spec, cp).is_none());
