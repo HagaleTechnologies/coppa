@@ -11,6 +11,9 @@ mod station;
 pub mod tnc;
 
 use clap::Args;
+
+/// The black-box trial CSV header (COP-170 Design section 5).
+pub const CSV_HEADER: &str = "modem,adapter,version_reply,binary_sha256,mode,channel,snr_db,size_bytes,trial,seed,ref_power_a,ref_power_b,cap_s,outcome,connect_s,delivered_bytes,exact,transfer_s,net_bytes_per_min,drops,wall_s,cable_latency_ms,starved_ticks,overflow_ticks";
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Args)]

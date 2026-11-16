@@ -39,13 +39,14 @@ pub fn drain_frames(wire: &mut Vec<u8>, payload: &mut Vec<u8>) -> Result<usize> 
         if wire.len() < len + 2 {
             break;
         }
-        anyhow::ensure!(
-            len >= 3 && &wire[2..5] == b"ARQ",
-            "invalid ARDOP data frame tag"
-        );
-        payload.extend_from_slice(&wire[5..len + 2]);
+        anyhow::ensure!(len >= 3, "invalid ARDOP data frame length {len}");
+        // The data port also carries FEC and IDF frames; only ARQ frames
+        // belong to the connected transfer.
+        if &wire[2..5] == b"ARQ" {
+            payload.extend_from_slice(&wire[5..len + 2]);
+            count += 1;
+        }
         wire.drain(..len + 2);
-        count += 1;
     }
     Ok(count)
 }
@@ -140,5 +141,22 @@ mod tests {
         wire.extend_from_slice(b"Qxy");
         assert_eq!(drain_frames(&mut wire, &mut payload).unwrap(), 1);
         assert_eq!(payload, b"xy");
+    }
+    #[test]
+    fn idf_and_fec_frames_are_skipped() {
+        let mut wire = Vec::new();
+        for (tag, body) in [
+            (&b"IDF"[..], &b"N0AAA"[..]),
+            (b"ARQ", b"data"),
+            (b"FEC", b"x"),
+        ] {
+            wire.extend_from_slice(&((tag.len() + body.len()) as u16).to_be_bytes());
+            wire.extend_from_slice(tag);
+            wire.extend_from_slice(body);
+        }
+        let mut payload = Vec::new();
+        assert_eq!(drain_frames(&mut wire, &mut payload).unwrap(), 1);
+        assert_eq!(payload, b"data");
+        assert!(wire.is_empty());
     }
 }

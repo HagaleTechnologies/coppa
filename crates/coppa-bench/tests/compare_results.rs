@@ -28,7 +28,7 @@ fn expected_page() -> (String, String) {
     let version = recorded_version(metadata.as_deref());
     let rows = [row_spec("link-l2").unwrap()];
     let mut bodies = regions(&rows, &trials, &version);
-    bodies.extend(data_regions(&default_out_dir()));
+    bodies.extend(data_regions(&default_out_dir()).unwrap());
     let expected = render_page(&page, &bodies).unwrap();
     (page, expected)
 }
@@ -51,7 +51,7 @@ fn rendering_the_committed_data_is_a_no_op() {
     let metadata = fs::read_to_string(default_out_dir().join("metadata.md")).ok();
     let version = recorded_version(metadata.as_deref());
     let mut bodies = regions(&rows, &trials, &version);
-    bodies.extend(data_regions(&default_out_dir()));
+    bodies.extend(data_regions(&default_out_dir()).unwrap());
     let again = render_page(&expected, &bodies).unwrap();
     assert_eq!(again, expected);
     assert_eq!(page, expected);

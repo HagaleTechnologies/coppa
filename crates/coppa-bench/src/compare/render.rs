@@ -199,25 +199,57 @@ pub fn render_cell_tables(rows: &[RowSpec], trials: &[TrialRow], version: &str) 
 /// Names of the generated regions of the page, in page order.
 pub const REGIONS: [&str; 4] = ["tables", "replay", "blackbox-selftest", "channel-check"];
 
-/// Render separately recorded black-box and channel measurements. Missing
-/// recordings are explicit rather than silently filled with model settings.
-pub fn data_regions(out_dir: &std::path::Path) -> Vec<(&'static str, String)> {
-    let blackbox = std::fs::read_to_string(out_dir.join("blackbox-coppad.csv"))
-        .ok()
-        .filter(|csv| csv.lines().count() > 1)
-        .map_or_else(
-            || "Not recorded yet.".to_string(),
-            |csv| render_blackbox(&csv),
-        );
-    let channel = super::channel_check::read_csv(&out_dir.join("channel-check.csv"))
-        .ok()
-        .filter(|rows| !rows.is_empty())
-        .map_or_else(
-            || "Not recorded yet.".to_string(),
-            |rows| super::channel_check::table(&rows).trim_end().to_string(),
-        );
-    vec![("blackbox-selftest", blackbox), ("channel-check", channel)]
+/// Render separately recorded black-box and channel measurements. A missing
+/// file renders "Not recorded yet."; an unreadable or malformed one is an
+/// error, so a damaged CSV cannot silently empty its region.
+///
+/// # Errors
+///
+/// Reading a present CSV fails, or it has the wrong header or row shape.
+pub fn data_regions(out_dir: &std::path::Path) -> anyhow::Result<Vec<(&'static str, String)>> {
+    use anyhow::Context;
+    const EMPTY: &str = "Not recorded yet.";
+    let blackbox_path = out_dir.join("blackbox-coppad.csv");
+    let blackbox = match std::fs::read_to_string(&blackbox_path) {
+        Ok(csv) => {
+            let mut lines = csv.lines();
+            anyhow::ensure!(
+                lines.next() == Some(BLACKBOX_HEADER),
+                "{}: not a black-box CSV header",
+                blackbox_path.display()
+            );
+            for (i, row) in lines.enumerate() {
+                anyhow::ensure!(
+                    row.split(',').count() == 24,
+                    "{}: row {} does not have 24 fields",
+                    blackbox_path.display(),
+                    i + 2
+                );
+            }
+            render_blackbox(&csv)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => EMPTY.to_string(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", blackbox_path.display())),
+    };
+    let channel_path = out_dir.join("channel-check.csv");
+    let channel = if channel_path.exists() {
+        let rows = super::channel_check::read_csv(&channel_path)
+            .with_context(|| format!("reading {}", channel_path.display()))?;
+        if rows.is_empty() {
+            EMPTY.to_string()
+        } else {
+            super::channel_check::table(&rows).trim_end().to_string()
+        }
+    } else {
+        EMPTY.to_string()
+    };
+    Ok(vec![
+        ("blackbox-selftest", blackbox),
+        ("channel-check", channel),
+    ])
 }
+
+use super::blackbox::CSV_HEADER as BLACKBOX_HEADER;
 
 fn render_blackbox(csv: &str) -> String {
     let mut cells: std::collections::BTreeMap<(Channel, i32, usize), Vec<Vec<&str>>> =
@@ -408,9 +440,26 @@ mod tests {
     #[test]
     fn missing_data_renders_the_empty_state() {
         let dir = std::env::temp_dir().join(format!("coppa-render-empty-{}", std::process::id()));
-        let rendered = data_regions(&dir);
+        let rendered = data_regions(&dir).unwrap();
         assert_eq!(rendered[0].1, "Not recorded yet.");
         assert_eq!(rendered[1].1, "Not recorded yet.");
+    }
+
+    #[test]
+    fn malformed_data_is_an_error_not_the_empty_state() {
+        let dir =
+            std::env::temp_dir().join(format!("coppa-render-malformed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("channel-check.csv"), "preset,oops\ngood,1\n").unwrap();
+        assert!(data_regions(&dir).is_err());
+        std::fs::remove_file(dir.join("channel-check.csv")).unwrap();
+        std::fs::write(
+            dir.join("blackbox-coppad.csv"),
+            format!("{BLACKBOX_HEADER}\ncoppad,vara,VERSION Coppa 1, build 2,x\n"),
+        )
+        .unwrap();
+        assert!(data_regions(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -431,13 +480,13 @@ mod tests {
     fn channel_csv_change_makes_page_stale() {
         let dir = std::env::temp_dir().join(format!("coppa-render-stale-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let page = render_page(&skeleton(), &data_regions(&dir)).unwrap();
+        let page = render_page(&skeleton(), &data_regions(&dir).unwrap()).unwrap();
         let csv = format!(
             "{}\ngood,48000,0x17f00000,600,1200,0.500,0.500,0.0,0.100,0.100,0.0,true\n",
             super::super::channel_check::HEADER
         );
         std::fs::write(dir.join("channel-check.csv"), csv).unwrap();
-        let expected = render_page(&page, &data_regions(&dir)).unwrap();
+        let expected = render_page(&page, &data_regions(&dir).unwrap()).unwrap();
         assert_eq!(
             first_difference(&page, &expected).unwrap().1,
             "region \"channel-check\""

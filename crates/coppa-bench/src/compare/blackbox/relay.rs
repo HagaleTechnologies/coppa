@@ -120,6 +120,11 @@ pub mod io {
                 thread: Some(thread),
             })
         }
+        /// True once the relay thread has exited, which before `stop` means
+        /// it failed (for example on playback that is not f32 audio).
+        pub fn is_dead(&self) -> bool {
+            self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+        }
         pub fn stop(mut self) -> Result<()> {
             self.stop.store(true, Ordering::Relaxed);
             self.thread

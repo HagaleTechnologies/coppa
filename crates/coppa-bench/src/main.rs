@@ -244,10 +244,10 @@ fn page_regions(
     trials: &[coppa_bench::compare::trial::TrialRow],
     version: &str,
     out_dir: &std::path::Path,
-) -> Vec<(&'static str, String)> {
+) -> anyhow::Result<Vec<(&'static str, String)>> {
     let mut all = regions(rows, trials, version);
-    all.extend(data_regions(out_dir));
-    all
+    all.extend(data_regions(out_dir)?);
+    Ok(all)
 }
 
 /// `compare --check`: 0 when the page matches the CSVs, 1 when it is stale.
@@ -259,7 +259,7 @@ fn check_compare(args: &CompareArgs) -> anyhow::Result<i32> {
         .map_err(|e| anyhow::anyhow!("reading {}: {e}", page_path.display()))?;
     let expected = render_page(
         &page,
-        &page_regions(&rows, &trials, &version, &plan.out_dir),
+        &page_regions(&rows, &trials, &version, &plan.out_dir)?,
     )
     .map_err(|e| anyhow::anyhow!("{}: {e}", page_path.display()))?;
     // COP-215: the page can match while the plan is only partly recorded;
@@ -320,7 +320,7 @@ fn run_compare(args: &CompareArgs) -> anyhow::Result<()> {
     };
     let rendered = render_page(
         &page,
-        &page_regions(&rows, &trials, &version, &plan.out_dir),
+        &page_regions(&rows, &trials, &version, &plan.out_dir)?,
     )
     .map_err(|e| anyhow::anyhow!("{}: {e}", page_path.display()))?;
     if rendered != page {
@@ -389,6 +389,10 @@ fn main() {
                     coppa_bench::compare::channel_check::run(args.sample_rate, &out_dir).map(
                         |table| {
                             print!("{table}");
+                            eprintln!(
+                                "compare channel-check: wrote {}",
+                                out_dir.join("channel-check.csv").display()
+                            );
                             0
                         },
                     )

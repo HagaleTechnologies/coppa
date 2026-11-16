@@ -38,8 +38,8 @@ fn absolute(path: &Path) -> Result<PathBuf> {
 pub fn check(out_dir: &Path, adapter: &str, version_reply: Option<&str>) -> Result<()> {
     let root = super::super::repo_root().canonicalize()?;
     let target = absolute(out_dir)?;
-    let published =
-        target.starts_with(root.join("results")) || target.starts_with(root.join("docs"));
+    // Anywhere in the repository but the ignored target/ tree can be committed.
+    let published = target.starts_with(&root) && !target.starts_with(root.join("target"));
     if !published {
         return Ok(());
     }
@@ -72,12 +72,23 @@ mod tests {
         assert!(check(&path, "kiss", None).is_err());
     }
     #[test]
+    fn foreign_results_cannot_target_other_tracked_paths() {
+        let root = super::super::super::repo_root();
+        for path in [root.clone(), root.join("wiki"), root.join("tools/compare")] {
+            assert!(check(&path, "vara", Some("VERSION Other 1.2")).is_err());
+        }
+        assert!(check(&default_out_dir("other"), "vara", Some("VERSION Other 1.2")).is_ok());
+    }
+    #[test]
     fn default_out_dir_is_under_target() {
         assert!(default_out_dir("coppad").ends_with("target/compare-foreign/coppad"));
     }
     #[test]
     fn relative_nonexistent_output_is_resolved() {
-        assert!(check(Path::new("target/new-blackbox-results"), "vara", None).is_ok());
+        // Tests run in the crate directory; this resolves to <repo>/target.
+        assert!(check(Path::new("../../target/new-blackbox-results"), "vara", None).is_ok());
+        // A crate-level target/ is not ignored by git, so it counts as published.
+        assert!(check(Path::new("target/new-blackbox-results"), "vara", None).is_err());
         let path = Path::new("../../target/new/../../results/compare");
         assert!(
             check(path, "vara", Some("VERSION Other")).is_err(),

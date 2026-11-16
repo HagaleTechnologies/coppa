@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const HEADER: &str = "modem,adapter,version_reply,binary_sha256,mode,channel,snr_db,size_bytes,trial,seed,ref_power_a,ref_power_b,cap_s,outcome,connect_s,delivered_bytes,exact,transfer_s,net_bytes_per_min,drops,wall_s,cable_latency_ms,starved_ticks,overflow_ticks";
+use super::CSV_HEADER as HEADER;
 
 struct CsvIdentity<'a> {
     profile: &'a Profile,
@@ -194,10 +194,16 @@ pub fn run(args: &BlackboxArgs) -> Result<()> {
         guard::check(&out_dir, "kiss", None)?;
     }
     let root = scratch()?;
-    super::gated(
+    let result = super::gated(
         || probe(&Cable::create(&root.join("probe"))?),
         |metrics| run_trials(args, &profile, &sha, &out_dir, &root, cell, &metrics),
-    )
+    );
+    if result.is_ok() {
+        let _ = fs::remove_dir_all(&root);
+    } else {
+        eprintln!("compare blackbox: scratch files kept in {}", root.display());
+    }
+    result
 }
 
 fn run_trials(
@@ -251,7 +257,7 @@ fn run_trials(
             sha,
             version: version.as_deref().unwrap_or(""),
         };
-        let lines = thread::scope(|scope| -> Result<Vec<String>> {
+        let results: Vec<Result<String>> = thread::scope(|scope| {
             let handles: Vec<_> = batch
                 .iter()
                 .map(|&(trial, seed)| scope.spawn(move || run_trial(context, trial, seed)))
@@ -264,12 +270,22 @@ fn run_trials(
                         .map_err(|_| anyhow::anyhow!("trial worker panicked"))?
                 })
                 .collect()
-        })?;
+        });
+        // Record every finished trial of the batch before reporting a failed one.
         let mut file = fs::OpenOptions::new().append(true).open(&path)?;
-        for line in lines {
-            file.write_all(line.as_bytes())?;
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(line) => file.write_all(line.as_bytes())?,
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
         }
         file.sync_all()?;
+        if let Some(e) = first_error {
+            return Err(e);
+        }
     }
     eprintln!("compare blackbox: wrote {}", path.display());
     Ok(())
@@ -292,12 +308,15 @@ fn calibrate(
         "vara" => Some(tnc::vara::version(&mut host_a)?),
         "ardop" => Some(tnc::ardop::version(&mut host_a)?),
         _ => None,
-    };
+    }
+    // The reply is a CSV field; a comma or quote in it would shift columns.
+    .map(|reply| reply.replace([',', '"'], ";"));
     let power = if let Some(pair) = specified {
         let (x, y) = pair.split_once(',').context("--ref-power expects A,B")?;
         [x.parse::<f32>()?, y.parse::<f32>()?]
     } else {
         if profile.adapter == "kiss" {
+            relay.counts.reset_power();
             let frame = tnc::kiss::frame(&[0x55; 200]);
             host_a.send_data(&frame)?;
             thread::sleep(Duration::from_secs(4));
@@ -325,7 +344,7 @@ fn calibrate(
             let mut received = [0u8; 4096];
             let deadline = Instant::now() + Duration::from_secs(90);
             let mut got = false;
-            while Instant::now() < deadline {
+            while Instant::now() < deadline && !relay.is_dead() {
                 if host_b.receive_data(&mut received)? > 0 {
                     got = true;
                     break;
@@ -339,7 +358,7 @@ fn calibrate(
             }
             let deadline = Instant::now() + Duration::from_secs(90);
             let mut got = false;
-            while Instant::now() < deadline {
+            while Instant::now() < deadline && !relay.is_dead() {
                 if host_a.receive_data(&mut received)? > 0 {
                     got = true;
                     break;
@@ -349,6 +368,10 @@ fn calibrate(
         }
         relay.counts.ref_power()
     };
+    if relay.is_dead() {
+        relay.stop()?;
+        bail!("the cable relay stopped during calibration");
+    }
     anyhow::ensure!(
         power.iter().all(|p| p.is_finite() && *p > 0.0),
         "calibration found no active TX power"
@@ -396,6 +419,7 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
     let mut outcome = "no_connect";
     let mut transfer_s = 0.0;
     let mut datagrams = 0usize;
+    let mut exact = false;
     match profile.adapter.as_str() {
         "vara" => {
             tnc::vara::listen(&mut host_b, "N0BBB")?;
@@ -435,7 +459,7 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
         let deadline = write_time + Duration::from_secs(cap_s);
         let mut received = Vec::new();
         let mut wire = Vec::new();
-        while Instant::now() < deadline && received.len() < payload.len() {
+        while Instant::now() < deadline && received.len() < payload.len() && !relay.is_dead() {
             let mut bytes = [0u8; 4096];
             let n = match host_b.receive_data(&mut bytes) {
                 Ok(n) => n,
@@ -470,7 +494,8 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
         relay.counts.counting.store(false, Ordering::Relaxed);
         delivered = received.len().min(payload.len());
         transfer_s = write_time.elapsed().as_secs_f64();
-        if delivered == payload.len() && received[..delivered] == payload {
+        exact = received == payload;
+        if exact {
             outcome = if profile.adapter == "kiss" {
                 "datagram"
             } else {
@@ -482,7 +507,7 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
     let starved = relay.counts.starved.load(Ordering::Relaxed);
     let overflow = relay.counts.overflow.load(Ordering::Relaxed);
     relay.stop()?;
-    let exact = outcome == "complete" || (outcome == "datagram" && delivered == args.size);
+
     let rate = if transfer_s > 0.0 {
         delivered as f64 * 60.0 / transfer_s
     } else {
