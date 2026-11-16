@@ -287,6 +287,20 @@ fn fittest_level_with_codewords(encoded_len: usize, current: u8, codewords: u8) 
 /// samples).
 /// `robust_floor` is the daemon's floor enable (COP-202: the speed level is
 /// automatic, `EventLoop::floor_enabled`).
+/// COP-210: the host API's name for a session waveform. `None` for a
+/// waveform the host API does not name yet (`LinkPhyMode` is
+/// non-exhaustive).
+#[cfg(feature = "websocket")]
+fn host_phy_mode(mode: LinkPhyMode) -> Option<coppa_host::websocket::PhyMode> {
+    use coppa_host::websocket::PhyMode;
+    match mode {
+        LinkPhyMode::Floor => Some(PhyMode::Floor),
+        LinkPhyMode::Ofdm { level } => Some(PhyMode::Ofdm { level }),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
 fn local_link_caps(config: &DaemonConfig, robust_floor: bool) -> LinkCapabilities {
     LinkCapabilities {
         robust_floor,
@@ -1010,11 +1024,20 @@ pub struct EventLoop {
     /// frames. Reset at each dial and each accepted CONNECT_REQ. Timers stay
     /// here in the daemon, per the controller's contract.
     floor: FloorController,
-    /// COP-202: the waveform of the last session frame keyed and of the last
-    /// session frame received. Internal (tests and logs), shaped like
-    /// `Link::phy_mode()`.
+    /// COP-202: the waveform of the last session frame keyed (`phy_tx`) and
+    /// of the frame being dispatched (`phy_rx`). `phy_rx` is the floor
+    /// controller's input and is set before any handler validates the frame,
+    /// so hosts never see it: they see `rx_reported`.
     phy_tx: Option<LinkPhyMode>,
     phy_rx: Option<LinkPhyMode>,
+    /// COP-210: the waveform of the last session frame a session handler
+    /// accepted, the RX half of `phy_mode()`. Frames for other stations,
+    /// stale ACKs and replayed handshakes leave it alone.
+    rx_reported: Option<LinkPhyMode>,
+    /// COP-210: the `(tx, rx)` pair last sent as a `phy_mode` push, so
+    /// `publish_phy_mode` pushes only changes.
+    #[cfg(feature = "websocket")]
+    last_pushed_phy_mode: Option<(Option<LinkPhyMode>, Option<LinkPhyMode>)>,
     /// COP-83: the `(level, manual)` pair last sent as a `speed_level`
     /// push, so `publish_speed_level` pushes only changes.
     #[cfg(feature = "websocket")]
@@ -1337,6 +1360,9 @@ impl EventLoop {
             floor: FloorController::default(),
             phy_tx: None,
             phy_rx: None,
+            rx_reported: None,
+            #[cfg(feature = "websocket")]
+            last_pushed_phy_mode: None,
             #[cfg(feature = "websocket")]
             last_pushed_speed_level: None,
             #[cfg(feature = "websocket")]
@@ -1953,11 +1979,13 @@ impl EventLoop {
             snap.link = link;
         }
         self.publish_speed_level().await;
+        self.publish_phy_mode().await;
     }
 
     #[cfg(not(feature = "websocket"))]
     async fn publish_ws_snapshot(&mut self) {
         self.publish_speed_level().await;
+        self.publish_phy_mode().await;
     }
 
     /// COP-83: mark a busy-channel wait in the WebSocket snapshot. Each wait
@@ -2471,6 +2499,17 @@ impl EventLoop {
     /// Call after `session_mgr` reflects the change. Broadcasts to all hosts:
     /// session state is link-wide; every attached host wants it.
     async fn notify_session(&mut self, client_id: u32, notice: SessionNotice) {
+        // COP-210: once no session is live, the reported waveform pair
+        // clears, and hosts hear it at once rather than on the next tick.
+        if matches!(
+            notice,
+            SessionNotice::Disconnected | SessionNotice::PendingCancelled
+        ) && self.live_session_id().is_none()
+        {
+            tracing::debug!(last = ?self.phy_mode(), "Session over; reported waveform cleared");
+            self.reset_floor();
+            self.publish_phy_mode().await;
+        }
         let (status, vara) = match &notice {
             SessionNotice::Connected {
                 local,
@@ -3223,6 +3262,10 @@ impl EventLoop {
         if matches!(outcome, InsertOutcome::Rejected(_)) {
             return;
         }
+        // COP-210: the block for this session is accepted.
+        if self.phy_rx.is_some() {
+            self.rx_reported = self.phy_rx;
+        }
         // Use the received frame's level. Peers may choose different TX levels.
         let profile = if self.engine.on_vhf_profile() {
             coppa_codec::ofdm::CoppaProfile::vhf_wide()
@@ -3698,12 +3741,55 @@ impl EventLoop {
         self.manual_speed_level.is_none()
     }
 
-    /// COP-202: start a new session's waveform policy from OFDM.
+    /// COP-202: start a new session's waveform policy from OFDM. COP-210:
+    /// also clears the reported waveform pair.
     fn reset_floor(&mut self) {
         self.floor = FloorController::default();
         self.phy_tx = None;
         self.phy_rx = None;
+        self.rx_reported = None;
     }
+
+    /// COP-210: the session waveform pair hosts see, shaped like
+    /// `Link::phy_mode()`: the waveform of the last session frame keyed and
+    /// of the last session frame a handler accepted. `(None, None)` before
+    /// session activity and after the session ends.
+    pub(crate) fn phy_mode(&self) -> (Option<LinkPhyMode>, Option<LinkPhyMode>) {
+        (self.phy_tx, self.rx_reported)
+    }
+
+    /// COP-210: a session handler accepted the frame being dispatched, so
+    /// its waveform becomes the reported RX waveform.
+    fn note_validated_rx(&mut self) {
+        if self.phy_rx.is_some() {
+            self.rx_reported = self.phy_rx;
+        }
+    }
+
+    /// COP-210: write the waveform pair to the WebSocket snapshot, and push
+    /// `phy_mode` when either half changed since the last push.
+    #[cfg(feature = "websocket")]
+    async fn publish_phy_mode(&mut self) {
+        use coppa_host::websocket::{PhyModeReport, WsServerMessage};
+        let (tx, rx) = self.phy_mode();
+        let report = PhyModeReport {
+            tx: tx.and_then(host_phy_mode),
+            rx: rx.and_then(host_phy_mode),
+        };
+        if let Some(ref status) = self.ws_status {
+            status.lock().await.phy_mode = Some(report);
+        }
+        if self.last_pushed_phy_mode != Some((tx, rx)) {
+            self.last_pushed_phy_mode = Some((tx, rx));
+            self.ws_push_reliable(WsServerMessage::PhyMode {
+                tx: report.tx,
+                rx: report.rx,
+            });
+        }
+    }
+
+    #[cfg(not(feature = "websocket"))]
+    async fn publish_phy_mode(&mut self) {}
 
     fn turnaround(&self) -> Duration {
         Duration::from_millis(self.config.radio.turnaround_ms)
@@ -7917,6 +8003,7 @@ impl EventLoop {
                 if let Some(session) = self.session_mgr.get_mut(id) {
                     match session.handle_connect_req(&pdu.payload, now) {
                         Ok(ack_pdu) => {
+                            self.note_validated_rx();
                             // COP-44: announce the attempt before the ACK,
                             // whose busy-channel wait can last seconds.
                             if !replaced {
@@ -7974,6 +8061,7 @@ impl EventLoop {
                     };
                     // COP-38 (D2): the new session starts at seq 0.
                     let session_id = session.id;
+                    self.note_validated_rx();
                     self.reset_session_link(session_id);
                     // The session is established now; the busy-channel courtesy
                     // wait in transmit_samples can delay the CFM by seconds.
@@ -8019,6 +8107,7 @@ impl EventLoop {
                     };
                     // COP-38 (D2): the new session starts at seq 0.
                     let session_id = session.id;
+                    self.note_validated_rx();
                     self.reset_session_link(session_id);
                     self.apply_floor_session_timers(session_id);
                     self.notify_session(0, notice).await;
@@ -8153,6 +8242,8 @@ impl EventLoop {
         if let Some(mode) = rx_mode {
             self.floor.received(mode);
         }
+        // COP-210: a reliable segment for this session is accepted.
+        self.note_validated_rx();
         let Some(ack) = self.deliver_session_segment(segment) else {
             return;
         };
@@ -8332,6 +8423,10 @@ impl EventLoop {
             );
             return;
         }
+        // COP-210: the ACK passed the stale-ACK guard.
+        if self.phy_rx.is_some() {
+            self.rx_reported = self.phy_rx;
+        }
         let outer_pending = link.tx_outer.is_some() && link.tx.in_flight() > 0;
         // COP-121 (D5): the in-flight segment's stream and length, read
         // before `process_ack` frees it.
@@ -8395,6 +8490,7 @@ impl EventLoop {
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             session.touch(clock_now());
+            self.note_validated_rx();
         }
     }
 
