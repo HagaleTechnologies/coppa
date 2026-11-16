@@ -3243,11 +3243,15 @@ impl EventLoop {
             return;
         }
         let ack = session_ack_frame(link);
+        // COP-210: `encode_bytes` encodes at the engine's current level.
+        let level = self.engine.speed_level();
         match self.engine.encode_bytes(&ack) {
             Ok(samples) => {
                 let doubled = [samples.as_slice(), samples.as_slice()].concat();
                 let generation = self.tx_generation;
-                Box::pin(self.transmit_samples(&doubled)).await;
+                if Box::pin(self.transmit_samples_keyed(&doubled)).await > 0 {
+                    self.phy_tx = Some(LinkPhyMode::Ofdm { level });
+                }
                 if self.tx_generation != generation {
                     if let Some(link) = self.session_link.as_mut() {
                         link.block_ack_at = None;
@@ -4141,6 +4145,9 @@ impl EventLoop {
                 ) {
                     Ok((samples, _)) => {
                         let keyed = Box::pin(self.transmit_samples_keyed(&samples)).await;
+                        if keyed > 0 {
+                            self.phy_tx = Some(LinkPhyMode::Ofdm { level: outer.level });
+                        }
                         self.set_session_segment_floor(
                             keyed,
                             outer.packets_len,
@@ -19518,6 +19525,63 @@ mod tests {
                 .unwrap()
                 .block_ack_at
                 .is_none());
+        }
+
+        /// COP-210: an RS block ACK and an RS burst retransmission are
+        /// session key-ups, so the reported TX waveform follows each at the
+        /// level it was encoded at, even when the speed level changed since
+        /// the previous session frame.
+        #[tokio::test(start_paused = true)]
+        async fn rs_keyups_set_reported_tx_waveform() {
+            let (mut station, mut consumer) = rs_station();
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![17; 200],
+                })
+                .await;
+            let _ = read_all(&mut consumer);
+            // The burst played out; the audio thread releases PTT.
+            station.handle_ptt_change(false).await;
+            assert_eq!(station.phy_mode().0, Some(LinkPhyMode::Ofdm { level: 2 }));
+            let link = station.session_link.as_ref().unwrap();
+            let segment = TransportPdu::new_reliable(0, 0, 0, vec![23; 40]).to_bytes();
+            let packets = coppa_protocol::outer_code::encode_block(0, &segment, 99).unwrap();
+            let frames: Vec<_> = packets
+                .iter()
+                .map(|p| {
+                    MacPdu::new(
+                        MacFrameType::OuterData,
+                        link.local.clone(),
+                        link.remote.clone(),
+                        link.ssid,
+                        p.to_bytes().unwrap(),
+                    )
+                })
+                .collect();
+            for frame in frames {
+                station.handle_session_outer_data(frame, 2).await;
+            }
+            station.engine.set_speed_level(4).unwrap();
+            let until = station.session_link.as_ref().unwrap().block_ack_at.unwrap();
+            let now = clock_now();
+            if until > now {
+                tokio::time::advance(until - now).await;
+            }
+            let generation = station.tx_generation;
+            station.flush_block_ack().await;
+            assert!(station.tx_generation > generation, "the block ACK keyed");
+            assert_eq!(station.phy_mode().0, Some(LinkPhyMode::Ofdm { level: 4 }));
+            let _ = read_all(&mut consumer);
+            station.handle_ptt_change(false).await;
+            // The level-2 burst goes unacknowledged and is resent at its
+            // pinned level.
+            let rto = station.session_link.as_ref().unwrap().tx.rto();
+            tokio::time::advance(rto + Duration::from_secs(1)).await;
+            let generation = station.tx_generation;
+            station.check_session_retransmits().await;
+            assert!(station.tx_generation > generation, "the burst was resent");
+            assert_eq!(station.phy_mode().0, Some(LinkPhyMode::Ofdm { level: 2 }));
         }
 
         /// COP-69 test rig: a station pinned to level 8 on `HF_STANDARD`
