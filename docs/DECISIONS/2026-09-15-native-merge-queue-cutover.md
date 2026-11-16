@@ -23,6 +23,10 @@ following the same pattern already live on `HagaleTechnologies/widdershins`, `ma
   rulesets' rules (six total: `deletion`, `merge_queue`, `non_fast_forward`, `pull_request`,
   `required_linear_history`, `required_status_checks`) while `release/*`/`releases/*` keep
   exactly their original five, unchanged.
+
+  Update 2026-11-14 (COP-203): the ruleset's `check_response_timeout_minutes` is 120
+  (changed 2026-11-06). ci-full's fan-in wait is budgeted against 120; see
+  [the fast-tier wait](../testing/full-ci.md#fast-tier-wait).
 - Landed via `HagaleTechnologies/coppa#108`, merged through the _existing_ Mergify queue
   (coppa's `.mergify.yml` still had `queue_rules` defined at that point) — the new ruleset
   was created immediately after, once #108's own admission workflows existed to use it.

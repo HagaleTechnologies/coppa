@@ -240,9 +240,15 @@ async fn chat_reaches_the_peer_and_the_sender_sees_a_receipt() {
 async fn chat_is_negotiated_only_when_both_stations_enable_the_websocket_api() {
     let mut on = DaemonConfig::default();
     on.host.websocket_enabled = true;
-    assert_eq!(hex(&local_link_caps(&on).to_bytes()), "00c80102081600");
+    assert_eq!(
+        hex(&local_link_caps(&on, true).to_bytes()),
+        "00c80102085600"
+    );
     on.session.fade_protection = crate::config::FadeProtection::Off;
-    assert_eq!(hex(&local_link_caps(&on).to_bytes()), "00c80102081200");
+    assert_eq!(
+        hex(&local_link_caps(&on, true).to_bytes()),
+        "00c80102085200"
+    );
 
     let mut p = connected_chat_pair_configured(|_| {}, |c| c.host.websocket_enabled = false).await;
     for station in [&p.a, &p.b] {
