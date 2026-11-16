@@ -38,7 +38,7 @@ COPPA_CL_SEED_OFFSET=5 ./target/release/examples/closed_loop_arq standard
 COPPA_CL_FRAMES=24 COPPA_CL_SEEDS=1 ./target/release/examples/closed_loop_arq robust  # smoke, before and after
 ```
 
-Wall times, all four full runs and the session bench started together on the shared 6-CPU quota (the development runs were paused for part of the acceptance runs so the decisional runs finished first): acceptance robust 20 min 24 s, acceptance standard 19 min 48 s, development robust did not finish in this session, development standard did not finish in this session, session did not finish in this session. Each seed ran 26 arms: 18 fixed cells, A, C, C', B, B0, P, A-d1 and B-d1.
+Wall times, all four full runs and the session bench started together on the shared 6-CPU quota (the development runs were paused for part of the acceptance runs so the decisional runs finished first): acceptance robust 20 min 24 s, acceptance standard 19 min 48 s, development robust 31 min 31 s and development standard 30 min 48 s (both including about 11 min paused), session 25 min 36 s. Each seed ran 26 arms: 18 fixed cells, A, C, C', B, B0, P, A-d1 and B-d1.
 
 The 24-frame smoke run's stdout before the change and after it are identical once the inserted `=== COP-183` blocks are removed; the prefix up to the first `=== COP-183` header is byte-identical. Every `COP-183` predicate line on the smoke run prints `None`, and it prints `COP-183 replay-check total_mismatches=0`.
 
@@ -49,7 +49,7 @@ Main's controller reproduces COP-152's baseline exactly. Every per-seed arm B ro
 Robust historical comparison (C1), seed 0, long-CP slot counts: adaptive 330144, fixed 358848, oracle 429256. Ratios 0.920010700910 and 0.769107478987; predicates `330144 > 358848` = False and `5 * 330144 >= 4 * 429256` = False. The bench's line:
 
 ```text
-COP-152 legacy seed=0 adaptive=330144 fixed=358848 oracle=429256 bars=Some((false, (None = non-decisional)
+COP-152 legacy seed=0 adaptive=330144 fixed=358848 oracle=429256 bars=Some((false, false)) (None = non-decisional)
 ```
 
 Standard production comparison (C2): arm B x1 sums of per-seed goodputs are [11260.240734940584, 12636.411899313538, 18309.26976867539], adaptive/fixed/oracle. Ratios of means 0.891094784236 and 0.615002175248; >1.0 = False, >=0.8 = False. The bench's line:
@@ -66,11 +66,76 @@ Main's baseline does not beat best-fixed on either profile, so the ticket's "clo
 
 `crates/coppa-bench/diagnostics/session.rs` runs level 2 fixed, window 8, five 10-minute sessions per Watterson preset. It has no `RateLoop` and no oracle, so it yields no adaptive/best-fixed or adaptive/oracle ratio and is not rate-loop evidence. It is recorded because the ticket asked for it.
 
-This session's rerun did not finish before the phase deadline; 15 session trials had completed when the log was written, and they are in the complete outputs below. The research phase ran the same bench at 2909f04 to completion: Good 2/5 sessions without a drop (the COP-5 floor of 2/5 is met), Moderate 0/5, Poor 0/5; the COP-119 arms report stop-and-wait ideal-ACK Good 3/5, Moderate 4/5, Poor 3/5, and RS(12,6) 5/5 on every preset.
+This run reproduces the research phase's run at 2909f04 preset for preset: Good 2/5 sessions without a drop (the COP-5 floor of 2/5 is met), Moderate 0/5, Poor 0/5; the COP-119 stop-and-wait ideal-ACK arm Good 3/5, Moderate 4/5, Poor 3/5; RS(12,6) 5/5 on every preset. Summary lines:
+
+```text
+Drop = ArqTx::is_failed (RTO cap reached), not a single retransmit.
+-> good: 2/5 sessions completed without a drop, avg net goodput 1314.3 bytes/min
+-> moderate: 0/5 sessions completed without a drop, avg net goodput 1057.8 bytes/min
+-> poor: 0/5 sessions completed without a drop, avg net goodput 342.1 bytes/min
+MET: Good completed 2/5 sessions without a drop (required at least 2/5).
+-> stop-and-wait ideal-ACK good: 3/5 completed, 1107.3 bytes/min
+-> stop-and-wait ideal-ACK moderate: 4/5 completed, 1140.3 bytes/min
+-> stop-and-wait ideal-ACK poor: 3/5 completed, 340.8 bytes/min
+-> stop-and-wait ACK-loss good: 2/5 completed, 1015.3 bytes/min
+-> stop-and-wait ACK-loss moderate: 2/5 completed, 935.6 bytes/min
+-> stop-and-wait ACK-loss poor: 3/5 completed, 196.6 bytes/min
+-> rs12-6 ideal-ACK good: 5/5 completed, 1518.5 bytes/min
+-> rs12-6 ideal-ACK moderate: 5/5 completed, 1457.2 bytes/min
+-> rs12-6 ideal-ACK poor: 5/5 completed, 1043.6 bytes/min
+-> rs12-6 ACK-loss good: 5/5 completed, 1395.7 bytes/min
+-> rs12-6 ACK-loss moderate: 5/5 completed, 1379.6 bytes/min
+-> rs12-6 ACK-loss poor: 5/5 completed, 738.1 bytes/min
+MET: rs12-6 Moderate completed 5/5 sessions without a drop (required 5/5).
+```
 
 ### Development-seed screen (seeds 5 to 9)
 
-The development runs did not finish before this log was written; the planning-phase screen (plan Appendix A) is the only development evidence. See the implement report.
+The committed Rust replay against the plan's Appendix A (scratch Python replay over planning dumps). Largest relative difference over every compared sum and per-seed arm B x1 value: 2.9e-10 (stop condition: 1e-6). `COP-183 replay-check total_mismatches` on the development runs: robust 0, standard 0.
+
+| Profile | Probing | Dwell | arm B x1 sum (bench) | arm B x1 sum (plan) | arm A sum (bench) | arm A sum (plan) | legacy arm A bits (bench) | (plan) | max rel diff |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| standard | 2,1 | 5 | 10046.037498 | 10046.037498 | 9416.603354 | 9416.603354 | 1725840 | 1725840 | 2.5e-11 |
+| standard | 2,1 | 1 | 13482.718686 | 13482.718686 | 11709.496726 | 11709.496726 | 1661072 | 1661072 | 3.0e-11 |
+| standard | off | 5 | 7444.447830 | 7444.447830 | 7155.465142 | 7155.465142 | 1577016 | 1577016 | 4.5e-11 |
+| standard | off | 1 | 11353.275066 | 11353.275066 | 9344.238741 | 9344.238741 | 1659072 | 1659072 | 2.8e-11 |
+| robust | 2,1 | 5 | 8516.523015 | 8516.523015 | 8044.230119 | 8044.230119 | 1637264 | 1637264 | 2.4e-11 |
+| robust | 2,1 | 1 | 11687.549336 | 11687.549336 | 10081.445208 | 10081.445208 | 1552704 | 1552704 | 4.4e-11 |
+| robust | off | 5 | 6650.513138 | 6650.513138 | 6113.287026 | 6113.287026 | 1560520 | 1560520 | 5.3e-11 |
+| robust | off | 1 | 9518.903030 | 9518.903030 | 8064.592678 | 8064.592678 | 1599416 | 1599416 | 2.4e-11 |
+
+Dwell sweep on the development seeds (ratios of five-seed sums; B is arm B x1 against the joint comparators, A is arm A against the long-CP comparators, legacy is arm A bits against best-fixed and oracle bits):
+
+| Profile | Probing | Dwell | B/bf | B/orc | A/bf | A/orc | legacy a/bf, a/o |
+|---|---|---:|---:|---:|---:|---:|---|
+| standard | 2,1 | 1 | 1.0772 | 0.7394 | 1.0648 | 0.7604 | 0.899, 0.759 |
+| standard | 2,1 | 2 | 0.9357 | 0.6422 | 0.9293 | 0.6636 | 0.939, 0.792 |
+| standard | 2,1 | 3 | 0.9442 | 0.6480 | 0.9297 | 0.6640 | 0.937, 0.791 |
+| standard | 2,1 | 4 | 0.7933 | 0.5445 | 0.8368 | 0.5976 | 0.940, 0.793 |
+| standard | 2,1 | 5 | 0.8026 | 0.5509 | 0.8563 | 0.6115 | 0.934, 0.789 |
+| standard | 2,1 | 6 | 0.7153 | 0.4910 | 0.7782 | 0.5557 | 0.927, 0.782 |
+| standard | 2,1 | 8 | 0.6802 | 0.4668 | 0.7382 | 0.5271 | 0.913, 0.771 |
+| standard | off | 1 | 0.9071 | 0.6226 | 0.8497 | 0.6068 | 0.898, 0.758 |
+| standard | off | 2 | 0.7606 | 0.5221 | 0.7335 | 0.5238 | 0.891, 0.752 |
+| standard | off | 3 | 0.6673 | 0.4580 | 0.6938 | 0.4954 | 0.879, 0.742 |
+| standard | off | 4 | 0.6275 | 0.4307 | 0.6671 | 0.4764 | 0.865, 0.730 |
+| standard | off | 5 | 0.5948 | 0.4082 | 0.6507 | 0.4647 | 0.854, 0.721 |
+| standard | off | 6 | 0.5769 | 0.3959 | 0.6191 | 0.4421 | 0.840, 0.709 |
+| standard | off | 8 | 0.5514 | 0.3784 | 0.5864 | 0.4188 | 0.825, 0.696 |
+| robust | 2,1 | 1 | 1.0396 | 0.7238 | 1.0403 | 0.7433 | 0.861, 0.725 |
+| robust | 2,1 | 2 | 0.8385 | 0.5837 | 0.8889 | 0.6351 | 0.910, 0.766 |
+| robust | 2,1 | 3 | 0.8600 | 0.5988 | 0.8669 | 0.6193 | 0.911, 0.767 |
+| robust | 2,1 | 4 | 0.7270 | 0.5062 | 0.8099 | 0.5786 | 0.913, 0.768 |
+| robust | 2,1 | 5 | 0.7575 | 0.5274 | 0.8301 | 0.5931 | 0.908, 0.764 |
+| robust | 2,1 | 6 | 0.6674 | 0.4646 | 0.7503 | 0.5360 | 0.901, 0.759 |
+| robust | 2,1 | 8 | 0.6269 | 0.4365 | 0.7065 | 0.5047 | 0.882, 0.743 |
+| robust | off | 1 | 0.8467 | 0.5895 | 0.8322 | 0.5946 | 0.887, 0.747 |
+| robust | off | 2 | 0.7088 | 0.4935 | 0.7385 | 0.5276 | 0.898, 0.756 |
+| robust | off | 3 | 0.6445 | 0.4487 | 0.6809 | 0.4865 | 0.881, 0.741 |
+| robust | off | 4 | 0.6207 | 0.4321 | 0.6541 | 0.4673 | 0.874, 0.735 |
+| robust | off | 5 | 0.5915 | 0.4118 | 0.6309 | 0.4507 | 0.866, 0.729 |
+| robust | off | 6 | 0.5691 | 0.3962 | 0.6135 | 0.4383 | 0.859, 0.723 |
+| robust | off | 8 | 0.5385 | 0.3749 | 0.5889 | 0.4207 | 0.846, 0.712 |
 
 Stall-gate attribution from planning (development seeds, probing (2,1), stall gate removed): B/bf for dwell 1, 2 and 5 was 1.0772, 1.0403 and 1.0109 on standard and 1.0396, 0.9883 and 0.9866 on robust. Dwell 1 with or without the gate is identical, because at dwell 1 the gate never fires. Most of the candidate's gain comes through the probing cadence the dwell change unlocks.
 
@@ -109,7 +174,7 @@ Stall-gate attribution from planning (development seeds, probing (2,1), stall ga
 C1, robust historical, seed 0: baseline arm A adaptive 330144, candidate arm A-d1 adaptive 301032, fixed 358848, oracle 429256. Candidate ratios 0.838884430177 and 0.701287809605; predicates `301032 > 358848` = False and `5 * 301032 >= 4 * 429256` = False. **C1 falls** (from 0.920010700910 / 0.769107478987): the candidate spends more frames at faster levels, which this airtime-blind slot count cannot credit. The bench's line:
 
 ```text
-COP-183 legacy seed=0 arm=A-d1 adaptive=301032 fixed=358848 oracle=429256 bars=Some((false, (None = non-decisional)
+COP-183 legacy seed=0 arm=A-d1 adaptive=301032 fixed=358848 oracle=429256 bars=Some((false, false)) (None = non-decisional)
 ```
 
 C2, standard production: arm B-d1 x1 sums [13969.341421053516, 12636.411899313538, 18309.26976867539]. Ratios of means 1.105483228337 and 0.762965514056; >1.0 = **True**, >=0.8 = False. The bench's line:
@@ -177,6 +242,8 @@ Every run replays arms A, B, A-d1 and B-d1 from the 18 fixed cells through the r
 ```text
 acc-robust: COP-183 replay-check total_mismatches=0
 acc-standard: COP-183 replay-check total_mismatches=0
+dev-robust: COP-183 replay-check total_mismatches=0
+dev-standard: COP-183 replay-check total_mismatches=0
 ```
 
 So the dwell sweep and G4 are valid replay results on every run reported here.
@@ -897,7 +964,7 @@ COP-183 gates base=standard gates=Some(AdoptionGates { g1: true, g2: true, g3: t
 
 </details>
 
-<details><summary>Development seeds 5-9, robust (incomplete: the run had not finished when this log was written)</summary>
+<details><summary>Development seeds 5-9, robust</summary>
 
 ```text
 === Closed-loop adaptive rate + CP contrast (COP-2) ===
@@ -908,22 +975,684 @@ NOTE         : the short-CP half of this pair is a BENCH-LOCAL SYNTHETIC profile
 unallocated bandwidth_id (5). `select_ofdm_profile` can never select it and the
 engine can never negotiate it, so this base measures the CP lever's MAGNITUDE,
 not a shippable feature. Use the `standard` base for the shippable claim.
+
+
+=== PRIMARY: airtime-normalized goodput (bits/s) ===
+The `airtime(s)` and `goodput` columns are DATA-AIRTIME-ONLY (= switch cost x0) for EVERY
+arm, arm B included. Arm B's CP-handshake air is real and is charged separately in the
+SWITCH ACCOUNTING block below (and as the x1 half of every ratio in THE BAR); it is NOT in
+this table's denominator. Arms A / P / B0 / C / C' and all 18 comparator cells have no
+handshake air at all, so for them x0 is the whole story.
+seed   arm       deliv       bits  airtime(s)    goodput     FER   delivery 95% CI
+5      A      258/300      330976      198.74     1665.4   14.0%   0.816-0.895  
+5      P      258/300      330976      198.74     1665.4   14.0%   0.816-0.895  
+5      B      266/300      338608      173.38     1953.0   11.3%   0.846-0.918  
+5      B0     266/300      338608      172.74     1960.2   11.3%   0.846-0.918  
+5      C      266/300      338608      171.95     1969.2   11.3%   0.846-0.918  
+5      C'     266/300      338608      171.95     1969.2   11.3%   0.846-0.918  
+5      C(fix)  200/300      252800      110.40     2289.9   33.3%   0.612-0.718    (L8)
+6      A      262/300      328696      206.59     1591.1   12.7%   0.831-0.906  
+6      P      262/300      328696      206.59     1591.1   12.7%   0.831-0.906  
+6      B      258/300      325888      200.48     1625.6   14.0%   0.816-0.895  
+6      B0     258/300      325888      199.83     1630.8   14.0%   0.816-0.895  
+6      C      258/300      325888      199.04     1637.3   14.0%   0.816-0.895  
+6      C'     256/300      326936      190.35     1717.6   14.7%   0.809-0.889  
+6      C(fix)  230/300      327520      144.90     2260.3   23.3%   0.716-0.811    (L7)
+7      A      257/300      322896      202.73     1592.7   14.3%   0.812-0.892  
+7      P      257/300      322896      202.73     1592.7   14.3%   0.812-0.892  
+7      B      258/300      320720      191.57     1674.1   14.0%   0.816-0.895  
+7      B0     258/300      320720      190.93     1679.7   14.0%   0.816-0.895  
+7      C      258/300      320720      190.14     1686.7   14.0%   0.816-0.895  
+7      C'     258/300      322672      187.04     1725.2   14.0%   0.816-0.895  
+7      C(fix)  235/300      334640      144.90     2309.5   21.7%   0.733-0.826    (L7)
+8      A      257/300      329408      198.00     1663.6   14.3%   0.812-0.892  
+8      P      257/300      329408      198.00     1663.6   14.3%   0.812-0.892  
+8      B      259/300      328120      188.40     1741.6   13.7%   0.820-0.898  
+8      B0     259/300      328120      187.76     1747.6   13.7%   0.820-0.898  
+8      C      259/300      328120      186.97     1755.0   13.7%   0.820-0.898  
+8      C'     255/300      320800      190.90     1680.5   15.0%   0.805-0.886  
+8      C(fix)  217/300      309008      144.90     2132.6   27.7%   0.670-0.771    (L7)
+9      A      263/300      325288      212.42     1531.4   12.3%   0.835-0.909  
+9      P      263/300      325288      212.42     1531.4   12.3%   0.835-0.909  
+9      B      253/300      328704      175.47     1873.2   15.7%   0.798-0.880  
+9      B0     253/300      328704      174.83     1880.1   15.7%   0.798-0.880  
+9      C      253/300      328704      174.04     1888.7   15.7%   0.798-0.880  
+9      C'     252/300      327784      174.32     1880.4   16.0%   0.794-0.877  
+9      C(fix)  229/300      326096      144.90     2250.5   23.7%   0.712-0.808    (L7)
+
+=== COMPARATORS: 9-cell long-CP-only vs 18-cell joint level x CP (D4) ===
+seed    bestfix(long)    lvl bestfix(joint)   cell  oracle(long) oracle(joint)
+5              2014.9     L7         2289.9 shortL8        2755.2        3337.2
+6              1896.0     L8         2260.3 shortL7        2712.0        3213.0
+7              1976.3     L8         2309.5 shortL7        2765.9        3277.3
+8              1865.9     L8         2132.6 shortL7        2629.3        3094.3
+9              1937.4     L7         2250.5 shortL7        2701.3        3226.3
+
+=== THE BAR (adaptive/best-fixed > 1.0, adaptive/oracle >= 0.8) ===
+Each ratio is printed at BOTH switch-cost multipliers: x0 (arm B's data airtime only) and
+x1 (the loss-free nominal, one handshake charged per switch). x0 alone is what these rows
+used to report, unlabelled -- an arm B that paid nothing for its own switches.
+seed          B/bf(long)       B/orc(long)       B/bf(joint)      B/orc(joint)
+5            0.969/0.929       0.709/0.679       0.853/0.817       0.585/0.561
+6            0.857/0.826       0.599/0.577       0.719/0.693       0.506/0.487
+7            0.847/0.815       0.605/0.582       0.725/0.697       0.511/0.491
+8            0.933/0.897       0.662/0.637       0.817/0.785       0.563/0.541
+9            0.967/0.927       0.693/0.665       0.832/0.798       0.581/0.556
+(each cell is x0/x1)
+
+REMINDER (Key Discovery 1): a uniform CP change is ONE CONSTANT airtime divisor, so it
+cancels out of any ratio. The `(long)` columns let a short-CP arm bank a spurious
+1260/1104 = +14.13% against a comparator DENIED the same lever; the `(joint)` columns are
+the honest ones (D4). A `(joint)` miss is NOT evidence against short CP -- the bar is
+structurally blind to an airtime lever.
+COP-152 seed=5 arm-B bits=338608 data_air=173.38124999999982379 switch_air=7.60975000000000001
+COP-152 segment seed=5 segment=2 bits=43552 data_air=35.64999999999999147 switch_air=-0.00000000000000000
+COP-152 segment seed=5 segment=3 bits=34512 data_air=52.76199999999994361 switch_air=-0.00000000000000000
+COP-152 seed=6 arm-B bits=325888 data_air=200.47524999999978945 switch_air=7.60975000000000001
+COP-152 segment seed=6 segment=2 bits=31136 data_air=53.42899999999995941 switch_air=-0.00000000000000000
+COP-152 segment seed=6 segment=3 bits=37360 data_air=62.07699999999995555 switch_air=-0.00000000000000000
+COP-152 seed=7 arm-B bits=320720 data_air=191.57424999999989268 switch_air=7.60975000000000001
+COP-152 segment seed=7 segment=2 bits=33168 data_air=49.90999999999995396 switch_air=-0.00000000000000000
+COP-152 segment seed=7 segment=3 bits=30816 data_air=56.69499999999996476 switch_air=-0.00000000000000000
+COP-152 seed=8 arm-B bits=328120 data_air=188.40024999999980082 switch_air=7.60975000000000001
+COP-152 segment seed=8 segment=2 bits=35976 data_air=45.97699999999997544 switch_air=-0.00000000000000000
+COP-152 segment seed=8 segment=3 bits=31104 data_air=57.10899999999996624 switch_air=-0.00000000000000000
+COP-152 seed=9 arm-B bits=328704 data_air=175.47424999999992679 switch_air=7.60975000000000001
+COP-152 segment seed=9 segment=2 bits=35240 data_air=47.14999999999997726 switch_air=-0.00000000000000000
+COP-152 segment seed=9 segment=3 bits=34648 data_air=43.46999999999998465 switch_air=-0.00000000000000000
+
+=== LEGACY CONTROL (airtime-blind bits-per-slot; proves the metric swap changed accounting only) ===
+These are the PRE-COP-2 quantities, recomputed. On the `robust` base at seed 0 they must
+reproduce the record: adaptive 326680 / best fixed (L4) 357424 / oracle 428936 /
+adaptive-oracle 0.762 / adaptive-best-fixed 0.914.
+COP-152 legacy seed=5 adaptive=330976 fixed=368816 oracle=432296 bars=None (None = non-decisional)
+seed 5   adaptive  330976 bits | best fixed (L4 )  368816 bits | oracle  432296 bits | a/o = 0.766  a/bf = 0.897
+COP-152 legacy seed=6 adaptive=328696 fixed=356000 oracle=427440 bars=None (None = non-decisional)
+seed 6   adaptive  328696 bits | best fixed (L4 )  356000 bits | oracle  427440 bits | a/o = 0.769  a/bf = 0.923
+COP-152 legacy seed=7 adaptive=322896 fixed=357424 oracle=431864 bars=None (None = non-decisional)
+seed 7   adaptive  322896 bits | best fixed (L4 )  357424 bits | oracle  431864 bits | a/o = 0.748  a/bf = 0.903
+COP-152 legacy seed=8 adaptive=329408 fixed=364544 oracle=422016 bars=None (None = non-decisional)
+seed 8   adaptive  329408 bits | best fixed (L4 )  364544 bits | oracle  422016 bits | a/o = 0.781  a/bf = 0.904
+COP-152 legacy seed=9 adaptive=325288 fixed=356000 oracle=428248 bars=None (None = non-decisional)
+seed 9   adaptive  325288 bits | best fixed (L4 )  356000 bits | oracle  428248 bits | a/o = 0.760  a/bf = 0.914
+NOTE: `best fixed` here is an argmax over BITS (the legacy quantity). The primary table's
+best-fixed is an argmax over GOODPUT, and the two genuinely select different levels -- that
+is the metric change working, not a regression.
+
+=== SWITCH ACCOUNTING (arm B) ===
+Charged per switch: 3 frames under the old profile (Propose, Confirm, bare ack) + 2 under
+the new one (CpSwitched, its ack) = the 5 droppable on-air frames cp_negotiator counts.
+seed    switches   frames   switch_air %of arm B       gp x0       gp x1       gp x6
+5              1        5         7.61     4.39%      1953.0      1870.9      1545.9
+         switch LongCp -> ShortCp decided@3 effective@9 L1
+6              1        5         7.61     3.80%      1625.6      1566.1      1324.0
+         switch LongCp -> ShortCp decided@3 effective@9 L1
+7              1        5         7.61     3.97%      1674.1      1610.2      1351.9
+         switch LongCp -> ShortCp decided@3 effective@9 L1
+8              1        5         7.61     4.04%      1741.6      1674.0      1401.9
+         switch LongCp -> ShortCp decided@3 effective@9 L1
+9              1        5         7.61     4.34%      1873.2      1795.4      1486.5
+         switch LongCp -> ShortCp decided@3 effective@9 L1
+x0 = no-charge upper bound, x1 = loss-free nominal, x6 = ARQ-budget ceiling
+(DEFAULT_MAX_RETRANSMIT = 5). Not charged at all, all biasing arm B optimistic:
+leg retransmissions, 4 half-duplex turnarounds at DEFAULT_TURNAROUND = 150 ms, and
+handshakes that fail and revert via G1-G4 having spent the full budget for zero CP change.
+
+=== CpGate DELAY-SPREAD HISTOGRAM (arm B, per schedule segment) ===
+Grid = (fft_size/nc)/sample_rate = 0.41667 ms; DelayDomainEstimator clamps taps to 1..=8, so
+the metric takes only EIGHT values, 0.000-2.9167 ms. CpGate::default_coppa() threshold is
+2.5 ms and requires STRICTLY below, so buckets 0-5 are calm and 6-7 are not.
+segment             0.000   0.417   0.833   1.250   1.667   2.083   2.500   2.917 undecoded  off_grid
+s5 awgn ramp up        97       0       0       0       0       0       0       0         3         0
+s5 awgn ramp down      91       0       0       0       0       0       0       0         9         0
+s5 watterson good      28      10       0       0       0       0       0       0        12         0
+s5 watterson poor      24       0       0       0       0      16       0       0        10         0
+s6 awgn ramp up        93       0       0       0       0       0       0       0         7         0
+s6 awgn ramp down      92       0       0       0       0       0       0       0         8         0
+s6 watterson good      29       6       0       0       0       0       0       0        15         0
+s6 watterson poor      27       0       0       0       0      11       0       0        12         0
+s7 awgn ramp up        96       0       0       0       0       0       0       0         4         0
+s7 awgn ramp down      90       0       0       0       0       0       0       0        10         0
+s7 watterson good      27      10       0       0       0       0       0       0        13         0
+s7 watterson poor      15       0       0       0       0      20       0       0        15         0
+s8 awgn ramp up        96       0       0       0       0       0       0       0         4         0
+s8 awgn ramp down      91       0       0       0       0       0       0       0         9         0
+s8 watterson good      30       6       0       0       0       0       0       0        14         0
+s8 watterson poor      18       0       0       0       0      18       0       0        14         0
+s9 awgn ramp up        96       0       0       0       0       0       0       0         4         0
+s9 awgn ramp down      90       0       0       0       0       0       0       0        10         0
+s9 watterson good      27       7       0       0       0       0       0       0        16         0
+s9 watterson poor      16       0       0       0       0      17       0       0        17         0
+off_grid total = 0 (MUST be 0; any nonzero value means the nc=48 / 8-tap
+assumption is wrong and this diagnostic is invalid)
+COP-152 standard arm-B-x1 operands=[[1870.8554569011737, 2289.8550724637785, 3337.248023187211], [1566.1292260374382, 2260.317460317452, 3212.9507242539908], [1610.1694915254247, 2309.45479641131, 3277.3217595986403], [1673.996224682416, 2132.560386473422, 3094.333784874621], [1795.3726158484637, 2250.4899930986808, 3226.3391304518673]] bars=None (None = non-decisional)
+
+=== TICKET COP-2 DELTA ===
+Both answers below were PRE-COMMITTED in the plan (D4a) before this run.
+
+PRIMARY -- the denominator delta (where a uniform airtime saving actually appears):
+  best-fixed:  long-CP-only    1938.1 bps  ->  joint    2248.5 bps   (+16.02%)
+  oracle    :  long-CP-only    2712.8 bps  ->  joint    3229.6 bps   (+19.05%)
+  (the uniform CP factor is 1260/1104 = +14.130%; a value at or near it means the lever is
+working exactly as arithmetic predicts, NOT that the bar moved)
+
+SECONDARY -- does CP *adaptivity* add anything over fixed short CP?
+  arm B (CP-adaptive)    1773.5 bps   vs   arm C (adaptive rate, fixed short CP)    1787.4 bps  (-0.78%)   [x0]
+  arm B (CP-adaptive)    1703.3 bps   vs   arm C (adaptive rate, fixed short CP)    1787.4 bps  (-4.70%)   [x1]
+  arm B / best-fixed(joint) = 0.789 (x0) / 0.758 (x1)  (bar: > 1.0)
+  arm B / oracle(joint)     = 0.549 (x0) / 0.527 (x1)  (bar: >= 0.8)
+  x0 = arm B's data airtime only; x1 = its handshake air charged once per switch. Arm C
+has no handshake air at all, so only arm B's side of each comparison moves.
+  upper bound (NOT a CP-isolation control): best hindsight-picked FIXED short-CP cell
+     2248.5 bps -- fixed rate AND fixed CP, so B/this delta still conflates both adaptive
+  dimensions; kept for reference only, per-frame in the seed table above as row "C".
+
+HEADER-CODEWORD ISOLATION (arm C vs arm C', same short CP, header bandwidth ID only):
+  arm C (header id 5)    1787.4 bps   vs   arm C' (header id 3)    1794.6 bps  (+0.40%)
+  for scale: B-vs-C was -0.78% (x0). If |C-vs-C'| is comparable to |B-vs-C|, the
+CP-specific conclusion above is confounded by the header codeword and should not be
+drawn without controlling for it.
+
+D9 DECISION RULE -- per-seed paired deltas, decided on SIGN CONSISTENCY:
+Deltas are shown at x0 and x1. The sign counts below are tallied at BOTH, because a sign
+that survives x0 but not x1 is a result the no-charge accounting manufactured.
+seed         B-A (bps) x0/x1       B-C (bps) x0/x1       B/bf(joint)
+5              +287.6/+205.5           -16.3/-98.4       0.853/0.817
+6                +34.5/-24.9           -11.7/-71.2       0.719/0.693
+7                +81.4/+17.4           -12.6/-76.6       0.725/0.697
+8                +78.0/+10.4           -13.4/-81.0       0.817/0.785
+9              +341.9/+264.0           -15.4/-93.3       0.832/0.798
+  x0: B > A on 5/5 seeds; B > C on 0/5 seeds.
+  x1: B > A on 4/5 seeds; B > C on 0/5 seeds.
+  Sign-consistent (all 5 seeds one way) => a DIRECTIONAL result. Mixed signs => no result,
+and the write-up must say the delta is inside this bench's own run-to-run band rather than
+reporting the mean as if it were an effect. Pairing is exact only at the CHANNEL level: once
+delivery outcomes diverge, RateLoop's trajectory diverges too, so the arms do not transmit
+the same levels on the same frames.
+
+REBUILD PLACEBO -- arm A 1608.8 bps vs arm P 1608.8 bps (+0.00%)
+  If these differ by more than this bench's run-to-run band, arm B must be read against P,
+not A, and the write-up must say so. Do NOT assume the transceiver rebuild is inert.
+
+D1a SHORT-CP AIRTIME SHARE (arm B, on the control arm's pre-reduction basis):
+  seed 5   levels<=4  47.97%   levels>=5  46.13%   (total short-CP  94.10%)
+  seed 6   levels<=4  56.11%   levels>=5  38.79%   (total short-CP  94.90%)
+  seed 7   levels<=4  53.76%   levels>=5  40.91%   (total short-CP  94.67%)
+  seed 8   levels<=4  52.17%   levels>=5  42.40%   (total short-CP  94.57%)
+  seed 9   levels<=4  44.67%   levels>=5  49.50%   (total short-CP  94.17%)
+  Only the levels<=4 share is production-reachable: `select_ofdm_profile` routes every level
+>= 5 to `vhf_wide()` and ignores cp_mode there, so the levels>=5 share is an explicit
+UPPER-BOUND OVERSHOOT this bench collects and production cannot (D1a).
+
+TRANSITION-COUNT GATE (pre-committed): if arm B yields <= 1 CpGate transition, this
+schedule does not exercise CP *adaptivity* at all and the only content is the arm B vs
+arm C fixed contrast -- which short_cp_fading_gate already covers. Do not describe a
+latched single switch as adaptive control.
+  transitions: 5 across 5 seed(s) (mean 1.0/run)
+
+=== COP-183 CANDIDATE: raise_dwell 1 (probing (2,1), CP gate, schedule, seeds and comparators unchanged) ===
+Arms A and B above are the baseline controller (raise dwell 5, probing (2,1)). Arms A-d1 and
+B-d1 are the same shapes with raise dwell 1 and nothing else changed. Each seed ran 26 arms
+(the 18 cells, A, C, C', B, B0, P, A-d1, B-d1); the header's `runs` count predates COP-183.
+COP-183 seed=5 arm=B bits=338608 data_air=173.38124999999982379 switch_air=7.60975000000000001 x1=1870.85545690117373852
+COP-183 seed=5 arm=B-d1 bits=319568 data_air=130.98875000000026603 switch_air=3.11874999999999991 x1=2382.92414667337288847
+COP-183 seed=5 arm=A goodput=1665.38231723807848539
+COP-183 seed=5 arm=A-d1 goodput=2085.29366504231438739
+COP-183 seed=6 arm=B bits=325888 data_air=200.47524999999978945 switch_air=7.60975000000000001 x1=1566.12922603743822947
+COP-183 seed=6 arm=B-d1 bits=313520 data_air=128.45875000000032173 switch_air=3.11874999999999991 x1=2382.77821056031007174
+COP-183 seed=6 arm=A goodput=1591.07400012101197717
+COP-183 seed=6 arm=A-d1 goodput=2006.28478010517073926
+COP-183 seed=7 arm=B bits=320720 data_air=191.57424999999989268 switch_air=7.60975000000000001 x1=1610.16949152542474621
+COP-183 seed=7 arm=B-d1 bits=310792 data_air=130.23650000000026239 switch_air=3.11874999999999991 x1=2330.55691470714054958
+COP-183 seed=7 arm=A goodput=1592.74893176226487412
+COP-183 seed=7 arm=A-d1 goodput=2009.68120131694604424
+COP-183 seed=8 arm=B bits=328120 data_air=188.40024999999980082 switch_air=7.60975000000000001 x1=1673.99622468241591378
+COP-183 seed=8 arm=B-d1 bits=318096 data_air=143.59275000000022260 switch_air=3.11874999999999991 x1=2168.17359239050438191
+COP-183 seed=8 arm=A goodput=1663.64525924382451194
+COP-183 seed=8 arm=A-d1 goodput=1950.60649485907970302
+COP-183 seed=9 arm=B bits=328704 data_air=175.47424999999992679 switch_air=7.60975000000000001 x1=1795.37261584846373808
+COP-183 seed=9 arm=B-d1 bits=314592 data_air=126.71075000000030286 switch_air=3.11874999999999991 x1=2423.11647198825585292
+COP-183 seed=9 arm=A goodput=1531.37961066779485009
+COP-183 seed=9 arm=A-d1 goodput=2029.57906712172371044
+COP-183 standard arm-B-d1-x1 operands=[[2382.924146673373, 2289.8550724637785, 3337.248023187211], [2382.77821056031, 2260.317460317452, 3212.9507242539908], [2330.5569147071405, 2309.45479641131, 3277.3217595986403], [2168.1735923905044, 2132.560386473422, 3094.333784874621], [2423.116471988256, 2250.4899930986808, 3226.3391304518673]] bars=None (None = non-decisional)
+COP-183 legacy seed=5 arm=A-d1 adaptive=304896 fixed=368816 oracle=432296 bars=None (None = non-decisional)
+COP-183 legacy seed=6 arm=A-d1 adaptive=311408 fixed=356000 oracle=427440 bars=None (None = non-decisional)
+COP-183 legacy seed=7 arm=A-d1 adaptive=312832 fixed=357424 oracle=431864 bars=None (None = non-decisional)
+COP-183 legacy seed=8 arm=A-d1 adaptive=311368 fixed=364544 oracle=422016 bars=None (None = non-decisional)
+COP-183 legacy seed=9 arm=A-d1 adaptive=312200 fixed=356000 oracle=428248 bars=None (None = non-decisional)
+COP-183 segment arm=B segment=2 bits=179072 data_air=232.11599999999987176 switch_air=0.00000000000000000 pooled_x1=771.47633080011758011
+COP-183 segment arm=B segment=3 bits=168440 data_air=272.11299999999982901 switch_air=0.00000000000000000 pooled_x1=619.00754465975569474
+COP-183 segment arm=B-d1 segment=2 bits=121000 data_air=133.28500000000002501 switch_air=0.00000000000000000 pooled_x1=907.82908804441592565
+COP-183 segment arm=B-d1 segment=3 bits=145072 data_air=135.58500000000003638 switch_air=0.00000000000000000 pooled_x1=1069.97086698381053793
+
+=== COP-183 REPLAY SELF-CHECK ===
+Each adaptive arm replayed from the 18 fixed cells with `coppa_bench::rate_replay::replay`
+(the real RateLoop and CpPolicy). Zero mismatches is what licenses the replay-only numbers
+below (the dwell sweep and the coppad-default guard).
+COP-183 replay-check seed=5 arm=A slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=5 arm=B slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=5 arm=A-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=5 arm=B-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=6 arm=A slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=6 arm=B slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=6 arm=A-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=6 arm=B-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=7 arm=A slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=7 arm=B slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=7 arm=A-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=7 arm=B-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=8 arm=A slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=8 arm=B slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=8 arm=A-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=8 arm=B-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=9 arm=A slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=9 arm=B slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=9 arm=A-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=9 arm=B-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check total_mismatches=0
+
+=== COP-183 DWELL SWEEP (replay; probing (2,1) and off) ===
+Ratios of five-seed sums. B = arm B shape (CP-adaptive, latency 5) at x1 against
+the joint comparators; A = arm A shape (long CP fixed) against the long-CP comparators;
+legacy = arm A shape's delivered bits against the long-CP best-fixed and oracle bits.
+COP-183 sweep probe=2,1 dwell=1 armB_x1_sum=11687.54933631958374463 bf_joint_sum=11242.67770876464419416 orc_joint_sum=16148.19342236633019638 B/bf=1.0396 B/orc=0.7238 armA_sum=10081.44520844523503911 bf_long_sum=9690.48526077094538778 orc_long_sum=13563.78779220040814835 A/bf=1.0403 A/orc=0.7433 legacy_bits=[1552704,1802784,2141864]
+COP-183 sweep probe=2,1 dwell=2 armB_x1_sum=9426.43916199947125278 bf_joint_sum=11242.67770876464419416 orc_joint_sum=16148.19342236633019638 B/bf=0.8385 B/orc=0.5837 armA_sum=8613.68708853083262511 bf_long_sum=9690.48526077094538778 orc_long_sum=13563.78779220040814835 A/bf=0.8889 A/orc=0.6351 legacy_bits=[1640504,1802784,2141864]
+COP-183 sweep probe=2,1 dwell=3 armB_x1_sum=9668.82695635610798490 bf_joint_sum=11242.67770876464419416 orc_joint_sum=16148.19342236633019638 B/bf=0.8600 B/orc=0.5988 armA_sum=8400.33804457449514302 bf_long_sum=9690.48526077094538778 orc_long_sum=13563.78779220040814835 A/bf=0.8669 A/orc=0.6193 legacy_bits=[1642544,1802784,2141864]
+COP-183 sweep probe=2,1 dwell=4 armB_x1_sum=8173.55839026479497988 bf_joint_sum=11242.67770876464419416 orc_joint_sum=16148.19342236633019638 B/bf=0.7270 B/orc=0.5062 armA_sum=7848.21676701844171475 bf_long_sum=9690.48526077094538778 orc_long_sum=13563.78779220040814835 A/bf=0.8099 A/orc=0.5786 legacy_bits=[1645320,1802784,2141864]
+COP-183 sweep probe=2,1 dwell=5 armB_x1_sum=8516.52301499491659342 bf_joint_sum=11242.67770876464419416 orc_joint_sum=16148.19342236633019638 B/bf=0.7575 B/orc=0.5274 armA_sum=8044.23011903297447134 bf_long_sum=9690.48526077094538778 orc_long_sum=13563.78779220040814835 A/bf=0.8301 A/orc=0.5931 legacy_bits=[1637264,1802784,2141864]
+COP-183 sweep probe=2,1 dwell=6 armB_x1_sum=7502.88648656043915253 bf_joint_sum=11242.67770876464419416 orc_joint_sum=16148.19342236633019638 B/bf=0.6674 B/orc=0.4646 armA_sum=7270.63771107162574481 bf_long_sum=9690.48526077094538778 orc_long_sum=13563.78779220040814835 A/bf=0.7503 A/orc=0.5360 legacy_bits=[1624856,1802784,2141864]
+COP-183 sweep probe=2,1 dwell=8 armB_x1_sum=7047.93081021360831073 bf_joint_sum=11242.67770876464419416 orc_joint_sum=16148.19342236633019638 B/bf=0.6269 B/orc=0.4365 armA_sum=6846.02526548282730801 bf_long_sum=9690.48526077094538778 orc_long_sum=13563.78779220040814835 A/bf=0.7065 A/orc=0.5047 legacy_bits=[1590512,1802784,2141864]
+COP-183 sweep probe=off dwell=1 armB_x1_sum=9518.90303003376902780 bf_joint_sum=11242.67770876464419416 orc_joint_sum=16148.19342236633019638 B/bf=0.8467 B/orc=0.5895 armA_sum=8064.59267811595964304 bf_long_sum=9690.48526077094538778 orc_long_sum=13563.78779220040814835 A/bf=0.8322 A/orc=0.5946 legacy_bits=[1599416,1802784,2141864]
+COP-183 sweep probe=off dwell=2 armB_x1_sum=7968.63739712865208276 bf_joint_sum=11242.67770876464419416 orc_joint_sum=16148.19342236633019638 B/bf=0.7088 B/orc=0.4935 armA_sum=7156.26494918379285082 bf_long_sum=9690.48526077094538778 orc_long_sum=13563.78779220040814835 A/bf=0.7385 A/orc=0.5276 legacy_bits=[1619680,1802784,2141864]
+COP-183 sweep probe=off dwell=3 armB_x1_sum=7246.15980652258440387 bf_joint_sum=11242.67770876464419416 orc_joint_sum=16148.19342236633019638 B/bf=0.6445 B/orc=0.4487 armA_sum=6598.12612179560892400 bf_long_sum=9690.48526077094538778 orc_long_sum=13563.78779220040814835 A/bf=0.6809 A/orc=0.4865 legacy_bits=[1587952,1802784,2141864]
+COP-183 sweep probe=off dwell=4 armB_x1_sum=6978.31199651552196883 bf_joint_sum=11242.67770876464419416 orc_joint_sum=16148.19342236633019638 B/bf=0.6207 B/orc=0.4321 armA_sum=6338.95592256017880572 bf_long_sum=9690.48526077094538778 orc_long_sum=13563.78779220040814835 A/bf=0.6541 A/orc=0.4673 legacy_bits=[1574864,1802784,2141864]
+COP-183 sweep probe=off dwell=5 armB_x1_sum=6650.51313782062425162 bf_joint_sum=11242.67770876464419416 orc_joint_sum=16148.19342236633019638 B/bf=0.5915 B/orc=0.4118 armA_sum=6113.28702632671956962 bf_long_sum=9690.48526077094538778 orc_long_sum=13563.78779220040814835 A/bf=0.6309 A/orc=0.4507 legacy_bits=[1560520,1802784,2141864]
+COP-183 sweep probe=off dwell=6 armB_x1_sum=6398.48081190198990953 bf_joint_sum=11242.67770876464419416 orc_joint_sum=16148.19342236633019638 B/bf=0.5691 B/orc=0.3962 armA_sum=5945.26945714940848120 bf_long_sum=9690.48526077094538778 orc_long_sum=13563.78779220040814835 A/bf=0.6135 A/orc=0.4383 legacy_bits=[1548480,1802784,2141864]
+COP-183 sweep probe=off dwell=8 armB_x1_sum=6053.76089744935507042 bf_joint_sum=11242.67770876464419416 orc_joint_sum=16148.19342236633019638 B/bf=0.5385 B/orc=0.3749 armA_sum=5706.52814046416460769 bf_long_sum=9690.48526077094538778 orc_long_sum=13563.78779220040814835 A/bf=0.5889 A/orc=0.4207 legacy_bits=[1525120,1802784,2141864]
+
+=== COP-183 COPPAD-DEFAULT GUARD (replay: long CP fixed, probing off) ===
+COP-183 coppad-default seed=5 dwell5=1291.00030109568274383 dwell1=1616.25048648512938598
+COP-183 coppad-default seed=6 dwell5=1232.83831265894241369 dwell1=1571.43976274410783844
+COP-183 coppad-default seed=7 dwell5=1159.10543130990663485 dwell1=1545.65847694104922994
+COP-183 coppad-default seed=8 dwell5=1214.94950679923135795 dwell1=1578.48587233142166042
+COP-183 coppad-default seed=9 dwell5=1215.39347446295732880 dwell1=1752.75807961425084613
+COP-183 coppad-default sum dwell5=6113.28702632671956962 dwell1=8064.59267811595964304
+
+=== COP-183 ADOPTION GATES ===
+Pre-registered (docs/benchmarks/ COP-183 log): G1 arm B-d1 x1 beats arm B x1 in the five-seed
+sum and on every seed; G2 pooled Watterson Good and Poor x1 goodput do not fall; G3 arm A-d1's
+sum does not fall below arm A's; G4 the replayed coppad default does not fall. All four, on
+both profiles, adopt raise dwell 1. None = non-decisional (not the five-seed 300-frame run).
+COP-183 gates base=robust gates=None all=None
+
+ frame   snr(dB)  level   (arm B, seed 5; level tracks the channel)
+     0      3.0     L1
+    15      7.1     L5
+    30     11.1     L8
+    45     15.1     L9
+    60     19.2     L9
+    75     23.2     L9
+    90     27.3     L8
+   105     28.6     L9
+   120     24.6     L9
+   135     20.5     L9
+   150     16.5     L8
+   165     12.5     L8
+   180      8.4     L8
+   195      4.4     L8
+   210     24.0     L3
+   225     24.0     L3
+   240     24.0     L5
+   255     24.0     L4
+   270     24.0     L1
+   285     24.0     L2
 ```
 
 </details>
 
-<details><summary>Development seeds 5-9, standard (incomplete: the run had not finished when this log was written)</summary>
+<details><summary>Development seeds 5-9, standard</summary>
 
 ```text
 === Closed-loop adaptive rate + CP contrast (COP-2) ===
 base pair    : hf_standard <-> hf_standard_short_cp (production-faithful, D1)
 frames/run   : 300   seeds: [5, 6, 7, 8, 9]   runs: 120
 DEVELOPMENT SEEDS [5, 6, 7, 8, 9]: screening only; no predicate below is decisional
+
+
+=== PRIMARY: airtime-normalized goodput (bits/s) ===
+The `airtime(s)` and `goodput` columns are DATA-AIRTIME-ONLY (= switch cost x0) for EVERY
+arm, arm B included. Arm B's CP-handshake air is real and is charged separately in the
+SWITCH ACCOUNTING block below (and as the x1 half of every ratio in THE BAR); it is NOT in
+this table's denominator. Arms A / P / B0 / C / C' and all 18 comparator cells have no
+handshake air at all, so for them x0 is the whole story.
+seed   arm       deliv       bits  airtime(s)    goodput     FER   delivery 95% CI
+5      A      262/300      341328      176.87     1929.8   12.7%   0.831-0.906  
+5      P      262/300      341328      176.87     1929.8   12.7%   0.831-0.906  
+5      B      271/300      359152      149.47     2402.8    9.7%   0.865-0.932  
+5      B0     271/300      359152      148.91     2411.9    9.7%   0.865-0.932  
+5      C      271/300      359152      148.23     2422.9    9.7%   0.865-0.932  
+5      C'     274/300      355176      150.67     2357.3    8.7%   0.876-0.940  
+5      C(fix)  232/300      330368      131.10     2520.0   22.7%   0.723-0.817    (L7)
+6      A      265/300      334592      188.29     1777.0   11.7%   0.842-0.915  
+6      P      265/300      334592      188.29     1777.0   11.7%   0.842-0.915  
+6      B      271/300      340448      175.55     1939.3    9.7%   0.865-0.932  
+6      B0     271/300      340448      174.99     1945.5    9.7%   0.865-0.932  
+6      C      271/300      340448      174.32     1953.0    9.7%   0.865-0.932  
+6      C'     271/300      338664      176.85     1915.0    9.7%   0.865-0.932  
+6      C(fix)  232/300      330368      131.10     2520.0   22.7%   0.723-0.817    (L7)
+7      A      268/300      343352      184.80     1858.0   10.7%   0.853-0.923  
+7      P      268/300      343352      184.80     1858.0   10.7%   0.853-0.923  
+7      B      268/300      332616      165.25     2012.8   10.7%   0.853-0.923  
+7      B0     268/300      332616      164.69     2019.7   10.7%   0.853-0.923  
+7      C      268/300      332616      164.01     2028.0   10.7%   0.853-0.923  
+7      C'     268/300      332616      164.01     2028.0   10.7%   0.853-0.923  
+7      C(fix)  208/300      262912      103.50     2540.2   30.7%   0.639-0.743    (L8)
+8      A      275/300      356744      177.61     2008.6    8.3%   0.880-0.943  
+8      P      275/300      356744      177.61     2008.6    8.3%   0.880-0.943  
+8      B      264/300      341208      169.85     2008.9   12.0%   0.838-0.912  
+8      B0     264/300      341208      169.29     2015.5   12.0%   0.838-0.912  
+8      C      264/300      341208      168.61     2023.6   12.0%   0.838-0.912  
+8      C'     265/300      342632      168.52     2033.2   11.7%   0.842-0.915  
+8      C(fix)  160/300      253440      103.50     2448.7   46.7%   0.477-0.589    (L9)
+9      A      268/300      349824      189.79     1843.2   10.7%   0.853-0.923  
+9      P      268/300      349824      189.79     1843.2   10.7%   0.853-0.923  
+9      B      265/300      342472      164.65     2080.0   11.7%   0.842-0.915  
+9      B0     265/300      342472      164.09     2087.1   11.7%   0.842-0.915  
+9      C      265/300      342472      163.41     2095.7   11.7%   0.842-0.915  
+9      C'     265/300      342952      162.49     2110.5   11.7%   0.842-0.915  
+9      C(fix)  229/300      326096      131.10     2487.4   23.7%   0.712-0.808    (L7)
+
+=== COMPARATORS: 9-cell long-CP-only vs 18-cell joint level x CP (D4) ===
+seed    bestfix(long)    lvl bestfix(joint)   cell  oracle(long) oracle(joint)
+5              2255.6     L7         2520.0 shortL7        3135.7        3688.5
+6              2132.1     L9         2520.0 shortL7        2995.2        3634.3
+7              2274.6     L7         2540.2 shortL8        3174.0        3691.1
+8              2145.5     L9         2448.7 shortL9        2992.8        3586.3
+9              2188.9     L7         2487.4 shortL7        3101.1        3635.6
+
+=== THE BAR (adaptive/best-fixed > 1.0, adaptive/oracle >= 0.8) ===
+Each ratio is printed at BOTH switch-cost multipliers: x0 (arm B's data airtime only) and
+x1 (the loss-free nominal, one handshake charged per switch). x0 alone is what these rows
+used to report, unlabelled -- an arm B that paid nothing for its own switches.
+seed          B/bf(long)       B/orc(long)       B/bf(joint)      B/orc(joint)
+5            1.065/1.021       0.766/0.734       0.954/0.914       0.651/0.624
+6            0.910/0.877       0.647/0.624       0.770/0.742       0.534/0.515
+7            0.885/0.851       0.634/0.610       0.792/0.762       0.545/0.525
+8            0.936/0.902       0.671/0.647       0.820/0.790       0.560/0.540
+9            0.950/0.914       0.671/0.645       0.836/0.805       0.572/0.550
+(each cell is x0/x1)
+
+REMINDER (Key Discovery 1): a uniform CP change is ONE CONSTANT airtime divisor, so it
+cancels out of any ratio. The `(long)` columns let a short-CP arm bank a spurious
+1260/1104 = +14.13% against a comparator DENIED the same lever; the `(joint)` columns are
+the honest ones (D4). A `(joint)` miss is NOT evidence against short CP -- the bar is
+structurally blind to an airtime lever.
+COP-152 seed=5 arm-B bits=359152 data_air=149.46999999999962938 switch_air=6.48700000000000010
+COP-152 segment seed=5 segment=2 bits=36920 data_air=32.15400000000001768 switch_air=-0.00000000000000000
+COP-152 segment seed=5 segment=3 bits=45016 data_air=39.14599999999999369 switch_air=-0.00000000000000000
+COP-152 seed=6 arm-B bits=340448 data_air=175.55199999999959459 switch_air=6.48700000000000010
+COP-152 segment seed=6 segment=2 bits=34712 data_air=43.24000000000000199 switch_air=-0.00000000000000000
+COP-152 segment seed=6 segment=3 bits=27272 data_air=54.23399999999997334 switch_air=-0.00000000000000000
+COP-152 seed=7 arm-B bits=332616 data_air=165.24799999999959255 switch_air=6.48700000000000010
+COP-152 segment seed=7 segment=2 bits=28936 data_air=40.20399999999999352 switch_air=-0.00000000000000000
+COP-152 segment seed=7 segment=3 bits=30608 data_air=47.14999999999999147 switch_air=-0.00000000000000000
+COP-152 seed=8 arm-B bits=341208 data_air=169.84799999999961528 switch_air=6.48700000000000010
+COP-152 segment seed=8 segment=2 bits=33416 data_air=44.71199999999999619 switch_air=-0.00000000000000000
+COP-152 segment seed=8 segment=3 bits=31376 data_air=47.14999999999999147 switch_air=-0.00000000000000000
+COP-152 seed=9 arm-B bits=342472 data_air=164.64999999999960778 switch_air=6.48700000000000010
+COP-152 segment seed=9 segment=2 bits=35608 data_air=34.96000000000001506 switch_air=-0.00000000000000000
+COP-152 segment seed=9 segment=3 bits=30768 data_air=51.70399999999997220 switch_air=-0.00000000000000000
+
+=== LEGACY CONTROL (airtime-blind bits-per-slot; proves the metric swap changed accounting only) ===
+These are the PRE-COP-2 quantities, recomputed. On the `robust` base at seed 0 they must
+reproduce the record: adaptive 326680 / best fixed (L4) 357424 / oracle 428936 /
+adaptive-oracle 0.762 / adaptive-best-fixed 0.914.
+COP-152 legacy seed=5 adaptive=341328 fixed=364544 oracle=437288 bars=None (None = non-decisional)
+seed 5   adaptive  341328 bits | best fixed (L4 )  364544 bits | oracle  437288 bits | a/o = 0.781  a/bf = 0.936
+COP-152 legacy seed=6 adaptive=334592 fixed=360272 oracle=431264 bars=None (None = non-decisional)
+seed 6   adaptive  334592 bits | best fixed (L4 )  360272 bits | oracle  431264 bits | a/o = 0.776  a/bf = 0.929
+COP-152 legacy seed=7 adaptive=343352 fixed=375936 oracle=443208 bars=None (None = non-decisional)
+seed 7   adaptive  343352 bits | best fixed (L4 )  375936 bits | oracle  443208 bits | a/o = 0.775  a/bf = 0.913
+COP-152 legacy seed=8 adaptive=356744 fixed=374512 oracle=437896 bars=None (None = non-decisional)
+seed 8   adaptive  356744 bits | best fixed (L4 )  374512 bits | oracle  437896 bits | a/o = 0.815  a/bf = 0.953
+COP-152 legacy seed=9 adaptive=349824 fixed=371664 oracle=439032 bars=None (None = non-decisional)
+seed 9   adaptive  349824 bits | best fixed (L4 )  371664 bits | oracle  439032 bits | a/o = 0.797  a/bf = 0.941
+NOTE: `best fixed` here is an argmax over BITS (the legacy quantity). The primary table's
+best-fixed is an argmax over GOODPUT, and the two genuinely select different levels -- that
+is the metric change working, not a regression.
+
+=== SWITCH ACCOUNTING (arm B) ===
+Charged per switch: 3 frames under the old profile (Propose, Confirm, bare ack) + 2 under
+the new one (CpSwitched, its ack) = the 5 droppable on-air frames cp_negotiator counts.
+seed    switches   frames   switch_air %of arm B       gp x0       gp x1       gp x6
+5              1        5         6.49     4.34%      2402.8      2302.9      1906.4
+         switch LongCp -> ShortCp decided@3 effective@9 L1
+6              1        5         6.49     3.70%      1939.3      1870.2      1587.4
+         switch LongCp -> ShortCp decided@3 effective@9 L1
+7              1        5         6.49     3.93%      2012.8      1936.8      1629.1
+         switch LongCp -> ShortCp decided@3 effective@9 L1
+8              1        5         6.49     3.82%      2008.9      1935.0      1634.4
+         switch LongCp -> ShortCp decided@3 effective@9 L1
+9              1        5         6.49     3.94%      2080.0      2001.2      1682.3
+         switch LongCp -> ShortCp decided@3 effective@9 L1
+x0 = no-charge upper bound, x1 = loss-free nominal, x6 = ARQ-budget ceiling
+(DEFAULT_MAX_RETRANSMIT = 5). Not charged at all, all biasing arm B optimistic:
+leg retransmissions, 4 half-duplex turnarounds at DEFAULT_TURNAROUND = 150 ms, and
+handshakes that fail and revert via G1-G4 having spent the full budget for zero CP change.
+
+=== CpGate DELAY-SPREAD HISTOGRAM (arm B, per schedule segment) ===
+Grid = (fft_size/nc)/sample_rate = 0.41667 ms; DelayDomainEstimator clamps taps to 1..=8, so
+the metric takes only EIGHT values, 0.000-2.9167 ms. CpGate::default_coppa() threshold is
+2.5 ms and requires STRICTLY below, so buckets 0-5 are calm and 6-7 are not.
+segment             0.000   0.417   0.833   1.250   1.667   2.083   2.500   2.917 undecoded  off_grid
+s5 awgn ramp up       100       0       0       0       0       0       0       0         0         0
+s5 awgn ramp down      96       0       0       0       0       0       0       0         4         0
+s5 watterson good      21      12       0       0       0       0       0       0        17         0
+s5 watterson poor      28       0       0       0       0      14       0       0         8         0
+s6 awgn ramp up       100       0       0       0       0       0       0       0         0         0
+s6 awgn ramp down      98       0       0       0       0       0       0       0         2         0
+s6 watterson good      30       5       0       0       0       0       0       0        15         0
+s6 watterson poor      27       0       0       0       0      11       0       0        12         0
+s7 awgn ramp up       100       0       0       0       0       0       0       0         0         0
+s7 awgn ramp down      95       0       0       0       0       0       0       0         5         0
+s7 watterson good      23      10       0       0       0       0       0       0        17         0
+s7 watterson poor      22       0       0       0       0      18       0       0        10         0
+s8 awgn ramp up       100       0       0       0       0       0       0       0         0         0
+s8 awgn ramp down      96       0       0       0       0       0       0       0         4         0
+s8 watterson good      29       6       0       0       0       0       0       0        15         0
+s8 watterson poor      14       0       0       0       0      19       0       0        17         0
+s9 awgn ramp up       100       0       0       0       0       0       0       0         0         0
+s9 awgn ramp down      96       0       0       0       0       0       0       0         4         0
+s9 watterson good      22      11       0       0       0       0       0       0        17         0
+s9 watterson poor      22       0       0       0       0      14       0       0        14         0
+off_grid total = 0 (MUST be 0; any nonzero value means the nc=48 / 8-tap
+assumption is wrong and this diagnostic is invalid)
+COP-152 standard arm-B-x1 operands=[[2302.8911815436363, 2519.9694889397483, 3688.5217025189013], [1870.192651025334, 2519.9694889397483, 3634.272550447161], [1936.797973622155, 2540.21256038648, 3691.142513281124], [1934.998724019626, 2448.6956521739194, 3586.254710258904], [2001.1569678094204, 2487.383676582769, 3635.6494487947007]] bars=None (None = non-decisional)
+
+=== TICKET COP-2 DELTA ===
+Both answers below were PRE-COMMITTED in the plan (D4a) before this run.
+
+PRIMARY -- the denominator delta (where a uniform airtime saving actually appears):
+  best-fixed:  long-CP-only    2199.3 bps  ->  joint    2503.2 bps   (+13.82%)
+  oracle    :  long-CP-only    3079.8 bps  ->  joint    3647.2 bps   (+18.42%)
+  (the uniform CP factor is 1260/1104 = +14.130%; a value at or near it means the lever is
+working exactly as arithmetic predicts, NOT that the bar moved)
+
+SECONDARY -- does CP *adaptivity* add anything over fixed short CP?
+  arm B (CP-adaptive)    2088.8 bps   vs   arm C (adaptive rate, fixed short CP)    2104.6 bps  (-0.75%)   [x0]
+  arm B (CP-adaptive)    2009.2 bps   vs   arm C (adaptive rate, fixed short CP)    2104.6 bps  (-4.53%)   [x1]
+  arm B / best-fixed(joint) = 0.834 (x0) / 0.803 (x1)  (bar: > 1.0)
+  arm B / oracle(joint)     = 0.573 (x0) / 0.551 (x1)  (bar: >= 0.8)
+  x0 = arm B's data airtime only; x1 = its handshake air charged once per switch. Arm C
+has no handshake air at all, so only arm B's side of each comparison moves.
+  upper bound (NOT a CP-isolation control): best hindsight-picked FIXED short-CP cell
+     2503.2 bps -- fixed rate AND fixed CP, so B/this delta still conflates both adaptive
+  dimensions; kept for reference only, per-frame in the seed table above as row "C".
+
+HEADER-CODEWORD ISOLATION (arm C vs arm C', same short CP, header bandwidth ID only):
+  arm C (header id 4)    2104.6 bps   vs   arm C' (header id 1)    2088.8 bps  (-0.75%)
+  for scale: B-vs-C was -0.75% (x0). If |C-vs-C'| is comparable to |B-vs-C|, the
+CP-specific conclusion above is confounded by the header codeword and should not be
+drawn without controlling for it.
+
+D9 DECISION RULE -- per-seed paired deltas, decided on SIGN CONSISTENCY:
+Deltas are shown at x0 and x1. The sign counts below are tallied at BOTH, because a sign
+that survives x0 but not x1 is a result the no-charge accounting manufactured.
+seed         B-A (bps) x0/x1       B-C (bps) x0/x1       B/bf(joint)
+5              +473.0/+373.1          -20.0/-120.0       0.954/0.914
+6               +162.3/+93.2           -13.7/-82.8       0.770/0.742
+7               +154.9/+78.8           -15.2/-91.2       0.792/0.762
+8                 +0.3/-73.6           -14.7/-88.6       0.820/0.790
+9              +236.8/+157.9           -15.7/-94.6       0.836/0.805
+  x0: B > A on 5/5 seeds; B > C on 0/5 seeds.
+  x1: B > A on 4/5 seeds; B > C on 0/5 seeds.
+  Sign-consistent (all 5 seeds one way) => a DIRECTIONAL result. Mixed signs => no result,
+and the write-up must say the delta is inside this bench's own run-to-run band rather than
+reporting the mean as if it were an effect. Pairing is exact only at the CHANNEL level: once
+delivery outcomes diverge, RateLoop's trajectory diverges too, so the arms do not transmit
+the same levels on the same frames.
+
+REBUILD PLACEBO -- arm A 1883.3 bps vs arm P 1883.3 bps (+0.00%)
+  If these differ by more than this bench's run-to-run band, arm B must be read against P,
+not A, and the write-up must say so. Do NOT assume the transceiver rebuild is inert.
+
+D1a SHORT-CP AIRTIME SHARE (arm B, on the control arm's pre-reduction basis):
+  seed 5   levels<=4  43.32%   levels>=5  50.78%   (total short-CP  94.10%)
+  seed 6   levels<=4  55.13%   levels>=5  39.86%   (total short-CP  94.99%)
+  seed 7   levels<=4  51.35%   levels>=5  43.32%   (total short-CP  94.67%)
+  seed 8   levels<=4  52.24%   levels>=5  42.57%   (total short-CP  94.82%)
+  seed 9   levels<=4  51.34%   levels>=5  43.31%   (total short-CP  94.65%)
+  Only the levels<=4 share is production-reachable: `select_ofdm_profile` routes every level
+>= 5 to `vhf_wide()` and ignores cp_mode there, so the levels>=5 share is an explicit
+UPPER-BOUND OVERSHOOT this bench collects and production cannot (D1a).
+
+TRANSITION-COUNT GATE (pre-committed): if arm B yields <= 1 CpGate transition, this
+schedule does not exercise CP *adaptivity* at all and the only content is the arm B vs
+arm C fixed contrast -- which short_cp_fading_gate already covers. Do not describe a
+latched single switch as adaptive control.
+  transitions: 5 across 5 seed(s) (mean 1.0/run)
+
+=== COP-183 CANDIDATE: raise_dwell 1 (probing (2,1), CP gate, schedule, seeds and comparators unchanged) ===
+Arms A and B above are the baseline controller (raise dwell 5, probing (2,1)). Arms A-d1 and
+B-d1 are the same shapes with raise dwell 1 and nothing else changed. Each seed ran 26 arms
+(the 18 cells, A, C, C', B, B0, P, A-d1, B-d1); the header's `runs` count predates COP-183.
+COP-183 seed=5 arm=B bits=359152 data_air=149.46999999999962938 switch_air=6.48700000000000010 x1=2302.89118154363632129
+COP-183 seed=5 arm=B-d1 bits=342920 data_air=118.81299999999960448 switch_air=2.74449999999999994 x1=2821.05176562533051765
+COP-183 seed=5 arm=A goodput=1929.79688758851921193
+COP-183 seed=5 arm=A-d1 goodput=2422.23553546466882835
+COP-183 seed=6 arm=B bits=340448 data_air=175.55199999999959459 switch_air=6.48700000000000010 x1=1870.19265102533404388
+COP-183 seed=6 arm=B-d1 bits=333536 data_air=122.35499999999964871 switch_air=2.74449999999999994 x1=2666.16573207727378758
+COP-183 seed=6 arm=A goodput=1776.99176143342128853
+COP-183 seed=6 arm=A-d1 goodput=2131.19227128823513340
+COP-183 seed=7 arm=B bits=332616 data_air=165.24799999999959255 switch_air=6.48700000000000010 x1=1936.79797362215504108
+COP-183 seed=7 arm=B-d1 bits=329728 data_air=121.56999999999966633 switch_air=2.74449999999999994 x1=2652.36959485820943883
+COP-183 seed=7 arm=A goodput=1857.96536796537066039
+COP-183 seed=7 arm=A-d1 goodput=2451.83547103052251259
+COP-183 seed=8 arm=B bits=341208 data_air=169.84799999999961528 switch_air=6.48700000000000010 x1=1934.99872401962602453
+COP-183 seed=8 arm=B-d1 bits=332200 data_air=121.36599999999964439 switch_air=2.74449999999999994 x1=2676.64702019572041536
+COP-183 seed=8 arm=A goodput=2008.60887068395800270
+COP-183 seed=8 arm=A-d1 goodput=2364.31316297438434049
+COP-183 seed=9 arm=B bits=342472 data_air=164.64999999999960778 switch_air=6.48700000000000010 x1=2001.15696780942039368
+COP-183 seed=9 arm=B-d1 bits=331920 data_air=121.73399999999965360 switch_air=2.74449999999999994 x1=2666.48457364123851221
+COP-183 seed=9 arm=A goodput=1843.24046631100964078
+COP-183 seed=9 arm=A-d1 goodput=2339.92028529474237075
+COP-183 standard arm-B-d1-x1 operands=[[2821.0517656253305, 2519.9694889397483, 3688.5217025189013], [2666.165732077274, 2519.9694889397483, 3634.272550447161], [2652.3695948582094, 2540.21256038648, 3691.142513281124], [2676.6470201957204, 2448.6956521739194, 3586.254710258904], [2666.4845736412385, 2487.383676582769, 3635.6494487947007]] bars=None (None = non-decisional)
+COP-183 legacy seed=5 arm=A-d1 adaptive=333560 fixed=364544 oracle=437288 bars=None (None = non-decisional)
+COP-183 legacy seed=6 arm=A-d1 adaptive=326488 fixed=360272 oracle=431264 bars=None (None = non-decisional)
+COP-183 legacy seed=7 arm=A-d1 adaptive=332616 fixed=375936 oracle=443208 bars=None (None = non-decisional)
+COP-183 legacy seed=8 arm=A-d1 adaptive=333776 fixed=374512 oracle=437896 bars=None (None = non-decisional)
+COP-183 legacy seed=9 arm=A-d1 adaptive=334632 fixed=371664 oracle=439032 bars=None (None = non-decisional)
+COP-183 segment arm=B segment=2 bits=169592 data_air=195.27000000000001023 switch_air=0.00000000000000000 pooled_x1=868.50002560557175002
+COP-183 segment arm=B segment=3 bits=165040 data_air=239.38399999999992929 switch_air=0.00000000000000000 pooled_x1=689.43621963038481226
+COP-183 segment arm=B-d1 segment=2 bits=112448 data_air=124.20000000000005969 switch_air=0.00000000000000000 pooled_x1=905.37842190016056065
+COP-183 segment arm=B-d1 segment=3 bits=151792 data_air=119.99100000000004229 switch_air=0.00000000000000000 pooled_x1=1265.02821044911661374
+
+=== COP-183 REPLAY SELF-CHECK ===
+Each adaptive arm replayed from the 18 fixed cells with `coppa_bench::rate_replay::replay`
+(the real RateLoop and CpPolicy). Zero mismatches is what licenses the replay-only numbers
+below (the dwell sweep and the coppad-default guard).
+COP-183 replay-check seed=5 arm=A slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=5 arm=B slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=5 arm=A-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=5 arm=B-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=6 arm=A slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=6 arm=B slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=6 arm=A-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=6 arm=B-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=7 arm=A slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=7 arm=B slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=7 arm=A-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=7 arm=B-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=8 arm=A slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=8 arm=B slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=8 arm=A-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=8 arm=B-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=9 arm=A slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=9 arm=B slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=9 arm=A-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check seed=9 arm=B-d1 slot_mismatches=0 switch_mismatches=0 first_mismatch_frame=None
+COP-183 replay-check total_mismatches=0
+
+=== COP-183 DWELL SWEEP (replay; probing (2,1) and off) ===
+Ratios of five-seed sums. B = arm B shape (CP-adaptive, latency 5) at x1 against
+the joint comparators; A = arm A shape (long CP fixed) against the long-CP comparators;
+legacy = arm A shape's delivered bits against the long-CP best-fixed and oracle bits.
+COP-183 sweep probe=2,1 dwell=1 armB_x1_sum=13482.71868639777312637 bf_joint_sum=12516.23086702266482462 orc_joint_sum=18235.84092530079215067 B/bf=1.0772 B/orc=0.7394 armA_sum=11709.49672605255182134 bf_long_sum=10996.72915622390064527 orc_long_sum=15398.83467460815336381 A/bf=1.0648 A/orc=0.7604 legacy_bits=[1661072,1846928,2188688]
+COP-183 sweep probe=2,1 dwell=2 armB_x1_sum=11711.46867688523707329 bf_joint_sum=12516.23086702266482462 orc_joint_sum=18235.84092530079215067 B/bf=0.9357 B/orc=0.6422 armA_sum=10218.82412801478312758 bf_long_sum=10996.72915622390064527 orc_long_sum=15398.83467460815336381 A/bf=0.9293 A/orc=0.6636 legacy_bits=[1733856,1846928,2188688]
+COP-183 sweep probe=2,1 dwell=3 armB_x1_sum=11817.73595424181985436 bf_joint_sum=12516.23086702266482462 orc_joint_sum=18235.84092530079215067 B/bf=0.9442 B/orc=0.6480 armA_sum=10224.14742779039806919 bf_long_sum=10996.72915622390064527 orc_long_sum=15398.83467460815336381 A/bf=0.9297 A/orc=0.6640 legacy_bits=[1731448,1846928,2188688]
+COP-183 sweep probe=2,1 dwell=4 armB_x1_sum=9929.42625250111996138 bf_joint_sum=12516.23086702266482462 orc_joint_sum=18235.84092530079215067 B/bf=0.7933 B/orc=0.5445 armA_sum=9202.29804904782940866 bf_long_sum=10996.72915622390064527 orc_long_sum=15398.83467460815336381 A/bf=0.8368 A/orc=0.5976 legacy_bits=[1735256,1846928,2188688]
+COP-183 sweep probe=2,1 dwell=5 armB_x1_sum=10046.03749802017227921 bf_joint_sum=12516.23086702266482462 orc_joint_sum=18235.84092530079215067 B/bf=0.8026 B/orc=0.5509 armA_sum=9416.60335398228016857 bf_long_sum=10996.72915622390064527 orc_long_sum=15398.83467460815336381 A/bf=0.8563 A/orc=0.6115 legacy_bits=[1725840,1846928,2188688]
+COP-183 sweep probe=2,1 dwell=6 armB_x1_sum=8953.07277680463448633 bf_joint_sum=12516.23086702266482462 orc_joint_sum=18235.84092530079215067 B/bf=0.7153 B/orc=0.4910 armA_sum=8557.89159737545014650 bf_long_sum=10996.72915622390064527 orc_long_sum=15398.83467460815336381 A/bf=0.7782 A/orc=0.5557 legacy_bits=[1711616,1846928,2188688]
+COP-183 sweep probe=2,1 dwell=8 armB_x1_sum=8513.25806895897767390 bf_joint_sum=12516.23086702266482462 orc_joint_sum=18235.84092530079215067 B/bf=0.6802 B/orc=0.4668 armA_sum=8117.29539968438166397 bf_long_sum=10996.72915622390064527 orc_long_sum=15398.83467460815336381 A/bf=0.7382 A/orc=0.5271 legacy_bits=[1687112,1846928,2188688]
+COP-183 sweep probe=off dwell=1 armB_x1_sum=11353.27506572857237188 bf_joint_sum=12516.23086702266482462 orc_joint_sum=18235.84092530079215067 B/bf=0.9071 B/orc=0.6226 armA_sum=9344.23874073730621603 bf_long_sum=10996.72915622390064527 orc_long_sum=15398.83467460815336381 A/bf=0.8497 A/orc=0.6068 legacy_bits=[1659072,1846928,2188688]
+COP-183 sweep probe=off dwell=2 armB_x1_sum=9520.39884190842349199 bf_joint_sum=12516.23086702266482462 orc_joint_sum=18235.84092530079215067 B/bf=0.7606 B/orc=0.5221 armA_sum=8066.21270568747513607 bf_long_sum=10996.72915622390064527 orc_long_sum=15398.83467460815336381 A/bf=0.7335 A/orc=0.5238 legacy_bits=[1645080,1846928,2188688]
+COP-183 sweep probe=off dwell=3 armB_x1_sum=8352.42773712242160400 bf_joint_sum=12516.23086702266482462 orc_joint_sum=18235.84092530079215067 B/bf=0.6673 B/orc=0.4580 armA_sum=7629.26687820860115608 bf_long_sum=10996.72915622390064527 orc_long_sum=15398.83467460815336381 A/bf=0.6938 A/orc=0.4954 legacy_bits=[1623240,1846928,2188688]
+COP-183 sweep probe=off dwell=4 armB_x1_sum=7853.71643524173759943 bf_joint_sum=12516.23086702266482462 orc_joint_sum=18235.84092530079215067 B/bf=0.6275 B/orc=0.4307 armA_sum=7335.77340299251773104 bf_long_sum=10996.72915622390064527 orc_long_sum=15398.83467460815336381 A/bf=0.6671 A/orc=0.4764 legacy_bits=[1596824,1846928,2188688]
+COP-183 sweep probe=off dwell=5 armB_x1_sum=7444.44783033002386219 bf_joint_sum=12516.23086702266482462 orc_joint_sum=18235.84092530079215067 B/bf=0.5948 B/orc=0.4082 armA_sum=7155.46514167601344525 bf_long_sum=10996.72915622390064527 orc_long_sum=15398.83467460815336381 A/bf=0.6507 A/orc=0.4647 legacy_bits=[1577016,1846928,2188688]
+COP-183 sweep probe=off dwell=6 armB_x1_sum=7220.19443556087844627 bf_joint_sum=12516.23086702266482462 orc_joint_sum=18235.84092530079215067 B/bf=0.5769 B/orc=0.3959 armA_sum=6808.29545409034199110 bf_long_sum=10996.72915622390064527 orc_long_sum=15398.83467460815336381 A/bf=0.6191 A/orc=0.4421 legacy_bits=[1551152,1846928,2188688]
+COP-183 sweep probe=off dwell=8 armB_x1_sum=6901.01876644909043534 bf_joint_sum=12516.23086702266482462 orc_joint_sum=18235.84092530079215067 B/bf=0.5514 B/orc=0.3784 armA_sum=6448.49751009763895127 bf_long_sum=10996.72915622390064527 orc_long_sum=15398.83467460815336381 A/bf=0.5864 A/orc=0.4188 legacy_bits=[1524376,1846928,2188688]
+
+=== COP-183 COPPAD-DEFAULT GUARD (replay: long CP fixed, probing off) ===
+COP-183 coppad-default seed=5 dwell5=1399.21819474058133892 dwell1=1918.77273953526287187
+COP-183 coppad-default seed=6 dwell5=1450.77530048628250370 dwell1=1767.42999469631581633
+COP-183 coppad-default seed=7 dwell5=1419.78509218414114912 dwell1=1927.49745486873439404
+COP-183 coppad-default seed=8 dwell5=1410.38201384418948692 dwell1=1915.84979641080212787
+COP-183 coppad-default seed=9 dwell5=1475.30454042081919397 dwell1=1814.68875522619168805
+COP-183 coppad-default sum dwell5=7155.46514167601344525 dwell1=9344.23874073730621603
+
+=== COP-183 ADOPTION GATES ===
+Pre-registered (docs/benchmarks/ COP-183 log): G1 arm B-d1 x1 beats arm B x1 in the five-seed
+sum and on every seed; G2 pooled Watterson Good and Poor x1 goodput do not fall; G3 arm A-d1's
+sum does not fall below arm A's; G4 the replayed coppad default does not fall. All four, on
+both profiles, adopt raise dwell 1. None = non-decisional (not the five-seed 300-frame run).
+COP-183 gates base=standard gates=None all=None
+
+ frame   snr(dB)  level   (arm B, seed 5; level tracks the channel)
+     0      3.0     L1
+    15      7.1     L5
+    30     11.1     L8
+    45     15.1     L9
+    60     19.2     L9
+    75     23.2     L9
+    90     27.3     L8
+   105     28.6     L9
+   120     24.6     L9
+   135     20.5     L9
+   150     16.5     L9
+   165     12.5     L8
+   180      8.4     L8
+   195      4.4     L8
+   210     24.0     L4
+   225     24.0     L4
+   240     24.0     L5
+   255     24.0     L3
+   270     24.0     L4
+   285     24.0     L2
 ```
 
 </details>
 
-<details><summary>Session bench (incomplete: the run had not finished when this log was written)</summary>
+<details><summary>Session bench</summary>
 
 ```text
 === Session-robustness bench: 5 x 10-min ARQ sessions/preset ===
@@ -1014,6 +1743,25 @@ Moderate and Poor are diagnostic-only; their results remain reported above.
   rs12-6 ideal-ACK [poor] trial 4: completed (619.2s, 10566 bytes, 1023.9 bytes/min)
 -> rs12-6 ideal-ACK poor: 5/5 completed, 1043.6 bytes/min
 -> rs12-6 ACK-loss clean: 1814.5 bytes/min
+  rs12-6 ACK-loss [good] trial 0: completed (613.8s, 14675 bytes, 1434.5 bytes/min)
+  rs12-6 ACK-loss [good] trial 1: completed (600.9s, 12327 bytes, 1230.8 bytes/min)
+  rs12-6 ACK-loss [good] trial 2: completed (613.3s, 14675 bytes, 1435.6 bytes/min)
+  rs12-6 ACK-loss [good] trial 3: completed (612.3s, 14675 bytes, 1438.1 bytes/min)
+  rs12-6 ACK-loss [good] trial 4: completed (611.8s, 14675 bytes, 1439.2 bytes/min)
+-> rs12-6 ACK-loss good: 5/5 completed, 1395.7 bytes/min
+  rs12-6 ACK-loss [moderate] trial 0: completed (602.0s, 14088 bytes, 1404.1 bytes/min)
+  rs12-6 ACK-loss [moderate] trial 1: completed (606.1s, 13501 bytes, 1336.6 bytes/min)
+  rs12-6 ACK-loss [moderate] trial 2: completed (615.0s, 14675 bytes, 1431.7 bytes/min)
+  rs12-6 ACK-loss [moderate] trial 3: completed (605.4s, 13501 bytes, 1338.0 bytes/min)
+  rs12-6 ACK-loss [moderate] trial 4: completed (609.1s, 14088 bytes, 1387.8 bytes/min)
+-> rs12-6 ACK-loss moderate: 5/5 completed, 1379.6 bytes/min
+  rs12-6 ACK-loss [poor] trial 0: completed (614.4s, 5283 bytes, 515.9 bytes/min)
+  rs12-6 ACK-loss [poor] trial 1: completed (602.2s, 7631 bytes, 760.3 bytes/min)
+  rs12-6 ACK-loss [poor] trial 2: completed (618.0s, 7044 bytes, 683.9 bytes/min)
+  rs12-6 ACK-loss [poor] trial 3: completed (613.8s, 8805 bytes, 860.7 bytes/min)
+  rs12-6 ACK-loss [poor] trial 4: completed (607.5s, 8805 bytes, 869.6 bytes/min)
+-> rs12-6 ACK-loss poor: 5/5 completed, 738.1 bytes/min
+MET: rs12-6 Moderate completed 5/5 sessions without a drop (required 5/5).
 ```
 
 </details>
