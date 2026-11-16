@@ -10,6 +10,7 @@ pub mod impairment;
 pub mod metrics;
 pub mod per_frame_link;
 pub mod profile_ab;
+pub mod rate_replay;
 pub mod report;
 pub mod runner;
 pub mod scenario;

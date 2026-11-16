@@ -391,4 +391,41 @@ mod tests {
         r.on_ack(9, true); // raise_run: 4 -> 5 -> steps up
         assert_eq!(r.current_level(), 2);
     }
+
+    /// COP-183 pins the mechanism its candidate depends on: at `raise_dwell = 1`, every ACK
+    /// leaves `raise_run` at zero, so the probe stall gate never engages and, with probing
+    /// (2, 1), every second transmission is a probe one level up.
+    #[test]
+    fn cop183_dwell_one_never_stall_gates_a_probe() {
+        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 1, 1)
+            .unwrap()
+            .with_probing(2, 1);
+        let mut probes = 0;
+        for f in 0..40 {
+            let (level, is_probe) = r.level_for_next_transmission();
+            let at_ceiling = r.current_level() == *VALID_SPEED_LEVELS.last().unwrap();
+            // Probes land on every odd call until the level reaches the ceiling, where there
+            // is nothing higher to probe.
+            assert_eq!(is_probe, f % 2 == 1 && !at_ceiling, "call {f}");
+            if is_probe {
+                probes += 1;
+                assert_eq!(r.raise_run, 0, "call {f}");
+                r.on_probe_result(level, false);
+            } else {
+                r.on_ack(9, true);
+                assert_eq!(r.raise_run, 0, "call {f}");
+            }
+        }
+        assert!(probes >= 4, "only {probes} probes");
+
+        // The same feedback at dwell 5 stall-gates: `raise_run` is non-zero on the probe turn.
+        let mut r = RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 5, 1)
+            .unwrap()
+            .with_probing(2, 1);
+        let (_, first) = r.level_for_next_transmission();
+        assert!(!first);
+        r.on_ack(9, true);
+        let (_, second) = r.level_for_next_transmission();
+        assert!(!second, "dwell 5 skips the probe while raise_run != 0");
+    }
 }

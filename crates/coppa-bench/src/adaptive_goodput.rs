@@ -55,6 +55,86 @@ pub fn standard_rate_bars(
     Some((sums[0] / sums[1] > 1.0, sums[0] / sums[2] >= 0.8))
 }
 
+/// Inputs to COP-183's pre-registered adoption rule. Every pair is `[baseline, candidate]`:
+/// the baseline is the dwell-5 controller, the candidate the dwell-1 controller, both from
+/// the same `closed_loop_arq` run.
+#[derive(Debug, Clone, Copy)]
+pub struct AdoptionInputs<'a> {
+    pub seeds: &'a [u64],
+    pub frames: usize,
+    /// Arm B (CP-adaptive, latency 5) goodput at switch cost x1, one value per seed.
+    pub arm_b_x1: [&'a [f64]; 2],
+    /// Arm B x1 goodput pooled over seeds in the Watterson Good segment.
+    pub good_x1: [f64; 2],
+    /// Arm B x1 goodput pooled over seeds in the Watterson Poor segment.
+    pub poor_x1: [f64; 2],
+    /// Arm A (long CP fixed, probing (2, 1)) goodput, one value per seed.
+    pub arm_a: [&'a [f64]; 2],
+    /// Replayed coppad default shape (long CP fixed, probing off) goodput, one value per seed.
+    pub coppad_default: [&'a [f64]; 2],
+}
+
+/// The four COP-183 adoption gates, each reported on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdoptionGates {
+    /// G1: arm B x1 rises in its five-seed sum and on every seed.
+    pub g1: bool,
+    /// G2: pooled arm B x1 goodput does not fall in the Watterson Good or Poor segment.
+    pub g2: bool,
+    /// G3: arm A's five-seed sum does not fall.
+    pub g3: bool,
+    /// G4: the replayed coppad default's five-seed sum does not fall.
+    pub g4: bool,
+}
+
+impl AdoptionGates {
+    /// Whether every gate holds, i.e. whether the candidate is adopted on this profile.
+    pub fn all(&self) -> bool {
+        self.g1 && self.g2 && self.g3 && self.g4
+    }
+}
+
+/// COP-183's pre-registered adoption rule for the raise-dwell candidate, fixed in the plan
+/// before any acceptance-seed result existed (`docs/benchmarks/` COP-183 log,
+/// "Pre-registration"):
+///
+/// - G1: `sum(candidate arm B x1) > sum(baseline)`, and candidate > baseline on every seed;
+/// - G2: pooled Good and pooled Poor candidate goodput are each `>=` the baseline's;
+/// - G3: `sum(candidate arm A) >= sum(baseline)`;
+/// - G4: `sum(candidate coppad default) >= sum(baseline)`.
+///
+/// `None` (non-decisional) off the full schedule (seeds other than `[0, 1, 2, 3, 4]`, or a
+/// frame count other than 300), for a per-seed slice whose length differs from the seed
+/// count, or for any non-finite or negative input. Like [`standard_rate_bars`], no value is
+/// rounded before it is compared.
+pub fn adoption_gates(inputs: &AdoptionInputs<'_>) -> Option<AdoptionGates> {
+    if inputs.seeds != [0, 1, 2, 3, 4] || inputs.frames != 300 {
+        return None;
+    }
+    let per_seed = inputs
+        .arm_b_x1
+        .iter()
+        .chain(inputs.arm_a.iter())
+        .chain(inputs.coppad_default.iter());
+    let mut scalars = inputs.good_x1.iter().chain(inputs.poor_x1.iter());
+    let valid = |x: &f64| x.is_finite() && *x >= 0.0;
+    for values in per_seed {
+        if values.len() != inputs.seeds.len() || !values.iter().all(valid) {
+            return None;
+        }
+    }
+    if !scalars.all(valid) {
+        return None;
+    }
+    let sum = |v: &[f64]| -> f64 { v.iter().sum() };
+    let [b_base, b_cand] = inputs.arm_b_x1;
+    let g1 = sum(b_cand) > sum(b_base) && b_cand.iter().zip(b_base).all(|(c, b)| c > b);
+    let g2 = inputs.good_x1[1] >= inputs.good_x1[0] && inputs.poor_x1[1] >= inputs.poor_x1[0];
+    let g3 = sum(inputs.arm_a[1]) >= sum(inputs.arm_a[0]);
+    let g4 = sum(inputs.coppad_default[1]) >= sum(inputs.coppad_default[0]);
+    Some(AdoptionGates { g1, g2, g3, g4 })
+}
+
 use coppa_codec::ofdm::CoppaProfile;
 use coppa_protocol::modem::frame_airtime_s;
 use coppa_protocol::modem::speed_levels::max_payload_for_level;
@@ -768,7 +848,9 @@ mod tests {
 
 #[cfg(test)]
 mod rate_bar_tests {
-    use super::{legacy_rate_bars, standard_rate_bars};
+    use super::{
+        adoption_gates, legacy_rate_bars, standard_rate_bars, AdoptionGates, AdoptionInputs,
+    };
 
     #[test]
     fn legacy_boundaries_use_widened_integer_arithmetic() {
@@ -814,6 +896,128 @@ mod rate_bar_tests {
         assert_eq!(
             standard_rate_bars(&seeds, 300, &values),
             Some((false, false))
+        );
+    }
+
+    fn cop183_passing() -> ([[f64; 5]; 6], [f64; 2], [f64; 2]) {
+        (
+            [
+                [10.0, 11.0, 12.0, 13.0, 14.0], // arm B x1 baseline
+                [11.0, 12.0, 13.0, 14.0, 15.0], // arm B x1 candidate
+                [5.0; 5],                       // arm A baseline
+                [5.0; 5],                       // arm A candidate (equal passes)
+                [3.0; 5],                       // coppad default baseline
+                [4.0; 5],                       // coppad default candidate
+            ],
+            [100.0, 100.0], // Good: equal passes
+            [50.0, 60.0],   // Poor
+        )
+    }
+
+    fn cop183_gates(
+        seeds: &[u64],
+        frames: usize,
+        v: &[[f64; 5]; 6],
+        good: [f64; 2],
+        poor: [f64; 2],
+    ) -> Option<AdoptionGates> {
+        adoption_gates(&AdoptionInputs {
+            seeds,
+            frames,
+            arm_b_x1: [&v[0], &v[1]],
+            good_x1: good,
+            poor_x1: poor,
+            arm_a: [&v[2], &v[3]],
+            coppad_default: [&v[4], &v[5]],
+        })
+    }
+
+    #[test]
+    fn cop183_adoption_gates_are_non_decisional_off_the_full_schedule() {
+        let seeds = [0, 1, 2, 3, 4];
+        let (v, good, poor) = cop183_passing();
+        assert!(cop183_gates(&seeds, 300, &v, good, poor).is_some());
+        // Wrong seeds: development seeds, or a short list.
+        assert_eq!(cop183_gates(&[5, 6, 7, 8, 9], 300, &v, good, poor), None);
+        assert_eq!(cop183_gates(&seeds[..4], 300, &v, good, poor), None);
+        // Wrong frame count.
+        assert_eq!(cop183_gates(&seeds, 299, &v, good, poor), None);
+        assert_eq!(cop183_gates(&seeds, 24, &v, good, poor), None);
+        // A non-finite or negative value anywhere.
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            for row in 0..6 {
+                let mut w = v;
+                w[row][2] = bad;
+                assert_eq!(cop183_gates(&seeds, 300, &w, good, poor), None, "row {row}");
+            }
+            assert_eq!(cop183_gates(&seeds, 300, &v, [bad, 1.0], poor), None);
+            assert_eq!(cop183_gates(&seeds, 300, &v, good, [1.0, bad]), None);
+        }
+        // A per-seed slice whose length differs from the seed count.
+        let short = [1.0; 4];
+        let inputs = AdoptionInputs {
+            seeds: &seeds,
+            frames: 300,
+            arm_b_x1: [&v[0], &v[1]],
+            good_x1: good,
+            poor_x1: poor,
+            arm_a: [&v[2], &short],
+            coppad_default: [&v[4], &v[5]],
+        };
+        assert_eq!(adoption_gates(&inputs), None);
+    }
+
+    #[test]
+    fn cop183_adoption_gates_fail_one_at_a_time() {
+        let seeds = [0, 1, 2, 3, 4];
+        let all = AdoptionGates {
+            g1: true,
+            g2: true,
+            g3: true,
+            g4: true,
+        };
+        let (v, good, poor) = cop183_passing();
+        let pass = cop183_gates(&seeds, 300, &v, good, poor).unwrap();
+        assert_eq!(pass, all);
+        assert!(pass.all());
+
+        // G1 fails on a single seed even though the five-seed sum still rises.
+        let mut w = v;
+        w[1][3] = 12.5; // below the baseline's 13.0 on seed 3
+        w[1][4] = 30.0; // sum still far above the baseline's
+        assert!(w[1].iter().sum::<f64>() > w[0].iter().sum::<f64>());
+        let g = cop183_gates(&seeds, 300, &w, good, poor).unwrap();
+        assert_eq!(g, AdoptionGates { g1: false, ..all });
+        assert!(!g.all());
+        // ...and a tie on one seed is not a rise either.
+        let mut w = v;
+        w[1][0] = w[0][0];
+        assert_eq!(
+            cop183_gates(&seeds, 300, &w, good, poor).unwrap(),
+            AdoptionGates { g1: false, ..all }
+        );
+
+        // G2: Poor below the baseline by 1e-9.
+        let g = cop183_gates(&seeds, 300, &v, good, [50.0, 50.0 - 1e-9]).unwrap();
+        assert_eq!(g, AdoptionGates { g2: false, ..all });
+        // ...and Good below it.
+        let g = cop183_gates(&seeds, 300, &v, [100.0, 99.0], poor).unwrap();
+        assert_eq!(g, AdoptionGates { g2: false, ..all });
+
+        // G3: arm A's sum falls.
+        let mut w = v;
+        w[3][0] = 4.0;
+        assert_eq!(
+            cop183_gates(&seeds, 300, &w, good, poor).unwrap(),
+            AdoptionGates { g3: false, ..all }
+        );
+
+        // G4: the coppad default's sum falls.
+        let mut w = v;
+        w[5] = [2.9; 5];
+        assert_eq!(
+            cop183_gates(&seeds, 300, &w, good, poor).unwrap(),
+            AdoptionGates { g4: false, ..all }
         );
     }
 }
