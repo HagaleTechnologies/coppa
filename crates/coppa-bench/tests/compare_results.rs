@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use coppa_bench::compare::grid::{cells, Channel, SEED_BASE, SIZES, SNRS_DB};
 use coppa_bench::compare::link_stack::row_spec;
-use coppa_bench::compare::render::{first_difference, recorded_version, regions, render_page};
+use coppa_bench::compare::render::{
+    anchor, first_difference, recorded_version, regions, render_page,
+};
 use coppa_bench::compare::trial::{read_csv, Outcome, HEADER};
 use coppa_bench::compare::{default_out_dir, default_page, repo_root};
 
@@ -102,7 +104,8 @@ fn published_trials_follow_the_grid() {
     assert!(trials.iter().any(|t| t.outcome == Outcome::Complete));
 }
 
-/// AC6: `compare --check` exits 0 on the committed tree.
+/// AC6: `compare --check` exits 0 on the committed tree. COP-215 AC3: it
+/// renders all 336 trials of the 42-cell grid.
 #[test]
 fn check_passes_on_the_committed_tree() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_coppa-bench"))
@@ -117,6 +120,51 @@ fn check_passes_on_the_committed_tree() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("matches"), "{stderr}");
+    let all = SNRS_DB.len() * Channel::ALL.len() * SIZES.len() * 8;
+    assert!(stderr.contains(&format!("({all} trials)")), "{stderr}");
+}
+
+/// The body of the page's generated region `name`.
+fn region<'a>(page: &'a str, name: &str) -> &'a str {
+    let begin = format!("<!-- compare:begin {name} -->");
+    let end = format!("<!-- compare:end {name} -->");
+    let start = page
+        .find(&begin)
+        .unwrap_or_else(|| panic!("comparison.md has no {begin}"))
+        + begin.len();
+    let stop = page[start..]
+        .find(&end)
+        .unwrap_or_else(|| panic!("comparison.md has no {end}"))
+        + start;
+    &page[start..stop]
+}
+
+/// COP-215 AC3: the published page has a value in all 42 cells. No table
+/// cell is the dash an unrecorded cell renders as, every cell's value ends
+/// in `k/8` and links to its cell anchor, and the replay region holds that
+/// anchor.
+#[test]
+fn published_page_has_a_value_in_every_cell() {
+    let page = read(&default_page());
+    let tables = region(&page, "tables");
+    let replay = region(&page, "replay");
+    let dashed: Vec<_> = tables.lines().filter(|l| l.contains("| - ")).collect();
+    assert!(
+        dashed.is_empty(),
+        "{} table rows show an unrecorded cell: {dashed:?}",
+        dashed.len()
+    );
+    for cell in cells(&Channel::ALL, &SNRS_DB, &SIZES) {
+        let id = anchor("link-l2", cell.channel, cell.snr_db, cell.size_bytes);
+        assert!(
+            tables.contains(&format!("/8](#{id})")),
+            "no 8-trial value links to #{id}"
+        );
+        assert!(
+            replay.contains(&format!("<a id=\"{id}\"></a>")),
+            "no replay row for #{id}"
+        );
+    }
 }
 
 #[test]
