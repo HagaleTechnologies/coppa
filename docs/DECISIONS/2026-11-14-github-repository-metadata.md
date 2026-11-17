@@ -98,8 +98,12 @@ the eleven D3 topics and `"has_discussions": true`, and the second shows
 
 ## Rejected alternatives
 
-- **The `sdr` topic.** No document in the repository mentions SDR, so the topic would bring
-  visitors looking for something coppa does not describe.
+- **The `sdr` topic.** Row 4 of the
+  [dimension D review](../reviews/2026-09-05-dim-D-docs-positioning.md) proposed it, and
+  H-111, which cites that row, left it out of its eleven. The other reviews mention SDR only as
+  an audience ("SDR hackers", "SDR folks") or as KiwiSDR and WebSDR receivers for on-air tests.
+  No document describes coppa as SDR software, so the topic would bring visitors looking for
+  something coppa does not describe.
 - **The `vara` topic.** It implies compatibility that the clean-room policy and the README
   rule out.
 - **"Winlink-ready" in the description.** See D2.
