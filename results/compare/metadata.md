@@ -82,6 +82,18 @@ both directions measured active TX reference powers of 0.022691 and
 the WGN throughput, so these are real-time self-test numbers, not
 bit-reproducible link rows.
 
+The six rows predate the payload fix: they carried a 256-byte ramp, where
+the harness now writes the link rows' seeded bytes for the same seed. They
+were not re-measured. With coppad's HF_STANDARD compression, the 2048-byte
+ramp encodes to 3550 bytes and the six seeds' payloads to 3509 to 3583. Cut
+into frames of at most 916 encoded bytes (level 2's eight-codeword budget
+less 20 bytes, an approximation of coppad's chunker), each payload takes
+four frames. At 4096 bytes the ramp encodes to 3572 or 3573 bytes against
+7024 to 7112 for the same seeds, so a 16 KB ramp trial would have
+overstated throughput. A resumed run with the same coppad binary would add
+seeded-payload trials to these ramp rows, so re-record all six before
+extending these cells.
+
 ## Public sources
 
 - The channel names (WGN, MPG, MPP) and the SNR grid (30 to 0 dB in 5 dB

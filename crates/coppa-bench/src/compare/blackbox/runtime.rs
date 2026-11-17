@@ -392,6 +392,12 @@ struct TrialContext<'a> {
     version: &'a str,
 }
 
+/// The bytes a trial writes (COP-170 decision 8): `StdRng` seeded with
+/// `derive_seed(seed, 0, 2)`, the link rows' payload for the same seed.
+fn trial_payload(seed: u64, size: usize) -> Vec<u8> {
+    super::super::link_stack::payload(seed, size)
+}
+
 fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String> {
     let TrialContext {
         profile,
@@ -441,9 +447,7 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
         _ => unreachable!(),
     }
     if outcome != "no_connect" {
-        let payload: Vec<u8> = (0..args.size)
-            .map(|i| (seed.wrapping_add(i as u64) & 0xff) as u8)
-            .collect();
+        let payload = trial_payload(seed, args.size);
         let write_time = Instant::now();
         let mut pacer = (profile.adapter == "kiss").then(|| {
             tnc::kiss::Pacer::new(
@@ -586,5 +590,25 @@ mod tests {
             .replace("0x17000000", "0x17120000")
             .replace("0.020000", "0.040000");
         assert!(recorded_cells(&other_cell, &identity).is_ok());
+    }
+
+    #[test]
+    fn trial_payload_is_the_link_rows_seeded_bytes() {
+        use rand::{RngExt, SeedableRng};
+        let seed = 0x1700_0000;
+        let payload = trial_payload(seed, 16384);
+        // COP-170 decision 8, built here rather than through `link_stack`.
+        let mut rng =
+            rand::rngs::StdRng::seed_from_u64(coppa_channel::persistent::derive_seed(seed, 0, 2));
+        let expected: Vec<u8> = (0..16384).map(|_| rng.random::<u8>()).collect();
+        assert_eq!(payload, expected);
+        // coppad's HF_STANDARD compresses each session chunk of up to 4096
+        // bytes; a compressible payload would overstate a trial's net B/min.
+        let core = coppa_engine::CoppaCore::with_config(coppa_engine::EngineConfig::from_profile(
+            &coppa_engine::profiles::HF_STANDARD,
+        ));
+        for chunk in payload.chunks(4096) {
+            assert!(core.encoded_payload_len(chunk) >= chunk.len());
+        }
     }
 }
