@@ -105,6 +105,8 @@ mod tests {
         "To ",
         "From ",
         "Delivered means the other station's coppad received the message. It does not mean someone read it.",
+        // COP-210: the Speed level card names the low-rate floor.
+        "floor",
     ];
 
     #[test]
@@ -355,6 +357,27 @@ mod tests {
         assert!(reset_live.contains("state.chatLoaded = false;"));
         assert!(!reset_live.contains("state.chat.clear()"));
         assert!(!reset_live.contains("state.chat = "));
+    }
+
+    /// COP-210: a socket loss forgets the session waveform pair, so the
+    /// Speed level card falls back to the integer text until the next
+    /// `status`; `applyStatus` takes `phy_mode` only when it is an object.
+    #[test]
+    fn page_forgets_phy_mode_on_socket_loss() {
+        let reset_live = page_function("resetLive");
+        assert!(
+            reset_live.contains("state.phyMode = null;"),
+            "resetLive keeps the waveform pair across a socket loss"
+        );
+        let apply_status = page_function("applyStatus");
+        assert!(
+            apply_status.contains("msg.phy_mode !== null && typeof msg.phy_mode === \"object\""),
+            "applyStatus takes phy_mode without checking its shape"
+        );
+        assert!(
+            INDEX_HTML.contains("case \"phy_mode\":"),
+            "handle ignores the phy_mode push"
+        );
     }
 
     #[test]

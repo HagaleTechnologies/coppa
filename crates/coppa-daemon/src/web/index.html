@@ -228,6 +228,9 @@ const state = {
   speedLevels: null,
   levelKey: "",
   rxLevel: null,
+  // COP-210: `{tx, rx}` waveform pair from `status.phy_mode` and the
+  // `phy_mode` push; null when unknown (older daemon, socket down).
+  phyMode: null,
   buffer: null,
   snrPoints: [],
   lastSnr: null,
@@ -348,6 +351,8 @@ function resetLive() {
   // Receipts missed while the socket is down arrive in the next chat_history.
   state.chatLoaded = false;
   state.chatAvailable = undefined;
+  // A waveform change missed while the socket is down is unknowable.
+  state.phyMode = null;
 }
 
 function onHello(msg) {
@@ -394,6 +399,7 @@ function handle(msg) {
     case "level": state.rxLevel = msg.level; break;
     case "buffer": state.buffer = msg.bytes; break;
     case "speed_level": state.speedLevel = msg.level; state.speedMode = msg.mode; break;
+    case "phy_mode": state.phyMode = { tx: msg.tx ?? null, rx: msg.rx ?? null }; break;
     case "session": applySession(msg.state === "connected", msg.remote_call || null, true); break;
     case "heard": if (Array.isArray(msg.stations)) state.heard = msg.stations; break;
     case "chat": applyChat(msg); break;
@@ -431,6 +437,9 @@ function applyStatus(msg) {
   if (typeof msg.speed_level === "number") state.speedLevel = msg.speed_level;
   if (typeof msg.speed_level_mode === "string") state.speedMode = msg.speed_level_mode;
   if (Array.isArray(msg.speed_levels)) state.speedLevels = msg.speed_levels;
+  if (msg.phy_mode !== null && typeof msg.phy_mode === "object") {
+    state.phyMode = { tx: msg.phy_mode.tx ?? null, rx: msg.phy_mode.rx ?? null };
+  }
   if (typeof msg.level === "number") state.rxLevel = msg.level;
   if (typeof msg.cfo === "number") state.cfo = msg.cfo;
   // A reading without an arrival time follows status; daemon data without
@@ -617,9 +626,17 @@ function renderSnr() {
 }
 
 function renderSpeed() {
-  $("tx-level").textContent = state.speedLevel === null ? "TX —"
-    : "TX " + state.speedLevel + " · " + (state.speedMode === "manual" ? "manual" : "auto");
-  $("rx-level").textContent = state.rxLevel === null ? "RX —" : "RX " + state.rxLevel + " (last decoded frame)";
+  // COP-210: a floor session shows "floor"; a numbered selection shows the
+  // pinned level, because the next frame goes on OFDM.
+  const phy = state.phyMode;
+  const manual = state.speedMode === "manual";
+  const txFloor = phy !== null && phy.tx === "floor" && !manual;
+  const rxFloor = phy !== null && phy.rx === "floor";
+  $("tx-level").textContent = txFloor ? "TX floor · auto"
+    : state.speedLevel === null ? "TX —"
+    : "TX " + state.speedLevel + " · " + (manual ? "manual" : "auto");
+  $("rx-level").textContent = rxFloor ? "RX floor (last decoded frame)"
+    : state.rxLevel === null ? "RX —" : "RX " + state.rxLevel + " (last decoded frame)";
   const levels = state.speedLevels || [];
   const key = levels.join(",");
   const box = $("level-buttons");

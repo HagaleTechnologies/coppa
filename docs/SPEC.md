@@ -2801,6 +2801,29 @@ on OFDM. A lost probe returns it at once (COP-211). Only a segment whose frame
 fits one floor
 frame and carries no outer code is retransmitted there. An in-flight segment
 cut at OFDM size, or sent as an RS(12,6) outer block, keeps the OFDM
-retransmission and fade-hold path, and RS(12,6) block ACKs stay on OFDM. It does not
-stagger discovery by callsign, keeps the 30 s inbound handshake timeout and does
-not replay a lost CONNECT_CFM.
+retransmission and fade-hold path, and RS(12,6) block ACKs stay on OFDM. It
+keeps the 30 s inbound handshake timeout and does not replay a lost
+CONNECT_CFM.
+
+Reference daemon simultaneous calls (COP-210, informative): coppad uses the
+library Link's tie break and stagger, through the shared
+`floor_controller::answers_simultaneous_call` and `calling_retry_stagger`.
+When coppad is dialing a station and hears that station's CONNECT_REQ
+addressed to the callsign it dials from, and its own callsign sorts after the
+caller's, it drops its own dial and answers the request, even while it is not
+listening. The other station keeps its dial and ignores the crossed request.
+While its floor is enabled and its last request was not a floor frame, the
+lexically higher caller waits one more retry interval plus one floor response
+window before each repeat, so it hears the lower station's two OFDM requests
+and first floor request. The host of the answering station sees no `PENDING`:
+the session completes as its own outgoing call (`CONNECTED`), and a crossed
+handshake that fails ends with `DISCONNECTED`, not `CANCELPENDING`.
+
+Host waveform reporting (COP-210, informative): coppad reports the session
+waveform pair to WebSocket hosts as `status.phy_mode` and a reliable
+`phy_mode` push (`docs/HOST-API.md`). `tx` is the waveform of the last session
+frame keyed. `rx` is the waveform of the last session frame a session handler
+accepted: frames for other stations, stale ACKs and replayed handshakes leave
+it unchanged. Each is `null`, `"floor"` or `"ofdm:<level>"`, and both clear to
+`null` when the session ends. This host field is unrelated to the 4-bit PHY
+header `phy_mode` field (§4); it carries nothing on air.

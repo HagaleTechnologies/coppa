@@ -560,7 +560,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:4f14238ae771d15d415aaccf5b59686301a2ab942538122d1884236c47e8b7c2",
+      "hash": "sha256:a312996287acc43dde393ac2f340540eeb72b54ed773d8ceb35f7d8651bd4626",
       "id": "low-rate-floor",
       "kind": "gotcha",
       "links": [
@@ -577,12 +577,14 @@
         "crates/coppa-bench/src/floor_sweep.rs",
         "crates/coppa-protocol/src/modem/floor.rs",
         "crates/coppa-daemon/src/event_loop.rs",
-        "crates/coppa-protocol/src/floor_controller.rs"
+        "crates/coppa-protocol/src/floor_controller.rs",
+        "crates/coppa-host/src/websocket.rs",
+        "crates/coppa-daemon/src/web/index.html"
       ],
       "status": "current",
       "title": "What has the low-rate floor experiment measured?",
-      "verified_commit": "032a8752b64a475a863738c734b6be66d6576330",
-      "verified_date": "2026-11-14",
+      "verified_commit": "5244d4e2534428748155b10810d5835685d1c029",
+      "verified_date": "2026-11-16",
       "visibility": "public"
     },
     {

@@ -392,9 +392,13 @@ update. **UPDATE (2026-11-16, COP-183): re-measured on main; one controller cand
   without peer evidence (measured after a successful probe for a 273-byte
   frame and an 8-byte outer-coded segment; COP-222). A session that moves to
   the floor mid-session keeps its 30 s keepalive interval; RS(12,6) block ACKs
-  stay on OFDM; no `phy_mode` host reporting (COP-210), so the dashboard shows the OFDM level
-  while the floor is in use; no lost-CONNECT_CFM replay; no
-  simultaneous-call tie break or discovery stagger. With a turnaround above
+  stay on OFDM; no lost-CONNECT_CFM replay. Two daemons that dial each other at
+  once connect through the library's lexical tie break (COP-210), but a
+  lexically higher Auto caller staggers each OFDM repeat by one more retry
+  interval plus one floor response window, so on a weak channel it reaches the
+  floor later than a lower caller would. Hosts see the active waveform through
+  the WebSocket `status.phy_mode` field, the `phy_mode` push and the dashboard
+  (COP-210); the VARA command port and the C ABI do not report it. With a turnaround above
   about 5.5 s, the last floor request's reply window and the inbound floor
   handshake can outlast the flat 30 s handshake timeout. Link records 0/10 in the
   reversed direction (lexically higher caller). Production development sweeps now
@@ -453,8 +457,9 @@ update. **UPDATE (2026-11-16, COP-183): re-measured on main; one controller cand
 - COP-190 allocates the candidate's header version value 2 as production
   air-protocol version 2 (SPEC §0.3.3, ADR-014), freezing the tone
   alphabet, header layout, FEC envelope, 40-byte capacity, 8.0 s airtime
-  and receiver search bounds. Frozen v1 formats, host fields and C ABI are
-  unchanged.
+  and receiver search bounds. Frozen v1 formats and the C ABI are
+  unchanged; COP-210 adds the optional WebSocket `phy_mode` status field and
+  push.
 - See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for
   raw development evidence. COP-191 records final-seed sweeps below; no
   production session result is claimed.
@@ -552,8 +557,9 @@ stall scenario does (`docs/testing/bpq-session.md`).
 - COP-190 allocates the candidate's header version value 2 as production
   air-protocol version 2 (SPEC §0.3.3, ADR-014), freezing the tone
   alphabet, header layout, FEC envelope, 40-byte capacity, 8.0 s airtime
-  and receiver search bounds. Frozen v1 formats, host fields and C ABI are
-  unchanged.
+  and receiver search bounds. Frozen v1 formats and the C ABI are
+  unchanged; COP-210 adds the optional WebSocket `phy_mode` status field and
+  push.
 - See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for raw
   development evidence. COP-191's production final-seed sweeps are in
   [BENCHMARKS](../BENCHMARKS.md#cop-191-production-floor-sweeps): both receivers

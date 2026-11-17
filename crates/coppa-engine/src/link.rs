@@ -858,8 +858,9 @@ impl Link {
     }
 
     fn on_connect_req(&mut self, pdu: &MacPdu, from_peer: bool, now: Instant) {
-        let simultaneous =
-            self.phase == Phase::Calling && from_peer && self.local.as_str() > pdu.src.as_str();
+        let simultaneous = self.phase == Phase::Calling
+            && from_peer
+            && floor_policy::answers_simultaneous_call(self.local.as_str(), pdu.src.as_str());
         let repeat = (self.phase == Phase::Accepting && from_peer) || simultaneous;
         if !(repeat || (self.phase == Phase::Idle && self.listening)) {
             return;
@@ -965,19 +966,16 @@ impl Link {
                 // buckets, these complementary roles cannot have equal delays
                 // for distinct callsigns. This matches on_connect_req's tie-break.
                 // Floor retries retain their normal response window.
-                let stagger = if self.config.robust_floor
-                    && self.tx_mode != Some(LinkPhyMode::Floor)
-                    && self.remote().is_some_and(|peer| self.local.as_str() > peer)
-                {
-                    retry_interval
-                        + FloorController::response_window(
-                            LinkPhyMode::Floor,
-                            Duration::ZERO,
-                            self.config.turnaround,
-                        )
-                } else {
-                    Duration::ZERO
-                };
+                let stagger = self.remote().map_or(Duration::ZERO, |peer| {
+                    floor_policy::calling_retry_stagger(
+                        self.local.as_str(),
+                        peer,
+                        self.config.robust_floor,
+                        self.tx_mode.unwrap_or(LinkPhyMode::Ofdm { level }),
+                        retry_interval,
+                        self.config.turnaround,
+                    )
+                });
                 // Keep the idle reaper beyond the retry and its turnaround
                 // hold. Retry exhaustion still bounds an unanswered call.
                 handshake_timeout = handshake_timeout.max(floor_policy::calling_handshake_timeout(

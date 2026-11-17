@@ -237,6 +237,39 @@
         "fade_protection"
       ]
     },
+    "PhyMode": {
+      "description": "COP-210: the waveform a session frame used: \"floor\" or \"ofdm:<level>\".",
+      "type": "string",
+      "pattern": "^(floor|ofdm:[1-9])$"
+    },
+    "PhyModeReport": {
+      "description": "COP-210: the waveform pair `status.phy_mode` reports. `tx` is the waveform\nof the last session frame keyed; `rx` is the waveform of the last session\nframe a session handler accepted. Both are `null` before session activity\nand after the session ends.",
+      "type": "object",
+      "properties": {
+        "rx": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PhyMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "tx": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PhyMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      }
+    },
     "SessionState": {
       "type": "string",
       "enum": [
@@ -621,6 +654,17 @@
                 "null"
               ]
             },
+            "phy_mode": {
+              "description": "COP-210: the waveform of the last session frame keyed (`tx`) and\naccepted (`rx`). Present once the daemon has published; both\nmembers are `null` with no session.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PhyModeReport"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "ptt": {
               "description": "COP-83: PTT state the daemon last commanded.",
               "type": [
@@ -972,6 +1016,39 @@
             "type",
             "level",
             "mode"
+          ]
+        },
+        {
+          "description": "COP-210: the session waveform pair, sent whenever `tx` or `rx`\nchanges, and with both `null` when the session ends. Reliable.",
+          "type": "object",
+          "properties": {
+            "rx": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PhyMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "tx": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PhyMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "phy_mode"
+            }
+          },
+          "required": [
+            "type"
           ]
         },
         {
