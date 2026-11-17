@@ -445,11 +445,21 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
             .map(|i| (seed.wrapping_add(i as u64) & 0xff) as u8)
             .collect();
         let write_time = Instant::now();
+        let mut pacer = (profile.adapter == "kiss").then(|| {
+            tnc::kiss::Pacer::new(
+                &payload,
+                profile.datagram_bytes.unwrap(),
+                tnc::kiss::WINDOW,
+                tnc::kiss::PRESUME_LOST,
+                write_time,
+            )
+        });
         match profile.adapter.as_str() {
             "vara" => host_a.send_data(&payload)?,
             "ardop" => tnc::ardop::send(&mut host_a, &payload)?,
+            // The first window only; the loop below sends the rest as B accounts for them.
             "kiss" => {
-                for frame in tnc::kiss::frames(&payload, profile.datagram_bytes.unwrap()) {
+                for frame in pacer.as_mut().unwrap().due(write_time) {
                     host_a.send_data(&frame)?;
                 }
             }
@@ -477,9 +487,26 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
                     }
                     "kiss" => {
                         wire.extend_from_slice(&bytes[..n]);
-                        datagrams += tnc::kiss::drain_frames(&mut wire, &mut received);
+                        for datagram in tnc::kiss::drain_datagrams(&mut wire) {
+                            if let Some(pacer) = pacer.as_mut() {
+                                pacer.received(&datagram, Instant::now());
+                            }
+                            received.extend_from_slice(&datagram);
+                            datagrams += 1;
+                        }
                     }
                     _ => unreachable!(),
+                }
+            }
+            // A's data connection failing ends the trial, as B's does above.
+            if let Some(pacer) = pacer.as_mut() {
+                if pacer
+                    .due(Instant::now())
+                    .iter()
+                    .any(|frame| host_a.send_data(frame).is_err())
+                {
+                    outcome = "drop";
+                    break;
                 }
             }
             if profile.adapter != "kiss"
