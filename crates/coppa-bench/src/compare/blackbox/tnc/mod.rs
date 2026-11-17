@@ -114,3 +114,107 @@ impl Host {
         Ok(None)
     }
 }
+
+/// Whether either station's command port reports that the connected session
+/// ended. Reads at most one line from each port per call. The answerer's
+/// `DISCONNECTED` counts only after its own `CONNECTED` line: lines before
+/// that belong to a handshake attempt that ended before this session (coppad's
+/// ARDOP interface answers a cancelled inbound attempt with `DISCONNECTED`).
+pub fn session_ended(
+    caller: &mut Host,
+    answerer: &mut Host,
+    answerer_connected: &mut bool,
+) -> Result<bool> {
+    if caller
+        .poll_line()?
+        .is_some_and(|line| line.starts_with("DISCONNECTED"))
+    {
+        return Ok(true);
+    }
+    match answerer.poll_line()? {
+        Some(line) if line.starts_with("CONNECTED") => *answerer_connected = true,
+        Some(line) if line.starts_with("DISCONNECTED") => return Ok(*answerer_connected),
+        _ => {}
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+
+    /// A host joined to a fake TNC that has written `script` on its command
+    /// port. The returned streams keep both connections open.
+    fn station(script: &[u8]) -> (Host, [TcpStream; 2]) {
+        let cmd = TcpListener::bind("127.0.0.1:0").unwrap();
+        let data = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = Host::connect(
+            &cmd.local_addr().unwrap().to_string(),
+            &data.local_addr().unwrap().to_string(),
+        )
+        .unwrap();
+        let (mut c, _) = cmd.accept().unwrap();
+        let (d, _) = data.accept().unwrap();
+        c.write_all(script).unwrap();
+        (host, [c, d])
+    }
+
+    fn ended_within(
+        caller: &mut Host,
+        answerer: &mut Host,
+        answerer_connected: &mut bool,
+        window: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            if session_ended(caller, answerer, answerer_connected).unwrap() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    #[test]
+    fn caller_disconnect_ends_the_session() {
+        let (mut a, _a) = station(b"DISCONNECTED\r");
+        let (mut b, _b) = station(b"");
+        let mut connected = false;
+        assert!(ended_within(
+            &mut a,
+            &mut b,
+            &mut connected,
+            Duration::from_secs(2)
+        ));
+    }
+
+    #[test]
+    fn answerer_disconnect_ends_the_session() {
+        let (mut a, _a) = station(b"");
+        let (mut b, _b) = station(b"CONNECTED N0AAA N0BBB 2300\rDISCONNECTED\r");
+        let mut connected = false;
+        assert!(ended_within(
+            &mut a,
+            &mut b,
+            &mut connected,
+            Duration::from_secs(2)
+        ));
+    }
+
+    #[test]
+    fn answerer_disconnect_before_its_connected_is_ignored() {
+        let (mut a, _a) = station(b"");
+        let (mut b, _b) = station(
+            b"TARGET N0BBB\rNEWSTATE IRS\rDISCONNECTED\rNEWSTATE DISC\rCONNECTED N0AAA 500MAX\rNEWSTATE IRS\r",
+        );
+        let mut connected = false;
+        assert!(!ended_within(
+            &mut a,
+            &mut b,
+            &mut connected,
+            Duration::from_millis(500)
+        ));
+        assert!(connected, "the answerer's CONNECTED line was never read");
+    }
+}

@@ -473,6 +473,7 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
         let deadline = write_time + Duration::from_secs(cap_s);
         let mut received = Vec::new();
         let mut wire = Vec::new();
+        let mut answerer_connected = false;
         while Instant::now() < deadline && received.len() < payload.len() && !relay.is_dead() {
             let mut bytes = [0u8; 4096];
             let n = match host_b.receive_data(&mut bytes) {
@@ -513,10 +514,10 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
                     break;
                 }
             }
+            // Either station's session ending ends the trial: B's data
+            // connection stays open when B reports DISCONNECTED.
             if profile.adapter != "kiss"
-                && host_a
-                    .poll_line()?
-                    .is_some_and(|line| line.starts_with("DISCONNECTED"))
+                && tnc::session_ended(&mut host_a, &mut host_b, &mut answerer_connected)?
             {
                 outcome = "drop";
                 break;
