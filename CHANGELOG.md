@@ -46,6 +46,13 @@ Older releases have no entry here. Their on-air breaks are listed in
 
 ## Unreleased: 0.16.0
 
+- Add `coppa-bench compare` (COP-170): runs coppa's library `Link` through
+  the WGN, MPG and MPP channels at the 2020 Winlink comparison's SNR grid for
+  2 KB and 16 KB transfers, records each trial in a resumable, seed-reproducible
+  CSV, and renders `docs/benchmarks/comparison.md`: mean net bytes/min with a
+  95% interval, completed/n and a replay command per cell. `compare --check`
+  reports a stale page. Coppa rows only; all 42 cells are recorded (COP-215),
+  and the black-box harness for other modems and the channel cross-check follow.
 - coppad's rate loop and `RateLoop::default_coppa()` now step up after one higher
   recommendation instead of five (COP-183). On the simulated closed-loop bench this
   lifts standard-profile adaptive goodput past the best fixed level; adaptive/oracle
@@ -63,6 +70,11 @@ Older releases have no entry here. Their on-air breaks are listed in
   A session established on the floor sends floor-sized data segments on it,
   probes OFDM level 1 after five acknowledged floor segments, and keys its
   ACKs, keepalives and DISCONNECT through the same controller.
+- A coppad session that negotiated the floor returns to it after two unanswered
+  data windows, as the library Link does, including after a successful OFDM
+  probe (COP-211). Before, only a lost probe could return it, so a session
+  whose probe succeeded during a signal peak ended in the COP-68 fade hold
+  when the signal fell back.
 - An unset VARA `RETRIES` now means 3 additional connect requests while the
   speed level is automatic (none with a pinned level). An explicit
   `RETRIES n` is honoured exactly.

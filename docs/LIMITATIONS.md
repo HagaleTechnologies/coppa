@@ -383,17 +383,22 @@ update. **UPDATE (2026-11-16, COP-183): re-measured on main; one controller cand
   carries data, ACKs, keepalives and DISCONNECT through the controller:
   floor-sized segments with no outer code while it is on the floor or
   probing, the floor RTO floor, and one level-1 OFDM probe after five
-  acknowledged floor segments. Still open for the daemon: a session
-  established on OFDM keeps the COP-68 retransmit and fade-hold path when it
-  fades and does not move to the floor mid-session; RS(12,6) block ACKs stay
-  on OFDM; once a level-1 probe succeeds the session never returns to the
-  floor; no lost-CONNECT_CFM replay. Two daemons that dial each other at once
-  connect through the library's lexical tie break (COP-210), but a lexically
-  higher Auto caller staggers each OFDM repeat by one more retry interval
-  plus one floor response window, so on a weak channel it reaches the floor
-  later than a lower caller would. Hosts see the active waveform through the WebSocket
-  `status.phy_mode` field, the `phy_mode` push and the dashboard (COP-210);
-  the VARA command port and the C ABI do not report it. With a turnaround above
+  acknowledged floor segments. Two unanswered data windows move a
+  floor-negotiated session to the floor mid-session (COP-211), but only an
+  in-flight segment whose frame fits one floor frame and carries no outer code
+  is resent there. Still open for the daemon: an OFDM-sized or RS(12,6)
+  outer-coded segment keeps the COP-68 retransmit and fade-hold path,
+  so a session that fades with one in flight ends 180 s after the hold starts
+  without peer evidence (measured after a successful probe for a 273-byte
+  frame and an 8-byte outer-coded segment; COP-222). A session that moves to
+  the floor mid-session keeps its 30 s keepalive interval; RS(12,6) block ACKs
+  stay on OFDM; no lost-CONNECT_CFM replay. Two daemons that dial each other at
+  once connect through the library's lexical tie break (COP-210), but a
+  lexically higher Auto caller staggers each OFDM repeat by one more retry
+  interval plus one floor response window, so on a weak channel it reaches the
+  floor later than a lower caller would. Hosts see the active waveform through
+  the WebSocket `status.phy_mode` field, the `phy_mode` push and the dashboard
+  (COP-210); the VARA command port and the C ABI do not report it. With a turnaround above
   about 5.5 s, the last floor request's reply window and the inbound floor
   handshake can outlast the flat 30 s handshake timeout. Link records 0/10 in the
   reversed direction (lexically higher caller). Production development sweeps now
@@ -564,3 +569,7 @@ stall scenario does (`docs/testing/bpq-session.md`).
 
 - **Full-CI hosted verdict budget (COP-200).** Local optimized groups pass below 25 minutes, but three same-revision hosted workflow verdicts below 30 minutes remain unverified. Other required jobs, runner queue time and cold caches can affect the complete result. See [full-CI measurements](testing/full-ci.md).
 - **Fast-tier duration (COP-203).** ci.yml's platform and feature jobs take 40-63.5 minutes, mostly `cargo test --workspace --lib`. The required `CI` verdict waits for them, so it cannot arrive under 30 minutes. The fan-in waits up to 75 minutes. Cutting that wall time is not done. See [the fast-tier wait](testing/full-ci.md#fast-tier-wait).
+
+## COP-170 same-simulator comparison (first slice)
+
+- **`coppa-bench compare` publishes coppa rows only, with 8 trials in each of its 42 cells.** [docs/benchmarks/comparison.md](benchmarks/comparison.md) holds 8 trials per cell of the `link-l2` row (library `Link`, level 2, floor off) on WGN, MPG and MPP at 30 to 0 dB, for 2 KB and 16 KB transfers. COP-215 recorded the fading 16 KB cells, so the bare `compare` runs no trial on the committed data. With 8 trials a cell's 95% interval is wide wherever trials vary. The numbers come from two library `Link`s in virtual time, not from coppad, and the two stacks were seen to disagree under fading during COP-170 research. The runner writes the payload at the caller's CONNECTED, which avoids the half-open state that waiting for both ends hits under fading (COP-169 section). Each row's SNR reference is the clean frame power at that row's level, so rows at different levels see different absolute noise at one SNR label. The page's numbers were recorded on Linux x86_64 and are bit-reproducible there only. Still open from the COP-170 plan: the black-box harness that drives unmodified modem binaries through the same channel (ALSA FIFO cable, integrity probe, VARA-style, ARDOP and KISS adapters, coppad self-test), and the Watterson cross-check against the IONOS, codec2 and PathSim documentation.

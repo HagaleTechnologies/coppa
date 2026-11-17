@@ -352,6 +352,33 @@ mod tests {
     }
 
     #[test]
+    fn window_expiry_after_successful_probe_follows_enabled() {
+        let probed = || {
+            let mut c = FloorController::default();
+            c.received(LinkPhyMode::Floor);
+            for seq in 0..5 {
+                c.prepare_data(seq);
+                c.acknowledged(seq, LinkPhyMode::Floor);
+            }
+            c.prepare_data(5);
+            c.acknowledged(5, LinkPhyMode::Ofdm { level: 1 });
+            assert!(!c.floor_active());
+            c
+        };
+        let mut off = probed();
+        for _ in 0..20 {
+            off.timeout(false);
+        }
+        let mut on = probed();
+        on.timeout(true);
+        let first = on.mode(2);
+        on.timeout(true);
+        assert_eq!(first, LinkPhyMode::Ofdm { level: 2 });
+        assert_eq!(on.mode(2), LinkPhyMode::Floor);
+        assert_eq!(off.mode(2), LinkPhyMode::Ofdm { level: 2 });
+    }
+
+    #[test]
     fn floor_two_window_fallback() {
         let mut c = FloorController::default();
         c.timeout(true);
