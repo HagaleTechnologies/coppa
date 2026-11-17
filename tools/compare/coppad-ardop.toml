@@ -1,0 +1,36 @@
+# ARDOP host interface to the same unmodified coppad binary.
+name = "coppad-ardop"
+adapter = "ardop"
+binary = "target/release/coppad"
+sha256 = ""
+mode = "HF_STANDARD"
+args = ["--config", "{dir}/coppad.toml"]
+ready_timeout_s = 20
+
+[ports]
+log_line = "ARDOP TNC host interface listening"
+command_key = "command_addr="
+data_key = "data_addr="
+
+[[files]]
+path = "{dir}/coppad.toml"
+contents = """
+[audio]
+sample_rate = 48000
+buffer_size = 16384
+input_device = "{device}"
+output_device = "{device}"
+
+[radio]
+ptt_method = "none"
+
+[host]
+bind_address = "127.0.0.1"
+ardop_enabled = true
+ardop_command_port = 0
+ardop_data_port = 0
+
+[engine]
+profile = "HF_STANDARD"
+callsign = "{call}"
+"""

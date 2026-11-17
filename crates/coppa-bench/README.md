@@ -30,6 +30,15 @@ Not on crates.io and not a product crate. From a clone of the repository:
   the page there, so a replay never overwrites the published one); `--page`
   names another page; `--no-render` measures only. The flat flags above do not
   mix with `compare`.
+- `cargo run --release -p coppa-bench -- compare channel-check` measures the
+  Watterson presets through the 48 kHz audio channel and writes
+  `results/compare/channel-check.csv`. Run bare `compare` to render the page
+  from that CSV, then `compare --check` to verify it.
+- `cargo run --release -p coppa-bench --features cpal-backend -- compare blackbox --modem tools/compare/coppad.toml`
+  runs the Linux ALSA cable experiment. Build a release `coppad` with
+  `--features cpal-backend,ardop,kiss-tnc` first. The cable accepts f32le,
+  48 kHz, mono playback. Live tests also need that release binary. The
+  integrity probe must pass before a trial is recorded.
 
 Results are logged in [BENCHMARKS.md](https://github.com/HagaleTechnologies/coppa/blob/main/BENCHMARKS.md).
 Read its [Conventions](../../BENCHMARKS.md) section and the

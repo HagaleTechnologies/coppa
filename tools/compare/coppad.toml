@@ -1,0 +1,37 @@
+# A modem the black-box harness launches twice, unmodified.
+# The modem must open its ALSA device as f32le, 48000 Hz, mono (coppad does).
+name = "coppad"
+adapter = "vara"
+binary = "target/release/coppad"
+sha256 = ""
+mode = "HF_STANDARD"
+args = ["--config", "{dir}/coppad.toml"]
+ready_timeout_s = 20
+
+[ports]
+log_line = "VARA TCP server listening"
+command_key = "command_addr="
+data_key = "data_addr="
+
+[[files]]
+path = "{dir}/coppad.toml"
+contents = """
+[audio]
+sample_rate = 48000
+buffer_size = 16384
+input_device = "{device}"
+output_device = "{device}"
+
+[radio]
+ptt_method = "none"
+
+[host]
+bind_address = "127.0.0.1"
+vara_enabled = true
+vara_command_port = 0
+vara_data_port = 0
+
+[engine]
+profile = "HF_STANDARD"
+callsign = "{call}"
+"""

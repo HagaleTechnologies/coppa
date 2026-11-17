@@ -1,0 +1,4 @@
+preset,sample_rate,seed,delay_duration_s,doppler_duration_s,delay_set_ms,delay_measured_ms,path_power_ratio_db,spread_set_hz,spread_measured_hz,noise_ref_error_db,within_tolerance
+good,48000,0x17f00000,600,1200,0.500,0.500,-0.260,0.100,0.096,0.006,true
+moderate,48000,0x17f00001,600,300,1.000,1.000,0.060,0.500,0.520,-0.004,true
+poor,48000,0x17f00002,600,300,2.000,2.000,0.619,1.000,0.976,-0.010,true

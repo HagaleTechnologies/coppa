@@ -9,6 +9,9 @@ description = "Measurement harness: BER/FER/goodput-vs-SNR for Coppa PHY modes"
 # [[example]] stanza each; tests/diagnostics_registered.rs keeps them in step.
 autoexamples = false
 
+[features]
+cpal-backend = ["coppa-audio/cpal-backend"]
+
 [dependencies]
 coppa-codec = { path = "../coppa-codec" }
 coppa-protocol = { path = "../coppa-protocol" }

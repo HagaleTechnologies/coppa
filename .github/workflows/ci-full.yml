@@ -180,6 +180,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Clippy KISS TNC without audio backend
         run: cargo clippy -p coppa-daemon --features kiss-tnc -- -D warnings
+      - name: Clippy coppa-bench black-box harness
+        run: cargo clippy -p coppa-bench --features cpal-backend --all-targets -- -D warnings
 
   msrv:
     name: MSRV Check
