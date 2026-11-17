@@ -189,15 +189,17 @@ fn published_data_is_coppa_only() {
             {
                 let text = read(&path);
                 assert!(text.starts_with("modem,adapter,version_reply,"));
+                // Decision 10: the modem column is coppad and the version
+                // reply column itself starts with "VERSION Coppa".
                 for row in text.lines().skip(1) {
+                    let fields: Vec<_> = row.split(',').collect();
+                    assert_eq!(fields.len(), 24, "{}: malformed row {row}", path.display());
+                    assert_eq!(fields[0], "coppad", "{}: foreign row {row}", path.display());
                     assert!(
-                        row.starts_with("coppad,"),
-                        "{}: foreign row",
-                        path.display()
-                    );
-                    assert!(
-                        row.contains("VERSION Coppa"),
-                        "{}: foreign version",
+                        fields
+                            .get(2)
+                            .is_some_and(|v| v.starts_with("VERSION Coppa")),
+                        "{}: foreign version reply in {row}",
                         path.display()
                     );
                 }
@@ -263,22 +265,6 @@ fn ci_full_lints_the_blackbox_feature() {
 }
 
 #[test]
-fn docs_name_both_compare_commands_and_audio_feature() {
-    let readme = read(&repo_root().join("crates/coppa-bench/README.md"));
-    for expected in [
-        "compare channel-check",
-        "compare blackbox",
-        "--features cpal-backend",
-        "f32le",
-    ] {
-        assert!(readme.contains(expected), "README lacks {expected}");
-    }
-    let changelog = read(&repo_root().join("CHANGELOG.md"));
-    assert!(changelog.contains("compare blackbox"));
-    assert!(changelog.contains("compare channel-check"));
-}
-
-#[test]
 fn channel_cross_check_records_three_passing_presets() {
     let rows =
         coppa_bench::compare::channel_check::read_csv(&default_out_dir().join("channel-check.csv"))
@@ -331,23 +317,6 @@ fn blackbox_selftest_records_every_field() {
 }
 
 #[test]
-fn page_records_public_dialect_and_channel_sources() {
-    let page = read(&default_page());
-    for source in [
-        "docs/HOST-API.md",
-        "docs/ARDOP.md",
-        "KISS TNC paper",
-        "IONOS manual",
-        "README_ofdm.md",
-        "PathSim's page",
-    ] {
-        assert!(page.contains(source), "page lacks {source}");
-    }
-    assert!(page.contains("No other modem's source was read"));
-    assert!(page.contains("no other modem was run for any number"));
-}
-
-#[test]
 fn metadata_names_version_commands_and_sources() {
     let m = read(&default_out_dir().join("metadata.md"));
     for needle in [
@@ -372,6 +341,37 @@ fn page_records_clean_room_provenance() {
     assert!(page.contains("No other modem's source was read"));
     assert!(page.contains("no other modem was run for any number on this page"));
     assert!(page.contains("This page publishes coppa rows only"));
+    // COP-214 (AC11): the provenance section names the public source of each
+    // host dialect and channel model.
+    let provenance = section(&page, "## Provenance and clean-room statement");
+    for source in [
+        "docs/HOST-API.md",
+        "docs/ARDOP.md",
+        "KISS TNC paper",
+        "IONOS manual",
+        "README_ofdm.md",
+        "PathSim's page",
+    ] {
+        assert!(provenance.contains(source), "provenance lacks {source}");
+    }
+}
+
+/// The text of one `## ` section of a Markdown page, heading included. The
+/// heading must start a line, so `### Status` or prose quoting a heading
+/// cannot stand in for it.
+fn section<'a>(page: &'a str, heading: &str) -> &'a str {
+    let start = if page.starts_with(heading) {
+        0
+    } else {
+        page.find(&format!("\n{heading}"))
+            .unwrap_or_else(|| panic!("page lacks {heading}"))
+            + 1
+    };
+    let rest = &page[start..];
+    let end = rest[heading.len()..]
+        .find("\n## ")
+        .map_or(rest.len(), |i| heading.len() + i);
+    &rest[..end]
 }
 
 #[test]
@@ -386,6 +386,45 @@ fn docs_point_at_the_comparison_page() {
     assert!(limitations.contains("## COP-170 same-simulator comparison"));
     let changelog = read(&root.join("CHANGELOG.md"));
     assert!(changelog.contains("coppa-bench compare"));
+
+    // COP-214 (AC10): every document says what shipped.
+    for (name, text) in [
+        ("BENCHMARKS.md", &benchmarks),
+        ("crates/coppa-bench/README.md", &readme),
+        ("CHANGELOG.md", &changelog),
+    ] {
+        for command in ["compare blackbox", "compare channel-check"] {
+            assert!(text.contains(command), "{name} lacks {command}");
+        }
+    }
+    for expected in ["--features cpal-backend", "f32le", "release `coppad`"] {
+        assert!(
+            readme.contains(expected),
+            "crates/coppa-bench/README.md lacks {expected}"
+        );
+    }
+    let comparison = section(&limitations, "## COP-170 same-simulator comparison");
+    assert!(
+        !comparison.contains("Still open from the COP-170 plan"),
+        "LIMITATIONS.md still lists the harness and cross-check as open"
+    );
+    // The f32-only cable and the planning probe's numbers.
+    for expected in [
+        "f32le",
+        "48 kHz, mono",
+        "0.772",
+        "correlation 1.000000",
+        "PathSim's delay offset is not measured",
+    ] {
+        assert!(
+            comparison.contains(expected),
+            "LIMITATIONS.md lacks {expected}"
+        );
+    }
+    let page = read(&default_page());
+    let status = section(&page, "## Status");
+    assert!(status.contains("(COP-214)"), "page Status: {status}");
+    assert!(!status.contains("Still to come"), "page Status: {status}");
 }
 
 /// Re-runs four committed trials, one of them a fading 16 KB trial (COP-215),
