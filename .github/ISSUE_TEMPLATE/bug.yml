@@ -1,0 +1,70 @@
+name: Bug report
+description: Something in coppa or coppad does not work as documented.
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problems go to the [Security tab](https://github.com/HagaleTechnologies/coppa/security/policy), not here.
+        Known gaps and open bugs are listed in [docs/LIMITATIONS.md](https://github.com/HagaleTechnologies/coppa/blob/main/docs/LIMITATIONS.md).
+  - type: textarea
+    id: version
+    attributes:
+      label: "`coppa --version` output"
+      description: Paste the whole output. It names the commit and the features your build has.
+      placeholder: |
+        coppa 0.16.0
+        commit: 2909f043a741
+        features: file-backend
+        wire format: 1
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+      placeholder: Debian 12 on a Raspberry Pi 4, macOS 15, Windows 11
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you installed coppa
+      options:
+        - Release archive
+        - Built from source
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: Include any error message exactly as coppa or coppad printed it.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The commands you ran, the `coppad.toml` settings you changed, and the profile and speed level in use. Remove `websocket_token` and anything else you would not post publicly.
+      placeholder: |
+        1. coppa tx "CQ CQ CQ DE VK2ABC K" --level 4 -o cq.wav
+        2. coppa rx cq.wav
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: "`coppa doctor` output or logs"
+      description: Optional. `coppa doctor` checks audio devices and rigctld without transmitting. Remove tokens, addresses and anything else you would not post publicly.
+      render: text

@@ -20,6 +20,7 @@ Design decisions for coppa, one file per decision. Process and owner calls live 
 | [ADR-012 (COP-119)](012-cop119-session-outer-code.md) | negotiated session erasure protection | Accepted | 2026-11-06 (merge date) |  |
 | [ADR-012 (COP-128)](012-cop128-cfo-hypothesis-search.md) | Fine-stage CFO hypothesis search | Accepted | 2026-11-04 | Widens ADR-003's ±50 Hz acquisition range |
 | [ADR-013 (COP-121)](013-cop121-session-app-messages.md) | chat as a negotiated second stream inside the session ARQ | Accepted | 2026-11-08 (merge date) |  |
+| [ADR-014 (COP-190)](014-cop190-low-rate-floor.md) | COP-190 low-rate floor — air-protocol version 2 framing | Accepted | 2026-11-12 | Carries COP-202 and COP-210 amendments |
 
 The status column uses three values: `Accepted`, `Accepted, partly superseded` (a later ADR or
 an inline update replaces one claim, and the rest stands) and `Superseded by ADR-N` (the
@@ -47,7 +48,7 @@ ADR-007 and ADR-008 cite `crates/coppa-bench/examples/`, moved to
 
 ## Adding an ADR
 
-The next free number is 014. Claim it by adding your row to this table in your draft pull request. Start the file with `# ADR-NNN: <title>` and a
+The next free number is 015. Claim it by adding your row to this table in your draft pull request. Start the file with `# ADR-NNN: <title>` and a
 `## Status` section whose first line is the status, in the form ADR-009 and ADR-010 use:
 `Accepted, <ticket>, <YYYY-MM-DD>.` Then add a row to the table above. To change an existing
 decision, add a dated inline update (`**<ticket> update (<YYYY-MM-DD>):** ...`) to that ADR,
