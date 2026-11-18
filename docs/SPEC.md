@@ -2112,7 +2112,7 @@ complete exchange.
 | 2 | 1 | `fec_rate_num` | 1 | 1 |
 | 3 | 1 | `fec_rate_den` | 2 | 2 |
 | 4 | 1 | `arq_window` | 8 | 8 |
-| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bit 5 `windowed_arq` (COP-168), bit 6 `robust_floor`, bit 7 reserved | `0x00` | `0x06`; `0x16` with the WebSocket API on |
+| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bit 5 `windowed_arq` (COP-168), bit 6 `robust_floor`, bit 7 reserved | `0x00` | `0x46`; `0x56` with the WebSocket API on; `0x42` with `fade_protection = "off"`. Bit 6 is clear while a numbered speed level is pinned |
 | 6 | 1 | `mcs_index` | 0 | 0 |
 
 The library default encodes as `00c80102080000` (P24). coppad sets
@@ -2750,6 +2750,7 @@ Informative reference behaviour (COP-172): inbound sessions use the dialled
 MYCALL as their local callsign. A host may set RETRIES n, from 0 to 20, to
 send 1+n ConnectReq frames separated by max twice request airtime plus two
 turnarounds, or five seconds. Repeats stop at 300 s. This changes no wire field.
+Unset, coppad sends 1+3 while its speed level is automatic.
 
 ### Negotiated low-rate floor session policy
 
@@ -2780,5 +2781,49 @@ RTO floor. With a 500 ms turnaround this is 20 seconds. Keepalives wait 60 secon
 capped at one third of the configured session timeout, to
 leave room for probe timeout and an eight-second recovery frame. Simultaneous
 call retries stagger by the local callsign; the lexically higher station
-accepts the lower station's request. The daemon does not implement this policy
-yet. These deterministic rules do not imply a measured connection probability.
+accepts the lower station's request. These deterministic rules do not imply a
+measured connection probability.
+
+Reference daemon behaviour (COP-202, informative): coppad advertises
+robust_floor while its speed level is automatic and runs the same
+FloorController policy as the library Link for the handshake. It starts
+discovery on OFDM, sends a floor CONNECT_REQ after two unanswered request
+windows, and answers each handshake frame in the waveform it arrived on. In
+Auto its request windows add the airtime of any station ID it prepended and of
+one level-1 OFDM station-ID frame for the peer's reply. It accepts floor session frames once both sides confirm bit 6. Session data,
+ACKs, keepalives and DISCONNECT then follow the same controller: while it is on
+the floor or probing, a data segment is cut so its MAC PDU fits one floor frame
+and its encoded payload fits one level-1 codeword, with no outer code, and a
+floor key-up's retransmission timeout is at least the floor RTO floor plus the
+station-ID allowance. Two unanswered data windows return a floor-negotiated
+session to the floor, also after a successful probe or when it was established
+on OFDM. A lost probe returns it at once (COP-211). Only a segment whose frame
+fits one floor
+frame and carries no outer code is retransmitted there. An in-flight segment
+cut at OFDM size, or sent as an RS(12,6) outer block, keeps the OFDM
+retransmission and fade-hold path, and RS(12,6) block ACKs stay on OFDM. It
+keeps the 30 s inbound handshake timeout and does not replay a lost
+CONNECT_CFM.
+
+Reference daemon simultaneous calls (COP-210, informative): coppad uses the
+library Link's tie break and stagger, through the shared
+`floor_controller::answers_simultaneous_call` and `calling_retry_stagger`.
+When coppad is dialing a station and hears that station's CONNECT_REQ
+addressed to the callsign it dials from, and its own callsign sorts after the
+caller's, it drops its own dial and answers the request, even while it is not
+listening. The other station keeps its dial and ignores the crossed request.
+While its floor is enabled and its last request was not a floor frame, the
+lexically higher caller waits one more retry interval plus one floor response
+window before each repeat, so it hears the lower station's two OFDM requests
+and first floor request. The host of the answering station sees no `PENDING`:
+the session completes as its own outgoing call (`CONNECTED`), and a crossed
+handshake that fails ends with `DISCONNECTED`, not `CANCELPENDING`.
+
+Host waveform reporting (COP-210, informative): coppad reports the session
+waveform pair to WebSocket hosts as `status.phy_mode` and a reliable
+`phy_mode` push (`docs/HOST-API.md`). `tx` is the waveform of the last session
+frame keyed. `rx` is the waveform of the last session frame a session handler
+accepted: frames for other stations, stale ACKs and replayed handshakes leave
+it unchanged. Each is `null`, `"floor"` or `"ofdm:<level>"`, and both clear to
+`null` when the session ends. This host field is unrelated to the 4-bit PHY
+header `phy_mode` field (§4); it carries nothing on air.

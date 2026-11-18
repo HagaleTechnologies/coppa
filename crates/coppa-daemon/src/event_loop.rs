@@ -21,7 +21,9 @@ use coppa_protocol::app_stream::{
 };
 use coppa_protocol::arq::{ArqConfig, ArqRx, ArqTx, DEFAULT_MAX_RETRANSMIT};
 use coppa_protocol::cp_negotiator::{ContentAction, CpMode, CpNegotiator};
+use coppa_protocol::floor_controller::{self as floor_policy, FloorController, LinkPhyMode};
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu, StationIdPayload};
+use coppa_protocol::modem::floor::MAX_PAYLOAD as FLOOR_MAX_PAYLOAD;
 use coppa_protocol::modem::max_payload_for_level;
 use coppa_protocol::modem::speed_levels::max_multi_payload_for_level;
 use coppa_protocol::modem::transceiver::MAX_CODEWORDS;
@@ -65,7 +67,10 @@ fn clock_now() -> Instant {
 
 #[derive(Default)]
 struct VaraClientState {
-    connect_retries: u8,
+    /// `RETRIES n` sets `Some(n)`. Unset (`None`) means
+    /// `session::MAX_CONNECT_RETRIES` on a floor-enabled dial, so the dial
+    /// can reach the floor, and 0 otherwise (COP-202).
+    connect_retries: Option<u8>,
     unrecognised: HashSet<String>,
 }
 
@@ -93,6 +98,16 @@ struct PendingDial {
     next_at: Instant,
     interval: Duration,
     give_up_at: Instant,
+    /// COP-202: the current window's `FloorController::timeout` was recorded
+    /// but its repeat has not keyed yet.
+    window_expired: bool,
+    /// COP-202: whether the dial started with the floor enabled (Auto speed
+    /// level). Fed to `FloorController::timeout` on every unanswered window.
+    floor: bool,
+    /// COP-210: the simultaneous-call stagger
+    /// (`floor_policy::calling_retry_stagger`) added to `interval` before
+    /// the next repeat keys.
+    stagger: Duration,
 }
 
 /// Map of connected VARA command-port clients' response senders
@@ -175,6 +190,10 @@ const NO_CALLSIGN_TX_REFUSAL: &str = "Transmission refused: no valid local calls
 /// How often `wait_for_rx_turnaround` drains the input ring: `run()`'s
 /// `audio_poll` cadence, so the ring never fills during the hold.
 const TURNAROUND_POLL: Duration = Duration::from_millis(20);
+
+/// `RateLoop` raise dwell for every daemon-built controller: one higher recommendation
+/// steps up one level (COP-183; BENCHMARKS.md's COP-183 log, which replaced dwell 5).
+const RATE_LOOP_RAISE_DWELL: u8 = 1;
 
 /// Smallest one-codeword payload budget on the whole speed ladder (COP-41,
 /// D4), derived rather than hardcoded: `min(max_payload_for_level(l))` for
@@ -264,14 +283,30 @@ fn fittest_level_with_codewords(encoded_len: usize, current: u8, codewords: u8) 
         .unwrap_or(current)
 }
 
+/// COP-210: the host API's name for a session waveform. `None` for a
+/// waveform the host API cannot name: a level outside the wire range 1-9, or
+/// a future `LinkPhyMode` variant (the enum is non-exhaustive).
+#[cfg(feature = "websocket")]
+fn host_phy_mode(mode: LinkPhyMode) -> Option<coppa_host::websocket::PhyMode> {
+    use coppa_host::websocket::PhyMode;
+    match mode {
+        LinkPhyMode::Floor => Some(PhyMode::Floor),
+        LinkPhyMode::Ofdm { level } if (1..=9).contains(&level) => Some(PhyMode::Ofdm { level }),
+        _ => None,
+    }
+}
+
 /// COP-69: the capabilities this coppad advertises in CONNECT_REQ/ACK.
 /// `multi_frame_ack` is on: this version's session link sends
 /// multi-codeword frames, and the flag is negotiated as an AND exactly like
 /// `compression`, so a peer that does not advertise it keeps today's exact
 /// 1-codeword wire behavior (the fallback is total, asserted on encoded
 /// samples).
-fn local_link_caps(config: &DaemonConfig) -> LinkCapabilities {
+/// `robust_floor` is the daemon's floor enable (COP-202: the speed level is
+/// automatic, `EventLoop::floor_enabled`).
+fn local_link_caps(config: &DaemonConfig, robust_floor: bool) -> LinkCapabilities {
     LinkCapabilities {
+        robust_floor,
         multi_frame_ack: true,
         outer_code_rx: config.session.fade_protection.as_str() != "off",
         outer_code_req: config.session.fade_protection.as_str() == "request",
@@ -915,6 +950,10 @@ pub struct EventLoop {
     /// the only thing left that can release PTT.
     #[cfg(test)]
     panic_in_completion_task: bool,
+    /// COP-210 test seam: every reliable `phy_mode` push, in order.
+    /// Paused-time tests cannot read a real socket reliably.
+    #[cfg(all(test, feature = "websocket"))]
+    ws_pushed: std::sync::Mutex<Vec<coppa_host::websocket::WsServerMessage>>,
     /// Last-seen value of the audio input ring's overflow counter (see
     /// `AudioRingConsumer::overflow_count`); `poll_audio_input` compares against
     /// this each poll and logs a warning when it grows (silent RX sample loss was
@@ -988,6 +1027,24 @@ pub struct EventLoop {
     /// change the engine's level (`apply_rate_loop_level`) and does not
     /// probe. Not persisted.
     manual_speed_level: Option<u8>,
+    /// COP-202: the shared COP-195 waveform policy for the current session's
+    /// frames. Reset at each dial and each accepted CONNECT_REQ. Timers stay
+    /// here in the daemon, per the controller's contract.
+    floor: FloorController,
+    /// COP-202: the waveform of the last session frame keyed (`phy_tx`) and
+    /// of the frame being dispatched (`phy_rx`). `phy_rx` is the floor
+    /// controller's input and is set before any handler validates the frame,
+    /// so hosts never see it: they see `rx_reported`.
+    phy_tx: Option<LinkPhyMode>,
+    phy_rx: Option<LinkPhyMode>,
+    /// COP-210: the waveform of the last session frame a session handler
+    /// accepted, the RX half of `phy_mode()`. Frames for other stations,
+    /// stale ACKs and replayed handshakes leave it alone.
+    rx_reported: Option<LinkPhyMode>,
+    /// COP-210: the host pair last sent as a `phy_mode` push, so
+    /// `publish_phy_mode` pushes only changes clients can see.
+    #[cfg(feature = "websocket")]
+    last_pushed_phy_mode: Option<coppa_host::websocket::PhyModeReport>,
     /// COP-83: the `(level, manual)` pair last sent as a `speed_level`
     /// push, so `publish_speed_level` pushes only changes.
     #[cfg(feature = "websocket")]
@@ -1085,6 +1142,11 @@ pub struct EventLoop {
     extra_callsigns: Vec<Callsign>,
     vara_clients: HashMap<u32, VaraClientState>,
     pending_dial: Option<PendingDial>,
+    /// COP-210: the inbound session that replaced our own dial to the same
+    /// station (a crossed call, `floor_policy::answers_simultaneous_call`).
+    /// Its host saw `CONNECTING`, not `PENDING`, so it completes as the
+    /// host's own call and ends with `DISCONNECTED`, never `CANCELPENDING`.
+    crossed_dial: Option<u8>,
     /// Bounded broadcast datagrams waiting for the transmitter.
     kiss_datagrams: VecDeque<Vec<u8>>,
     /// Fan-out exclusively to KISS clients, separate from host DataOut.
@@ -1236,9 +1298,10 @@ impl EventLoop {
         // hardcoded level 1 -- otherwise a fresh daemon's very first outgoing
         // frame would silently force the engine down to level 1 via
         // `try_drain_tx_queue`'s unconditional `set_speed_level(rate_loop.
-        // current_level())`, even with probing disabled. `levels`/`raise_dwell`
-        // still match `default_coppa()`'s own choices -- only the initial
-        // level differs.
+        // current_level())`, even with probing disabled. `raise_dwell` is
+        // `RATE_LOOP_RAISE_DWELL`, the same dwell `default_coppa()` uses (1
+        // since COP-183); the levels are the engine's ladder and the initial
+        // level is the engine's own.
         let rate_loop = Self::build_rate_loop(&config, &engine, engine.speed_level())?;
 
         // Always constructed (cheap; mirrors RateLoop's own "hardcode the
@@ -1290,6 +1353,8 @@ impl EventLoop {
             tx_stall_clock: None,
             #[cfg(test)]
             panic_in_completion_task: false,
+            #[cfg(all(test, feature = "websocket"))]
+            ws_pushed: std::sync::Mutex::new(Vec::new()),
             audio_in_overflow_count: 0,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             arq_tx,
@@ -1306,6 +1371,12 @@ impl EventLoop {
             arq_next_seq: 0,
             probe_state: None,
             manual_speed_level: None,
+            floor: FloorController::default(),
+            phy_tx: None,
+            phy_rx: None,
+            rx_reported: None,
+            #[cfg(feature = "websocket")]
+            last_pushed_phy_mode: None,
             #[cfg(feature = "websocket")]
             last_pushed_speed_level: None,
             #[cfg(feature = "websocket")]
@@ -1343,6 +1414,7 @@ impl EventLoop {
             extra_callsigns: Vec::new(),
             vara_clients: HashMap::new(),
             pending_dial: None,
+            crossed_dial: None,
             vara_keepalive_period: VARA_KEEPALIVE_PERIOD,
             listening: false,
             cw_id_on,
@@ -1648,7 +1720,11 @@ impl EventLoop {
         engine: &CoppaCore,
         initial_level: u8,
     ) -> Result<RateLoop> {
-        let rate_loop = RateLoop::new(engine.available_speed_levels(), 5, initial_level)?;
+        let rate_loop = RateLoop::new(
+            engine.available_speed_levels(),
+            RATE_LOOP_RAISE_DWELL,
+            initial_level,
+        )?;
         Ok(if config.engine.rate_loop_probe_interval > 0 {
             rate_loop.with_probing(
                 config.engine.rate_loop_probe_interval,
@@ -1918,11 +1994,13 @@ impl EventLoop {
             snap.link = link;
         }
         self.publish_speed_level().await;
+        self.publish_phy_mode().await;
     }
 
     #[cfg(not(feature = "websocket"))]
     async fn publish_ws_snapshot(&mut self) {
         self.publish_speed_level().await;
+        self.publish_phy_mode().await;
     }
 
     /// COP-83: mark a busy-channel wait in the WebSocket snapshot. Each wait
@@ -2013,6 +2091,12 @@ impl EventLoop {
 
     #[cfg(feature = "websocket")]
     fn ws_push_reliable(&self, msg: coppa_host::websocket::WsServerMessage) {
+        #[cfg(test)]
+        if matches!(msg, coppa_host::websocket::WsServerMessage::PhyMode { .. }) {
+            if let Ok(mut pushed) = self.ws_pushed.lock() {
+                pushed.push(msg.clone());
+            }
+        }
         if let Some(push) = &self.ws_push {
             push.push(&msg);
         }
@@ -2436,6 +2520,24 @@ impl EventLoop {
     /// Call after `session_mgr` reflects the change. Broadcasts to all hosts:
     /// session state is link-wide; every attached host wants it.
     async fn notify_session(&mut self, client_id: u32, notice: SessionNotice) {
+        // COP-210: once no session is live, the reported waveform pair
+        // clears, and hosts hear it at once rather than on the next tick:
+        // after the `session` push when there is one, so a client never sees
+        // the waveform clear while the session still reads as connected.
+        let disconnected = matches!(notice, SessionNotice::Disconnected);
+        let session_over = (disconnected || matches!(notice, SessionNotice::PendingCancelled))
+            && self.live_session_id().is_none();
+        if session_over {
+            tracing::debug!(
+                tx = ?self.phy_tx,
+                rx = ?self.rx_reported,
+                "Session over; reported waveform cleared"
+            );
+            self.reset_floor();
+            if !disconnected {
+                self.publish_phy_mode().await;
+            }
+        }
         let (status, vara) = match &notice {
             SessionNotice::Connected {
                 local,
@@ -2583,6 +2685,9 @@ impl EventLoop {
                 stations: self.ws_heard.clone(),
             });
         }
+        if session_over && disconnected {
+            self.publish_phy_mode().await;
+        }
     }
 
     /// Send a keepalive for every active session that has been idle for its
@@ -2604,14 +2709,19 @@ impl EventLoop {
                 .map(|s| s.needs_keepalive(now))
                 .unwrap_or(false);
             if needs {
-                if let Some(session) = self.session_mgr.get_mut(id) {
-                    if let Ok(ka_pdu) = session.keepalive(now) {
-                        let ka_bytes = ka_pdu.to_bytes();
-                        if let Ok(samples) = self.engine.encode_bytes(&ka_bytes) {
-                            // COP-46: `tools/pat-loop` counts these.
-                            tracing::info!(session = id, "Sending session KEEPALIVE");
-                            self.transmit_samples(&samples).await;
-                        }
+                let ka_bytes = self
+                    .session_mgr
+                    .get_mut(id)
+                    .and_then(|session| session.keepalive(now).ok())
+                    .map(|ka_pdu| ka_pdu.to_bytes());
+                // COP-202: keyed in the shared controller's waveform.
+                if let Some(Ok((samples, mode))) =
+                    ka_bytes.map(|ka_bytes| self.encode_session_frame(&ka_bytes, None))
+                {
+                    // COP-46: `tools/pat-loop` counts these.
+                    tracing::info!(session = id, "Sending session KEEPALIVE");
+                    if self.transmit_samples_keyed(&samples).await > 0 {
+                        self.phy_tx = Some(mode);
                     }
                 }
             }
@@ -2623,7 +2733,36 @@ impl EventLoop {
         // pending inbound handshakes first (COP-44: those end in
         // CANCELPENDING, not DISCONNECTED).
         let pending = self.accepting_sessions();
-        let removed = self.session_mgr.cleanup_timed_out(clock_now());
+        let now = clock_now();
+        // COP-202: a calling session with a scheduled connect repeat lives
+        // past the flat handshake timeout until that repeat and its
+        // turnaround hold (`calling_handshake_timeout`); every other session
+        // uses `Session::is_timed_out`, as `cleanup_timed_out` did.
+        let dialing = self
+            .pending_dial
+            .as_ref()
+            .filter(|d| d.left > 0)
+            .map(|d| (d.session_id, d.interval + d.stagger));
+        let turnaround = self.turnaround();
+        let removed: Vec<u8> = self
+            .session_mgr
+            .active_sessions()
+            .into_iter()
+            .filter(|&id| {
+                self.session_mgr.get(id).is_some_and(|s| match dialing {
+                    Some((dial_id, interval))
+                        if dial_id == id && s.state == SessionState::Connecting =>
+                    {
+                        now.saturating_duration_since(s.last_activity)
+                            >= floor_policy::calling_handshake_timeout(interval, turnaround)
+                    }
+                    _ => s.is_timed_out(now),
+                })
+            })
+            .collect();
+        for &id in &removed {
+            self.session_mgr.remove(id);
+        }
         for id in removed {
             // COP-43: a drain that keyed nothing for `disconnect_timeout`
             // ends the way a drained one does, minus the unsent chunks.
@@ -2647,13 +2786,20 @@ impl EventLoop {
     }
 
     /// COP-44: the sessions in `Accepting`, the inbound handshakes a host
-    /// was told were `PENDING`.
+    /// was told were `PENDING` (COP-210: a crossed call is not one).
     fn accepting_sessions(&self) -> Vec<u8> {
         self.session_mgr
             .active_sessions()
             .into_iter()
-            .filter(|&id| self.is_accepting(id))
+            .filter(|&id| self.host_pending(id))
             .collect()
+    }
+
+    /// COP-210: an inbound handshake whose host was told `PENDING`. A
+    /// crossed call (`crossed_dial`) is `Accepting` too, but its host saw
+    /// its own `CONNECTING`, so it never gets `CANCELPENDING`.
+    fn host_pending(&self, session_id: u8) -> bool {
+        self.is_accepting(session_id) && self.crossed_dial != Some(session_id)
     }
 
     fn is_accepting(&self, session_id: u8) -> bool {
@@ -3053,6 +3199,9 @@ impl EventLoop {
             self.session_tx_held_by_frequency_gate = true;
             return true;
         }
+        if keyed > 0 {
+            self.phy_tx = Some(LinkPhyMode::Ofdm { level });
+        }
         if let Some(link) = self.session_link.as_mut() {
             link.tx_outer = Some(OuterTx {
                 level,
@@ -3060,7 +3209,7 @@ impl EventLoop {
             });
             link.tx_codewords = 1;
         }
-        self.set_session_segment_floor(keyed, packet_len, 1);
+        self.set_session_segment_floor(keyed, packet_len, 1, LinkPhyMode::Ofdm { level });
         if let Some(link) = self.session_link.as_mut() {
             link.stream_backlog_mut(stream).drain(..take);
             link.tx_stream = stream;
@@ -3094,11 +3243,15 @@ impl EventLoop {
             return;
         }
         let ack = session_ack_frame(link);
+        // COP-210: `encode_bytes` encodes at the engine's current level.
+        let level = self.engine.speed_level();
         match self.engine.encode_bytes(&ack) {
             Ok(samples) => {
                 let doubled = [samples.as_slice(), samples.as_slice()].concat();
                 let generation = self.tx_generation;
-                Box::pin(self.transmit_samples(&doubled)).await;
+                if Box::pin(self.transmit_samples_keyed(&doubled)).await > 0 {
+                    self.phy_tx = Some(LinkPhyMode::Ofdm { level });
+                }
                 if self.tx_generation != generation {
                     if let Some(link) = self.session_link.as_mut() {
                         link.block_ack_at = None;
@@ -3150,6 +3303,10 @@ impl EventLoop {
         };
         if matches!(outcome, InsertOutcome::Rejected(_)) {
             return;
+        }
+        // COP-210: the block for this session is accepted.
+        if self.phy_rx.is_some() {
+            self.rx_reported = self.phy_rx;
         }
         // Use the received frame's level. Peers may choose different TX levels.
         let profile = if self.engine.on_vhf_profile() {
@@ -3222,7 +3379,19 @@ impl EventLoop {
         if !ready || self.session_tx_held_by_frequency_gate {
             return;
         }
-        if self.session_fade_mode() == "rs12-6" && self.try_send_outer_block().await {
+        // COP-202: bind the recovery probe to the segment about to be cut,
+        // then cut a floor-sized segment while the controller is on the
+        // floor or probing (Decision 5). Such a segment never takes the
+        // outer code: outer data only travels on OFDM.
+        if let Some(seq) = self.session_link.as_ref().map(|l| l.tx.next_seq()) {
+            self.floor.prepare_data(seq);
+        }
+        let floor_segment =
+            self.session_floor_negotiated() && self.floor.floor_active() && self.floor_enabled();
+        if !floor_segment
+            && self.session_fade_mode() == "rs12-6"
+            && self.try_send_outer_block().await
+        {
             return;
         }
         // COP-69: the per-frame codeword count, gated by the negotiated
@@ -3243,7 +3412,9 @@ impl EventLoop {
             .and_then(|id| self.session_mgr.get(id))
             .and_then(|s| s.negotiated.as_ref())
             .is_some_and(|c| c.multi_frame_ack);
-        let cap = if negotiated_multi {
+        let cap = if floor_segment {
+            1
+        } else if negotiated_multi {
             self.config
                 .session
                 .max_codewords_per_frame
@@ -3253,6 +3424,16 @@ impl EventLoop {
         };
         let cap_budget = max_multi_payload_for_level(level, cap)
             .expect("the engine's speed level is always a valid wire level");
+        // COP-202: a floor segment's raw PDU fits one floor frame and its
+        // encoded payload fits one level-1 codeword, so it can also ride the
+        // level-1 probe. The chunk is bounded by the shared segment limit.
+        let floor_budget = max_payload_for_level(1).unwrap_or(0);
+        let floor_limit = self
+            .session_link
+            .as_ref()
+            .and_then(|l| self.session_mgr.get(l.session_id))
+            .and_then(|s| s.negotiated.as_ref())
+            .map_or(0, |c| floor_policy::floor_segment_limit(c.max_payload_size));
         let (seq, take, frame, codewords, stream) = {
             let Some(link) = self.session_link.as_mut() else {
                 return;
@@ -3270,7 +3451,19 @@ impl EventLoop {
                     cap,
                 ) <= cap_budget
             };
-            let take = if cap == 1 {
+            let take = if floor_segment {
+                let fits_floor = |c: &[u8]| {
+                    let frame = session_stream_frame(link, stream, seq, c);
+                    frame.len() <= FLOOR_MAX_PAYLOAD
+                        && engine.encoded_payload_len(&frame) <= floor_budget
+                };
+                next_chunk_len(
+                    backlog,
+                    header_len,
+                    (floor_limit + header_len + 1).min(floor_budget),
+                    fits_floor,
+                )
+            } else if cap == 1 {
                 next_chunk_len(backlog, header_len, cap_budget, fits)
             } else {
                 next_growing_chunk_len(
@@ -3292,8 +3485,19 @@ impl EventLoop {
             };
             (seq, take, frame, codewords, stream)
         };
-        let samples = match self.engine.encode_bytes_with_codewords(&frame, codewords) {
-            Ok(samples) => samples,
+        // COP-202: a floor segment goes through the shared waveform choice
+        // (the floor, or the level-1 probe); every other segment keeps
+        // today's multi-codeword OFDM encode at the engine level.
+        let encoded = if floor_segment {
+            self.encode_session_frame(&frame, None)
+        } else {
+            self.engine
+                .encode_bytes_with_codewords(&frame, codewords)
+                .map(|samples| (samples, LinkPhyMode::Ofdm { level }))
+                .map_err(|e| e.to_string())
+        };
+        let (samples, mode) = match encoded {
+            Ok(encoded) => encoded,
             Err(e) => {
                 // Unreachable for a chunk sized against `cap_budget`; the bytes
                 // stay in the backlog.
@@ -3308,11 +3512,12 @@ impl EventLoop {
         let generation = self.tx_generation;
         let keyed = Box::pin(self.transmit_samples_keyed(&samples)).await;
         if keyed > 0 {
+            self.phy_tx = Some(mode);
             if let Some(link) = self.session_link.as_mut() {
                 link.tx_outer = None;
             }
         }
-        self.set_session_segment_floor(keyed, samples.len(), codewords);
+        self.set_session_segment_floor(keyed, samples.len(), codewords, mode);
         if self.tx_generation == generation {
             // The gate passed above but refused after the courtesy wait (the
             // one `transmit_samples` path that keys nothing and leaves
@@ -3371,8 +3576,28 @@ impl EventLoop {
     /// the transmission was refused and nothing changes. The full HF long-CP
     /// ACK is a conservative upper bound for the supported HF short-CP and
     /// VHF profiles too; this branch still sends full-frame ACKs.
-    fn set_session_segment_floor(&mut self, keyed: usize, frame_len: usize, codewords: u8) {
+    ///
+    /// COP-202: a floor key-up's floor is the shared floor RTO floor plus
+    /// the peer's station-ID allowance and any ID we prepended (Decision 8).
+    fn set_session_segment_floor(
+        &mut self,
+        keyed: usize,
+        frame_len: usize,
+        codewords: u8,
+        mode: LinkPhyMode,
+    ) {
         if keyed == 0 {
+            return;
+        }
+        if mode == LinkPhyMode::Floor {
+            let sr = self.engine.config().sample_rate as f64;
+            let own_id = Duration::from_secs_f64(keyed.saturating_sub(frame_len) as f64 / sr);
+            let floor = floor_policy::floor_rto_floor(self.turnaround())
+                + self.station_id_allowance()
+                + own_id;
+            if let Some(link) = self.session_link.as_mut() {
+                link.tx.set_segment_floor(floor);
+            }
             return;
         }
         if codewords <= 1 && keyed <= frame_len {
@@ -3552,6 +3777,160 @@ impl EventLoop {
         }
     }
 
+    /// COP-202: the floor is enabled while the speed level is automatic. A
+    /// numbered speed level pins OFDM (COP-195's approved design).
+    fn floor_enabled(&self) -> bool {
+        self.manual_speed_level.is_none()
+    }
+
+    /// COP-202: start a new session's waveform policy from OFDM. COP-210:
+    /// also clears the reported waveform pair.
+    fn reset_floor(&mut self) {
+        self.floor = FloorController::default();
+        self.phy_tx = None;
+        self.phy_rx = None;
+        self.rx_reported = None;
+        self.crossed_dial = None;
+    }
+
+    /// COP-210: the session waveform pair hosts see, shaped like
+    /// `Link::phy_mode()`: the waveform of the last session frame keyed and
+    /// of the last session frame a handler accepted. `(None, None)` before
+    /// session activity and after the session ends. A key-up path that
+    /// records `phy_tx` after a re-entrant session end cannot bring a dead
+    /// session's waveform back: with no live session the pair is empty.
+    /// Hosts read it only through the WebSocket snapshot.
+    #[cfg(any(test, feature = "websocket"))]
+    pub(crate) fn phy_mode(&self) -> (Option<LinkPhyMode>, Option<LinkPhyMode>) {
+        if self.live_session_id().is_none() {
+            return (None, None);
+        }
+        (self.phy_tx, self.rx_reported)
+    }
+
+    /// COP-210: a session handler accepted the frame being dispatched, so
+    /// its waveform becomes the reported RX waveform.
+    fn note_validated_rx(&mut self) {
+        if self.phy_rx.is_some() {
+            self.rx_reported = self.phy_rx;
+        }
+    }
+
+    /// COP-210: write the waveform pair to the WebSocket snapshot, and push
+    /// `phy_mode` when either half changed since the last push.
+    #[cfg(feature = "websocket")]
+    async fn publish_phy_mode(&mut self) {
+        use coppa_host::websocket::{PhyModeReport, WsServerMessage};
+        let (tx, rx) = self.phy_mode();
+        let report = PhyModeReport {
+            tx: tx.and_then(host_phy_mode),
+            rx: rx.and_then(host_phy_mode),
+        };
+        if let Some(ref status) = self.ws_status {
+            status.lock().await.phy_mode = Some(report);
+        }
+        if self.last_pushed_phy_mode != Some(report) {
+            self.last_pushed_phy_mode = Some(report);
+            self.ws_push_reliable(WsServerMessage::PhyMode {
+                tx: report.tx,
+                rx: report.rx,
+            });
+        }
+    }
+
+    #[cfg(not(feature = "websocket"))]
+    async fn publish_phy_mode(&mut self) {}
+
+    fn turnaround(&self) -> Duration {
+        Duration::from_millis(self.config.radio.turnaround_ms)
+    }
+
+    /// COP-202: whether the session link's session negotiated the floor
+    /// (capability bit 6 at both ends).
+    fn session_floor_negotiated(&self) -> bool {
+        self.session_link
+            .as_ref()
+            .and_then(|l| self.session_mgr.get(l.session_id))
+            .and_then(|s| s.negotiated.as_ref())
+            .is_some_and(|c| c.robust_floor)
+    }
+
+    /// COP-202: a session that negotiated the floor and established on it
+    /// keys its keepalives on the shared floor interval, so a keepalive
+    /// never keys across a failed probe's recovery window (as Link does). A
+    /// session established on OFDM keeps today's interval.
+    fn apply_floor_session_timers(&mut self, session_id: u8) {
+        if !self.floor.floor_active() {
+            return;
+        }
+        if let Some(session) = self.session_mgr.get_mut(session_id) {
+            if session.negotiated.as_ref().is_some_and(|c| c.robust_floor) {
+                session.keepalive_interval = floor_policy::floor_keepalive_interval(
+                    session.keepalive_interval,
+                    session.session_timeout,
+                );
+            }
+        }
+    }
+
+    /// COP-202 Decision 8: airtime of the level-1 station-ID frame a peer
+    /// may prepend to its reply, sized from our own ID frame. The peer's ID
+    /// timer decides whether it prepends one, so this does not depend on our
+    /// `id_interval_secs`; an ID we prepend is counted separately by the
+    /// callers. Zero only when no local callsign is configured.
+    fn station_id_allowance(&self) -> Duration {
+        self.encode_id_beacon_frame().map_or(Duration::ZERO, |id| {
+            Duration::from_secs_f64(id.len() as f64 / self.engine.config().sample_rate as f64)
+        })
+    }
+
+    /// COP-202: the one encode path for session frames. The waveform is
+    /// `Ofdm { level: pin }` while a speed level is pinned, else `reply_to`
+    /// (the waveform the frame being answered arrived on), else the shared
+    /// controller's choice. A floor frame larger than one floor PDU goes on
+    /// OFDM at the current level instead.
+    fn encode_session_frame(
+        &self,
+        bytes: &[u8],
+        reply_to: Option<LinkPhyMode>,
+    ) -> Result<(Vec<f32>, LinkPhyMode), String> {
+        let level = self.engine.speed_level();
+        let mode = match (self.manual_speed_level, reply_to) {
+            (Some(pin), _) => LinkPhyMode::Ofdm { level: pin },
+            // An OFDM handshake reply keeps today's level, so OFDM-only
+            // sessions stay byte-identical to the pre-floor daemon.
+            (None, Some(LinkPhyMode::Floor)) => LinkPhyMode::Floor,
+            (None, Some(_)) => LinkPhyMode::Ofdm { level },
+            (None, None) => self.floor.mode(level),
+        };
+        let mode = match mode {
+            LinkPhyMode::Floor if bytes.len() > FLOOR_MAX_PAYLOAD => LinkPhyMode::Ofdm { level },
+            other => other,
+        };
+        let samples = self.encode_session_mode(bytes, mode)?;
+        Ok((samples, mode))
+    }
+
+    /// COP-202: encode one session frame in an already chosen waveform.
+    fn encode_session_mode(&self, bytes: &[u8], mode: LinkPhyMode) -> Result<Vec<f32>, String> {
+        let level = self.engine.speed_level();
+        match mode {
+            LinkPhyMode::Floor => self
+                .engine
+                .floor()
+                .encode(bytes)
+                .map_err(|e| format!("{e:?}")),
+            LinkPhyMode::Ofdm { level: l } if l == level => {
+                self.engine.encode_bytes(bytes).map_err(|e| e.to_string())
+            }
+            LinkPhyMode::Ofdm { level: l } => self
+                .engine
+                .encode_bytes_at_level(bytes, l)
+                .map_err(|e| e.to_string()),
+            _ => self.engine.encode_bytes(bytes).map_err(|e| e.to_string()),
+        }
+    }
+
     async fn repeat_pending_dial(&mut self) {
         let Some(mut dial) = self.pending_dial.take() else {
             return;
@@ -3567,8 +3946,16 @@ impl EventLoop {
             return;
         }
         if now >= dial.next_at && !self.is_transmitting {
-            match self.engine.encode_bytes(&dial.request) {
-                Ok(samples) => {
+            // COP-202: one complete request window went unanswered. The
+            // shared controller decides whether this repeat goes on the floor.
+            // A refused key-up below retries the same window, so the timeout
+            // is recorded once per window.
+            if !dial.window_expired {
+                self.floor.timeout(dial.floor);
+                dial.window_expired = true;
+            }
+            match self.encode_session_frame(&dial.request, None) {
+                Ok((samples, mode)) => {
                     let destination = self
                         .session_mgr
                         .get(dial.session_id)
@@ -3580,6 +3967,8 @@ impl EventLoop {
                         self.pending_dial = Some(dial);
                         return;
                     }
+                    self.phy_tx = Some(mode);
+                    dial.window_expired = false;
                     let keyed = self
                         .tx_keyed_since
                         .map(|t| t.into_std())
@@ -3588,9 +3977,44 @@ impl EventLoop {
                         session.touch(keyed);
                     }
                     tracing::info!(attempt = dial.total-dial.left+2, of = dial.total+1,
-                                   %destination, "Connect request repeated");
+                                   %destination, ?mode, "Connect request repeated");
                     dial.left -= 1;
-                    dial.next_at = keyed + dial.interval;
+                    if mode == LinkPhyMode::Floor {
+                        // The floor reply cannot arrive before the floor
+                        // response window, plus the peer's station ID and
+                        // any ID we prepended (COP-202 Decision 8).
+                        let sr = self.engine.config().sample_rate as f64;
+                        let own_id =
+                            Duration::from_secs_f64(sent.saturating_sub(samples.len()) as f64 / sr);
+                        dial.interval = coppa_protocol::session::connect_req_retry_interval(
+                            Duration::from_secs_f64(samples.len() as f64 / sr),
+                            self.turnaround(),
+                        )
+                        .max(
+                            FloorController::response_window(
+                                LinkPhyMode::Floor,
+                                Duration::ZERO,
+                                self.turnaround(),
+                            ) + self.station_id_allowance()
+                                + own_id,
+                        );
+                    }
+                    // COP-210: re-evaluated after every repeat, so the
+                    // stagger stops once a request has gone on the floor.
+                    dial.stagger =
+                        self.session_mgr
+                            .get(dial.session_id)
+                            .map_or(Duration::ZERO, |s| {
+                                floor_policy::calling_retry_stagger(
+                                    s.local.as_str(),
+                                    s.remote.as_str(),
+                                    dial.floor,
+                                    mode,
+                                    dial.interval,
+                                    self.turnaround(),
+                                )
+                            });
+                    dial.next_at = keyed + dial.interval + dial.stagger;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to encode repeat CONNECT_REQ");
@@ -3663,10 +4087,17 @@ impl EventLoop {
         {
             self.touch_draining_session(session_id);
         }
+        let floor_negotiated = self.session_floor_negotiated();
         let Some(link) = self.session_link.as_mut() else {
             return;
         };
         let seqs = link.tx.get_retransmits(now);
+        // COP-202, COP-211: one expired response window per retransmit
+        // pass, fed to the shared controller before it picks the
+        // retransmission's waveform. As in Link, two unanswered windows
+        // return a floor-negotiated session to the floor (also after a
+        // successful probe), and a lost probe returns it at once.
+        let expired = !seqs.is_empty();
         let link = &*link;
         let frames: Vec<(u8, Vec<u8>)> = seqs
             .into_iter()
@@ -3676,6 +4107,9 @@ impl EventLoop {
                     .map(|data| (seq, session_stream_frame(link, link.tx_stream, seq, data)))
             })
             .collect();
+        if expired {
+            self.floor.timeout(floor_negotiated && self.floor_enabled());
+        }
         for (seq, frame) in frames {
             let attempt = self
                 .session_link
@@ -3711,7 +4145,15 @@ impl EventLoop {
                 ) {
                     Ok((samples, _)) => {
                         let keyed = Box::pin(self.transmit_samples_keyed(&samples)).await;
-                        self.set_session_segment_floor(keyed, outer.packets_len, 1);
+                        if keyed > 0 {
+                            self.phy_tx = Some(LinkPhyMode::Ofdm { level: outer.level });
+                        }
+                        self.set_session_segment_floor(
+                            keyed,
+                            outer.packets_len,
+                            1,
+                            LinkPhyMode::Ofdm { level: outer.level },
+                        );
                     }
                     Err(error) => tracing::warn!(%error, "Failed to encode outer retransmission"),
                 }
@@ -3736,19 +4178,45 @@ impl EventLoop {
                 }
                 continue;
             }
-            let encoded = match self.session_link.as_ref().and_then(|l| l.fallback.as_ref()) {
-                Some(fallback) => self.engine.encode_bytes_with_level_and_codewords(
-                    &frame,
-                    fallback.level,
-                    codewords,
-                ),
-                None => self.engine.encode_bytes_with_codewords(&frame, codewords),
+            // COP-202: while the controller is on the floor, a segment whose
+            // frame fits one floor PDU is resent on the floor, whatever the
+            // fade hold's level. Larger segments keep today's OFDM path
+            // (Decision 5: ARQ cannot re-cut an in-flight segment).
+            let level = self.engine.speed_level();
+            let floor_retransmit = floor_negotiated
+                && self.floor_enabled()
+                && frame.len() <= FLOOR_MAX_PAYLOAD
+                && self.floor.mode(level) == LinkPhyMode::Floor;
+            let encoded = if floor_retransmit {
+                self.encode_session_frame(&frame, None)
+            } else {
+                match self.session_link.as_ref().and_then(|l| l.fallback.as_ref()) {
+                    Some(fallback) => self
+                        .engine
+                        .encode_bytes_with_level_and_codewords(&frame, fallback.level, codewords)
+                        .map(|samples| {
+                            (
+                                samples,
+                                LinkPhyMode::Ofdm {
+                                    level: fallback.level,
+                                },
+                            )
+                        }),
+                    None => self
+                        .engine
+                        .encode_bytes_with_codewords(&frame, codewords)
+                        .map(|samples| (samples, LinkPhyMode::Ofdm { level })),
+                }
+                .map_err(|e| e.to_string())
             };
             match encoded {
-                Ok(samples) => {
-                    tracing::debug!(seq, attempt, "Retransmitting session frame");
+                Ok((samples, mode)) => {
+                    tracing::debug!(seq, attempt, ?mode, "Retransmitting session frame");
                     let keyed = Box::pin(self.transmit_samples_keyed(&samples)).await;
-                    self.set_session_segment_floor(keyed, samples.len(), codewords);
+                    if keyed > 0 {
+                        self.phy_tx = Some(mode);
+                    }
+                    self.set_session_segment_floor(keyed, samples.len(), codewords, mode);
                 }
                 Err(e) => tracing::warn!(
                     error = %e,
@@ -3841,14 +4309,15 @@ impl EventLoop {
     /// `DISCONNECT` of any other session drains first and ends through
     /// `end_local_disconnect` (COP-43).
     async fn end_session(&mut self, session_id: u8, client_id: u32) {
-        let was_pending = self.is_accepting(session_id);
+        let was_pending = self.host_pending(session_id);
         self.discard_session_tx(session_id).await;
         if let Some(session) = self.session_mgr.get_mut(session_id) {
             match session.disconnect(clock_now()) {
                 Ok(disc_pdu) => {
                     let pdu_bytes = disc_pdu.to_bytes();
-                    match self.engine.encode_bytes(&pdu_bytes) {
-                        Ok(samples) => {
+                    // COP-202: keyed in the shared controller's waveform.
+                    match self.encode_session_frame(&pdu_bytes, None) {
+                        Ok((samples, _)) => {
                             let samples = self.with_closing_cw_id(samples, session_id);
                             Box::pin(self.transmit_samples(&samples)).await
                         }
@@ -4088,7 +4557,7 @@ impl EventLoop {
             return;
         };
         tracing::info!(session_id = id, "ABORT: ending the session now");
-        let was_pending = self.is_accepting(id);
+        let was_pending = self.host_pending(id);
         // COP-43: ABORT also ends a DISCONNECT drain at once. Dropping its
         // record means the drain never sends its DISCONNECT frame or a
         // second `DISCONNECTED` later.
@@ -4148,11 +4617,13 @@ impl EventLoop {
     /// cannot send the frame twice.
     async fn end_local_disconnect(&mut self, pending: PendingDisconnect) {
         self.discard_session_tx(pending.session_id).await; // Drops the drained link.
-        match self.engine.encode_bytes(&pending.pdu_bytes) {
+
+        // COP-202: keyed in the shared controller's waveform.
+        match self.encode_session_frame(&pending.pdu_bytes, None) {
             // Boxed: `handle_ptt_change` -> `finish_drained_disconnect` ->
             // `transmit_samples` -> `handle_ptt_change` is the same async
             // call cycle `drain_session_link` documents.
-            Ok(samples) => {
+            Ok((samples, _)) => {
                 let samples = self.with_closing_cw_id(samples, pending.session_id);
                 Box::pin(self.transmit_samples(&samples)).await
             }
@@ -4583,7 +5054,7 @@ impl EventLoop {
                                 .session_mgr
                                 .active_sessions()
                                 .into_iter()
-                                .filter(|&id| self.is_accepting(id))
+                                .filter(|&id| self.host_pending(id))
                                 .collect();
                             for id in pending {
                                 self.discard_session_tx(id).await;
@@ -4613,7 +5084,7 @@ impl EventLoop {
                             self.vara_clients
                                 .entry(client_id)
                                 .or_default()
-                                .connect_retries = n as u8;
+                                .connect_retries = Some(n as u8);
                         } else {
                             tracing::info!("RETRIES takes a whole number from 0 to 20");
                         }
@@ -4791,8 +5262,11 @@ impl EventLoop {
                     self.ardop_clients.entry(client_id).or_default().refused = false;
                 }
                 self.pending_dial = None;
-                let caps = local_link_caps(&self.config);
+                let floor = self.floor_enabled();
+                let caps = local_link_caps(&self.config, floor);
                 let now = clock_now();
+                self.reset_floor();
+                let local_call = local.clone();
                 match self.session_mgr.create(local, remote.clone(), 0, caps, now) {
                     Ok(id) => {
                         if let Some(session) = self.session_mgr.get_mut(id) {
@@ -4812,30 +5286,81 @@ impl EventLoop {
                                     let pdu_bytes = req_pdu.to_bytes();
                                     match self.engine.encode_bytes(&pdu_bytes) {
                                         Ok(samples) => {
-                                            let retries = if ardop_dial {
-                                                0
+                                            // COP-202: an explicit RETRIES is
+                                            // honoured exactly; unset (always
+                                            // for an ARDOP dial) defaults by
+                                            // floor enable, as `LinkConfig`.
+                                            let explicit = if ardop_dial {
+                                                None
                                             } else {
                                                 self.vara_clients
                                                     .get(&client_id)
-                                                    .map_or(0, |s| s.connect_retries)
+                                                    .and_then(|s| s.connect_retries)
                                             };
+                                            let retries = explicit.unwrap_or(if floor {
+                                                coppa_protocol::session::MAX_CONNECT_RETRIES
+                                            } else {
+                                                0
+                                            });
                                             let sent = self.transmit_samples_keyed(&samples).await;
+                                            if sent > 0 {
+                                                self.phy_tx = Some(LinkPhyMode::Ofdm {
+                                                    level: self.engine.speed_level(),
+                                                });
+                                            }
                                             let keyed = self
                                                 .tx_keyed_since
                                                 .map(|t| t.into_std())
                                                 .unwrap_or_else(clock_now);
                                             if retries > 0 && sent > 0 {
-                                                let interval = coppa_protocol::session::connect_req_retry_interval(
-                                                    Duration::from_secs_f64(samples.len() as f64 / self.engine.config().sample_rate as f64),
+                                                // COP-210: the reaper measures the
+                                                // staggered repeat from key-up, as
+                                                // `repeat_pending_dial` does, not
+                                                // from before a busy-channel wait.
+                                                if let Some(session) = self.session_mgr.get_mut(id)
+                                                {
+                                                    session.touch(keyed);
+                                                }
+                                                let sr = self.engine.config().sample_rate as f64;
+                                                let mut interval = coppa_protocol::session::connect_req_retry_interval(
+                                                    Duration::from_secs_f64(samples.len() as f64 / sr),
                                                     Duration::from_millis(self.config.radio.turnaround_ms));
+                                                // COP-202 Decision 8: a floor-enabled dial's
+                                                // windows cover our prepended ID and the
+                                                // peer's, so a clean-channel ACK lands
+                                                // before the first repeat. A pinned dial
+                                                // keeps COP-172's schedule.
+                                                if floor {
+                                                    interval += Duration::from_secs_f64(
+                                                        sent.saturating_sub(samples.len()) as f64
+                                                            / sr,
+                                                    ) + self.station_id_allowance();
+                                                }
+                                                // COP-210: the lexically higher
+                                                // floor-enabled caller listens
+                                                // through the peer's OFDM and
+                                                // first floor requests.
+                                                let stagger = floor_policy::calling_retry_stagger(
+                                                    local_call.as_str(),
+                                                    remote.as_str(),
+                                                    floor,
+                                                    LinkPhyMode::Ofdm {
+                                                        level: self.engine.speed_level(),
+                                                    },
+                                                    interval,
+                                                    self.turnaround(),
+                                                );
                                                 self.pending_dial = Some(PendingDial {
                                                     session_id: id,
                                                     request: pdu_bytes.clone(),
                                                     left: retries,
                                                     total: retries,
-                                                    next_at: keyed + interval,
+                                                    next_at: keyed + interval + stagger,
                                                     interval,
                                                     give_up_at: keyed + Duration::from_secs(300),
+                                                    window_expired: false,
+                                                    floor,
+                                                    stagger,
                                                 });
                                             }
                                         }
@@ -5569,6 +6094,9 @@ impl EventLoop {
 
                     // Try to parse as MAC PDU for session handling
                     if let Ok(mac_pdu) = MacPdu::from_bytes(decoded_bytes) {
+                        self.phy_rx = Some(LinkPhyMode::Ofdm {
+                            level: frame.speed_level,
+                        });
                         if mac_pdu.frame_type == MacFrameType::OuterData {
                             self.handle_session_outer_data(mac_pdu, frame.speed_level)
                                 .await;
@@ -5780,6 +6308,51 @@ impl EventLoop {
                     #[cfg(feature = "websocket")]
                     self.ws_decode_failure();
                 }
+            }
+        }
+        self.decode_and_dispatch_floor(samples).await;
+    }
+
+    /// COP-202: the floor receive path. The floor detector always runs; the
+    /// shared `admits_floor_pdu` gate decides what reaches the handlers. A
+    /// floor frame carries no OFDM metrics, so no SNR, level or CFO
+    /// telemetry is pushed for it.
+    async fn decode_and_dispatch_floor(&mut self, samples: &[f32]) {
+        for payload in self.engine.push_floor_samples(samples) {
+            let Ok(pdu) = MacPdu::from_bytes(&payload) else {
+                continue;
+            };
+            let session = self
+                .session_id_for_frame(&pdu)
+                .and_then(|id| self.session_mgr.get(id));
+            // A session that already advertised bit 6 keeps hearing the
+            // floor if a speed level is pinned mid-session; a pin only stops
+            // new floor bootstraps.
+            let local_enabled =
+                self.floor_enabled() || session.is_some_and(|s| s.local_caps.robust_floor);
+            if !floor_policy::admits_floor_pdu(pdu.frame_type, &pdu.payload, session, local_enabled)
+            {
+                continue;
+            }
+            if matches!(
+                pdu.frame_type,
+                MacFrameType::ConnectReq | MacFrameType::ConnectAck | MacFrameType::ConnectCfm
+            ) && LinkCapabilities::from_bytes(&pdu.payload)
+                .is_ok_and(|c| floor_policy::floor_caps_unusable(&c))
+            {
+                continue;
+            }
+            // COP-60: the sender is still keyed for its PTT tail.
+            let until = tokio::time::Instant::now()
+                + Duration::from_millis(self.config.radio.turnaround_ms);
+            self.rx_turnaround_until =
+                Some(self.rx_turnaround_until.map_or(until, |old| old.max(until)));
+            self.phy_rx = Some(LinkPhyMode::Floor);
+            if pdu.frame_type == MacFrameType::Ack {
+                let level = self.engine.speed_level();
+                self.handle_session_ack_at_level(pdu, level).await;
+            } else {
+                self.handle_mac_pdu(pdu).await;
             }
         }
     }
@@ -7453,7 +8026,40 @@ impl EventLoop {
     }
 
     async fn handle_incoming_connect(&mut self, pdu: MacPdu) {
-        if !self.listening {
+        // COP-210: a simultaneous call. We are dialing the station whose
+        // CONNECT_REQ this is, and our callsign sorts after its callsign
+        // (`floor_policy::answers_simultaneous_call`), so we drop our own
+        // dial and answer its request, as the library `Link` does. The call
+        // is the host's own, so `LISTEN OFF` does not refuse it. The other
+        // station keeps calling and ignores our request.
+        let crossed = self.session_id_for_frame(&pdu).filter(|&id| {
+            self.session_mgr.get(id).is_some_and(|s| {
+                s.state == SessionState::Connecting
+                    && floor_policy::answers_simultaneous_call(s.local.as_str(), s.remote.as_str())
+            })
+        });
+        let crossed = match crossed {
+            Some(_) if LinkCapabilities::from_bytes(&pdu.payload).is_err() => {
+                tracing::debug!(remote = %pdu.src, "Unreadable crossed CONNECT_REQ; ignoring");
+                return;
+            }
+            Some(id) => {
+                tracing::info!(
+                    remote = %pdu.src, session_id = id,
+                    "Simultaneous call; answering the peer's CONNECT_REQ"
+                );
+                self.session_mgr.remove(id);
+                self.pending_dial = None;
+                true
+            }
+            None => false,
+        };
+        // A repeat REQ for a crossed session (its caller missed our ACK) is
+        // still the host's own call.
+        let crossed_repeat = self
+            .session_id_for_frame(&pdu)
+            .is_some_and(|id| self.is_accepting(id) && self.crossed_dial == Some(id));
+        if !self.listening && !crossed && !crossed_repeat {
             tracing::debug!("CONNECT_REQ received but not listening; ignoring");
             return;
         }
@@ -7475,6 +8081,9 @@ impl EventLoop {
         let pending_id = self
             .session_id_for_frame(&pdu)
             .filter(|&id| self.is_accepting(id));
+        // A repeat REQ that replaces a crossed session keeps the crossed
+        // reporting on the new session.
+        let crossed = crossed || pending_id.is_some_and(|id| self.crossed_dial == Some(id));
         let replaced = match pending_id {
             Some(_) if LinkCapabilities::from_bytes(&pdu.payload).is_err() => {
                 tracing::debug!(remote = %pdu.src, "Unreadable repeat CONNECT_REQ; ignoring");
@@ -7503,19 +8112,34 @@ impl EventLoop {
         }
 
         let remote = pdu.src.clone();
-        let caps = local_link_caps(&self.config);
+        let caps = local_link_caps(&self.config, self.floor_enabled());
         let now = clock_now();
         match self
             .session_mgr
             .create(local, remote.clone(), pdu.ssid, caps, now)
         {
             Ok(id) => {
+                // COP-202: a new inbound session (a COP-44 replacement too)
+                // starts its waveform policy afresh, then follows the
+                // waveform this request arrived on.
+                let rx_mode = self.phy_rx;
+                self.reset_floor();
+                self.phy_rx = rx_mode;
+                if let Some(mode) = rx_mode {
+                    self.floor.received(mode);
+                }
+                if crossed {
+                    self.crossed_dial = Some(id);
+                }
                 if let Some(session) = self.session_mgr.get_mut(id) {
                     match session.handle_connect_req(&pdu.payload, now) {
                         Ok(ack_pdu) => {
+                            self.note_validated_rx();
                             // COP-44: announce the attempt before the ACK,
                             // whose busy-channel wait can last seconds.
-                            if !replaced {
+                            // COP-210: a crossed call's host already saw
+                            // its own CONNECTING.
+                            if !replaced && !crossed {
                                 self.notify_session(
                                     0,
                                     SessionNotice::Pending {
@@ -7525,8 +8149,12 @@ impl EventLoop {
                                 .await;
                             }
                             let ack_bytes = ack_pdu.to_bytes();
-                            match self.engine.encode_bytes(&ack_bytes) {
-                                Ok(samples) => self.transmit_samples(&samples).await,
+                            match self.encode_session_frame(&ack_bytes, rx_mode) {
+                                Ok((samples, mode)) => {
+                                    if self.transmit_samples_keyed(&samples).await > 0 {
+                                        self.phy_tx = Some(mode);
+                                    }
+                                }
                                 Err(e) => {
                                     tracing::warn!(error = %e, "Failed to encode CONNECT_ACK")
                                 }
@@ -7538,7 +8166,10 @@ impl EventLoop {
                             tracing::warn!(error = %e, "Failed to handle CONNECT_REQ");
                             self.session_mgr.remove(id);
                             // The session this REQ replaced is gone too.
-                            if replaced {
+                            // COP-210: so is a crossed call's own dial.
+                            if crossed {
+                                self.notify_session(0, SessionNotice::Disconnected).await;
+                            } else if replaced {
                                 self.notify_session(0, SessionNotice::PendingCancelled)
                                     .await;
                             }
@@ -7566,13 +8197,25 @@ impl EventLoop {
                     };
                     // COP-38 (D2): the new session starts at seq 0.
                     let session_id = session.id;
+                    self.note_validated_rx();
                     self.reset_session_link(session_id);
                     // The session is established now; the busy-channel courtesy
                     // wait in transmit_samples can delay the CFM by seconds.
                     self.notify_session(0, notice).await;
+                    // COP-202: the CFM answers in the waveform the ACK
+                    // arrived on, and the controller follows it.
+                    let rx_mode = self.phy_rx;
+                    if let Some(mode) = rx_mode {
+                        self.floor.received(mode);
+                    }
+                    self.apply_floor_session_timers(session_id);
                     let cfm_bytes = cfm_pdu.to_bytes();
-                    match self.engine.encode_bytes(&cfm_bytes) {
-                        Ok(samples) => self.transmit_samples(&samples).await,
+                    match self.encode_session_frame(&cfm_bytes, rx_mode) {
+                        Ok((samples, mode)) => {
+                            if self.transmit_samples_keyed(&samples).await > 0 {
+                                self.phy_tx = Some(mode);
+                            }
+                        }
                         Err(e) => tracing::warn!(error = %e, "Failed to encode CONNECT_CFM"),
                     }
                 }
@@ -7588,6 +8231,8 @@ impl EventLoop {
     async fn handle_connect_cfm_rx(&mut self, pdu: MacPdu) {
         let remote = pdu.src.clone();
         let session_id = self.session_id_for_frame(&pdu);
+        // COP-210: a crossed call completes as the host's own outgoing call.
+        let crossed = session_id.is_some() && self.crossed_dial == session_id;
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             match session.handle_connect_cfm(&pdu.payload, clock_now()) {
                 Ok(()) => {
@@ -7596,11 +8241,13 @@ impl EventLoop {
                     let notice = SessionNotice::Connected {
                         local: session.local.clone(),
                         remote,
-                        we_called: false,
+                        we_called: crossed,
                     };
                     // COP-38 (D2): the new session starts at seq 0.
                     let session_id = session.id;
+                    self.note_validated_rx();
                     self.reset_session_link(session_id);
+                    self.apply_floor_session_timers(session_id);
                     self.notify_session(0, notice).await;
                 }
                 Err(e) => {
@@ -7612,8 +8259,12 @@ impl EventLoop {
                         let session_id = session.id;
                         self.session_mgr.remove(session_id);
                         self.discard_session_tx(session_id).await;
-                        self.notify_session(0, SessionNotice::PendingCancelled)
-                            .await;
+                        let notice = if crossed {
+                            SessionNotice::Disconnected
+                        } else {
+                            SessionNotice::PendingCancelled
+                        };
+                        self.notify_session(0, notice).await;
                     }
                 }
             }
@@ -7628,7 +8279,7 @@ impl EventLoop {
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(id) = session_id {
             // Read before `handle_disconnect` sets the session `Idle`.
-            let was_pending = self.is_accepting(id);
+            let was_pending = self.host_pending(id);
             if let Some(session) = self.session_mgr.get_mut(id) {
                 session.handle_disconnect();
             }
@@ -7724,11 +8375,32 @@ impl EventLoop {
             }
             return;
         };
+        // COP-202: the controller follows the waveform the data arrived on.
+        // A level-1 OFDM segment heard while on the floor is the peer's
+        // recovery probe, answered on level 1 so the reply is as robust as
+        // the probe; every other ACK answers in the waveform it heard.
+        let rx_mode = self.phy_rx;
+        let was_floor = self.floor.floor_active();
+        if let Some(mode) = rx_mode {
+            self.floor.received(mode);
+        }
         let Some(ack) = self.deliver_session_segment(segment) else {
             return;
         };
-        match self.engine.encode_bytes(&ack) {
-            Ok(samples) => Box::pin(self.transmit_samples(&samples)).await,
+        // COP-210: the delivery path accepted the segment.
+        self.note_validated_rx();
+        let probe = LinkPhyMode::Ofdm { level: 1 };
+        let encoded = if was_floor && rx_mode == Some(probe) && self.floor_enabled() {
+            self.encode_session_mode(&ack, probe).map(|s| (s, probe))
+        } else {
+            self.encode_session_frame(&ack, rx_mode)
+        };
+        match encoded {
+            Ok((samples, mode)) => {
+                if Box::pin(self.transmit_samples_keyed(&samples)).await > 0 {
+                    self.phy_tx = Some(mode);
+                }
+            }
             Err(e) => tracing::warn!(error = %e, "Failed to encode session ACK"),
         }
     }
@@ -7893,6 +8565,10 @@ impl EventLoop {
             );
             return;
         }
+        // COP-210: the ACK passed the stale-ACK guard.
+        if self.phy_rx.is_some() {
+            self.rx_reported = self.phy_rx;
+        }
         let outer_pending = link.tx_outer.is_some() && link.tx.in_flight() > 0;
         // COP-121 (D5): the in-flight segment's stream and length, read
         // before `process_ack` frees it.
@@ -7902,6 +8578,13 @@ impl EventLoop {
         let acked = link
             .tx
             .process_ack(ack.ack_num, ack.ack_bitmap, clock_now());
+        // COP-202: a newly acknowledged exchange, in the waveform the ACK
+        // arrived on (the stale-ACK guard above already ran).
+        if acked.contains(&base) {
+            if let Some(mode) = self.phy_rx {
+                self.floor.acknowledged(base, mode);
+            }
+        }
         let delivered_chat = if base_stream == APP_STREAM && acked.contains(&base) {
             link.chat_tx.ack(base_len)
         } else {
@@ -7949,6 +8632,7 @@ impl EventLoop {
         let session_id = self.session_id_for_frame(&pdu);
         if let Some(session) = session_id.and_then(|id| self.session_mgr.get_mut(id)) {
             session.touch(clock_now());
+            self.note_validated_rx();
         }
     }
 
@@ -8583,6 +9267,12 @@ mod tests {
     async fn cop172_retries_repeat_the_connect_request() {
         for retries in [0, 2, 20] {
             let (mut a, mut audio, mut replies) = cop172_station("N1CALL");
+            // COP-202: a pinned speed level keeps COP-172's OFDM schedule.
+            a.handle_host_event(HostEvent::SetSpeedLevel {
+                client_id: 1,
+                level: Some(2),
+            })
+            .await;
             cop172_command(&mut a, 1, &format!("RETRIES {retries}")).await;
             a.handle_host_event(HostEvent::ConnectRequest {
                 client_id: 1,
@@ -8653,7 +9343,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cop172_retries_are_per_client_and_abort_stops_repeats() {
         let (mut a, mut audio, _) = cop172_station("N1CALL");
-        cop172_command(&mut a, 2, "RETRIES 3").await;
+        cop172_command(&mut a, 2, "RETRIES 5").await;
         a.handle_host_event(HostEvent::ConnectRequest {
             client_id: 1,
             source: "N1CALL".into(),
@@ -8661,7 +9351,12 @@ mod tests {
         })
         .await;
         take_leg(&mut audio, "request");
-        assert!(a.pending_dial.is_none());
+        // COP-202: client 2's RETRIES does not reach client 1, whose unset
+        // count defaults to the Auto floor-fallback repeats.
+        assert_eq!(
+            a.pending_dial.as_ref().map(|d| d.total),
+            Some(coppa_protocol::session::MAX_CONNECT_RETRIES)
+        );
         cop172_command(&mut a, 1, "ABORT").await;
         cop172_command(&mut a, 1, "RETRIES 3").await;
         a.handle_host_event(HostEvent::Disconnected { client_id: 1 })
@@ -10675,6 +11370,26 @@ mod tests {
         (a, b, a_consumer, b_consumer)
     }
 
+    /// COP-211: pin both speed levels before the handshake so these COP-68
+    /// tests exercise an OFDM session with no negotiated floor.
+    async fn connected_ofdm_pair(
+        turnaround_ms: u64,
+    ) -> (
+        EventLoop,
+        EventLoop,
+        coppa_audio::AudioRingConsumer,
+        coppa_audio::AudioRingConsumer,
+    ) {
+        let (mut a, mut b, mut a_consumer, mut b_consumer) =
+            unconnected_pair(turnaround_ms, |_| {}, |_| {});
+        for station in [&mut a, &mut b] {
+            station.manual_speed_level = Some(station.engine.speed_level());
+        }
+        handshake_pair(&mut a, &mut b, &mut a_consumer, &mut b_consumer).await;
+        assert!(!a.session_floor_negotiated() && !b.session_floor_negotiated());
+        (a, b, a_consumer, b_consumer)
+    }
+
     /// Two listening stations, VK3ABC (`a`) and W1AW (`b`), each with an
     /// audio sink, before any session.
     fn unconnected_pair(
@@ -11239,7 +11954,7 @@ mod tests {
     /// after exhaustion.)
     #[tokio::test]
     async fn exhausted_session_link_sends_disconnect_and_reports_disconnected() {
-        let (mut a, mut b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, mut b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         let mut status_rx = vara_lines(&mut a);
         let mut b_status_rx = vara_lines(&mut b);
         fast_session_rto(&mut a);
@@ -11305,7 +12020,7 @@ mod tests {
     /// the no-evidence bound once the peer goes quiet.
     #[tokio::test]
     async fn session_link_holds_while_peer_still_decodable_and_fails_after_quiet() {
-        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         let mut status_rx = vara_lines(&mut a);
         fast_session_rto(&mut a);
         a.handle_host_event(HostEvent::DataReceived {
@@ -11375,7 +12090,7 @@ mod tests {
     /// hold and restores the standard budget.
     #[tokio::test]
     async fn fade_hold_retransmits_at_fittest_level_and_recovers() {
-        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
         a.handle_host_event(HostEvent::DataReceived {
             client_id: 1,
@@ -11428,13 +12143,54 @@ mod tests {
         assert_eq!(a.buffered_tx_bytes(), 0);
     }
 
+    /// COP-211: two expired data windows return a floor-negotiated session
+    /// to the floor even after its level-1 probe succeeded.
+    #[tokio::test]
+    async fn post_probe_window_expiry_returns_to_the_floor() {
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        assert!(
+            a.session_floor_negotiated(),
+            "both stations advertise bit 6"
+        );
+        a.floor.received(LinkPhyMode::Floor);
+        for seq in 0..5 {
+            a.floor.prepare_data(seq);
+            a.floor.acknowledged(seq, LinkPhyMode::Floor);
+        }
+        a.floor.prepare_data(5);
+        a.floor.acknowledged(5, LinkPhyMode::Ofdm { level: 1 });
+        assert!(!a.floor.floor_active(), "the probe succeeded");
+        fast_session_rto(&mut a);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: b"tiny".to_vec(),
+        })
+        .await;
+        read_all(&mut a_consumer);
+        let mut modes = Vec::new();
+        for _ in 0..2 {
+            a.handle_ptt_change(false).await;
+            sleep_past_session_rto(&a);
+            a.check_session_retransmits().await;
+            read_all(&mut a_consumer);
+            modes.push(a.phy_tx);
+        }
+        assert_eq!(
+            modes,
+            vec![
+                Some(LinkPhyMode::Ofdm { level: 2 }),
+                Some(LinkPhyMode::Floor)
+            ]
+        );
+    }
+
     /// COP-68: a segment whose encoded frame exceeds level 2's 117-byte
     /// budget has no lower level to drop to -- the honest "nothing lower
     /// fits" branch: the link still holds (no teardown at the old death
     /// point) and retransmits at the current level.
     #[tokio::test]
     async fn oversized_segment_holds_at_current_level() {
-        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
         // COP-110: one codeword per frame, so the 120 B segment stays a
         // 1-codeword frame too big for any lower level (with 2 codewords,
@@ -11487,7 +12243,7 @@ mod tests {
     /// bounded after the refreshed bound with no further evidence.
     #[tokio::test]
     async fn header_only_decode_counts_as_evidence() {
-        let (mut a, b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
         a.handle_host_event(HostEvent::DataReceived {
             client_id: 1,
@@ -11572,7 +12328,7 @@ mod tests {
     /// robust-level frame ever went out.
     #[tokio::test]
     async fn fade_hold_no_evidence_bound_starts_at_hold_entry() {
-        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
         a.handle_host_event(HostEvent::DataReceived {
             client_id: 1,
@@ -11637,7 +12393,7 @@ mod tests {
     /// field to 0 in release.
     #[tokio::test]
     async fn fade_hold_attempt_calculation_saturates_past_u8_max() {
-        let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
+        let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
         a.handle_host_event(HostEvent::DataReceived {
             client_id: 1,
@@ -12453,9 +13209,9 @@ mod tests {
         // Seed the confirmer's `RateLoop` at level 4 -- one step below the
         // HF/VHF boundary -- so the very next raise crosses it. Direct
         // assignment matches how every other `rate_loop` test in this file
-        // seeds a non-default starting level. `raise_dwell = 5` is
-        // `RateLoop::default_coppa`'s own swept value, so five consecutive
-        // higher recommendations is exactly what a real climb costs.
+        // seeds a non-default starting level. `raise_dwell = 5` is the
+        // pre-COP-183 dwell, kept explicit here so five consecutive higher
+        // recommendations is exactly what this test's climb costs.
         a.rate_loop = RateLoop::new(a.engine.available_speed_levels(), 5, 4).unwrap();
 
         // Five real ACKs, encoded under `hf_standard_short_cp` -- `a`'s REAL
@@ -15377,6 +16133,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cop183_one_higher_suggested_rate_raises_the_daemon_rate_loop_one_level() {
+        let mut config = DaemonConfig::default();
+        config.engine.arq_enabled = true;
+        let mut event_loop = EventLoop::new(config).unwrap();
+        event_loop.arq_tx = Some(ArqTx::new(ArqConfig::default()).unwrap());
+
+        let levels = event_loop.engine.available_speed_levels();
+        let before_level = event_loop.rate_loop.current_level();
+        let rank = levels
+            .iter()
+            .position(|&l| l == before_level)
+            .expect("the rate loop starts on a ladder level");
+        let next = levels[rank + 1];
+
+        // ONE peer ACK recommending level 9.
+        let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
+        let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
+        let ack_pdu = TransportPdu::new_ack_with_rate(0, 0, 0, 9);
+        let header = coppa_codec::ofdm::frame::CoppaHeader {
+            version: 1,
+            phy_mode: 0,
+            frame_type: coppa_codec::ofdm::frame::CoppaFrameType::Data,
+            bandwidth: 1,
+            fec_type: 0,
+            speed_level: 2,
+            seq_num: 0,
+            payload_len: ack_pdu.to_bytes().len() as u16,
+            codewords: 1,
+        };
+        let samples = peer_tx
+            .transmit(&header, &ack_pdu.to_bytes())
+            .expect("peer transmit should succeed");
+        event_loop
+            .decode_and_dispatch_audio(&with_lead_and_trail(&samples))
+            .await;
+
+        assert_eq!(
+            event_loop.rate_loop.current_level(),
+            next,
+            "one higher suggested_rate must raise one ladder step at RATE_LOOP_RAISE_DWELL = 1"
+        );
+        assert_eq!(
+            event_loop.engine.speed_level(),
+            event_loop.rate_loop.current_level(),
+            "the engine's configured speed level should track RateLoop's current level"
+        );
+    }
+
+    #[tokio::test]
     async fn incoming_ack_with_rate_updates_rate_loop_and_encoder() {
         let mut config = DaemonConfig::default();
         config.engine.arq_enabled = true;
@@ -15387,8 +16192,9 @@ mod tests {
 
         // A peer ACK recommending a level clearly different from the default
         // (RateLoop::default_coppa starts at level 1) -- enough consecutive
-        // higher recommendations to actually step, matching RateLoop's own
-        // "raise slow" semantics (raise_dwell = 5 by default).
+        // higher recommendations to actually step. Since COP-183 the daemon's
+        // dwell is 1 (`RATE_LOOP_RAISE_DWELL`), so the first ACK already
+        // steps; five still exercises repeated raises.
         let peer_profile = coppa_codec::ofdm::CoppaProfile::hf_standard();
         let peer_tx = coppa_protocol::modem::transceiver::CoppaTransceiver::new(peer_profile, 1);
         for _ in 0..5 {
@@ -18333,12 +19139,22 @@ mod tests {
             // advertises the outer-code receive bit (SPEC §22.1).
             let mut off_config = DaemonConfig::default();
             off_config.session.fade_protection = crate::config::FadeProtection::Off;
+            // COP-202: P23 is reproduced with fade protection off and the
+            // floor off (a pinned speed level); in Auto coppad sets bit 6.
             assert_eq!(
-                hex(&local_link_caps(&off_config).to_bytes()),
+                hex(&local_link_caps(&off_config, false).to_bytes()),
                 "00c80102080200"
             );
             assert_eq!(
-                hex(&local_link_caps(&DaemonConfig::default()).to_bytes()),
+                hex(&local_link_caps(&off_config, true).to_bytes()),
+                "00c80102084200"
+            );
+            assert_eq!(
+                hex(&local_link_caps(&DaemonConfig::default(), true).to_bytes()),
+                "00c80102084600"
+            );
+            assert_eq!(
+                hex(&local_link_caps(&DaemonConfig::default(), false).to_bytes()),
                 "00c80102080600"
             );
             // COP-121: host bytes on stream 0 are still P04, byte for byte,
@@ -18363,8 +19179,8 @@ mod tests {
                 let mut chat_config = DaemonConfig::default();
                 chat_config.host.websocket_enabled = true;
                 assert_eq!(
-                    hex(&local_link_caps(&chat_config).to_bytes()),
-                    "00c80102081600"
+                    hex(&local_link_caps(&chat_config, true).to_bytes()),
+                    "00c80102085600"
                 );
             }
         }
@@ -18633,13 +19449,23 @@ mod tests {
             let ack = peer.engine.encode_bytes(&session_ack_frame(link)).unwrap();
             let floor =
                 Duration::from_secs_f64((burst.len() + 2 * ack.len()) as f64 / 48000.0 + 1.5);
-            station.set_session_segment_floor(burst.len(), packet_len, 1);
+            station.set_session_segment_floor(
+                burst.len(),
+                packet_len,
+                1,
+                LinkPhyMode::Ofdm { level: 1 },
+            );
             assert!(
                 station.session_link.as_ref().unwrap().tx.rto() >= floor,
                 "RS timeout must cover both level-2 peer ACKs"
             );
             station.engine.set_speed_level(7).unwrap();
-            station.set_session_segment_floor(burst.len(), packet_len, 1);
+            station.set_session_segment_floor(
+                burst.len(),
+                packet_len,
+                1,
+                LinkPhyMode::Ofdm { level: 1 },
+            );
             let link = station.session_link.as_ref().unwrap();
             assert_eq!(link.tx_outer.unwrap().level, 8);
             assert!(
@@ -18760,6 +19586,63 @@ mod tests {
                 .unwrap()
                 .block_ack_at
                 .is_none());
+        }
+
+        /// COP-210: an RS block ACK and an RS burst retransmission are
+        /// session key-ups, so the reported TX waveform follows each at the
+        /// level it was encoded at, even when the speed level changed since
+        /// the previous session frame.
+        #[tokio::test(start_paused = true)]
+        async fn rs_keyups_set_reported_tx_waveform() {
+            let (mut station, mut consumer) = rs_station();
+            station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: vec![17; 200],
+                })
+                .await;
+            let _ = read_all(&mut consumer);
+            // The burst played out; the audio thread releases PTT.
+            station.handle_ptt_change(false).await;
+            assert_eq!(station.phy_mode().0, Some(LinkPhyMode::Ofdm { level: 2 }));
+            let link = station.session_link.as_ref().unwrap();
+            let segment = TransportPdu::new_reliable(0, 0, 0, vec![23; 40]).to_bytes();
+            let packets = coppa_protocol::outer_code::encode_block(0, &segment, 99).unwrap();
+            let frames: Vec<_> = packets
+                .iter()
+                .map(|p| {
+                    MacPdu::new(
+                        MacFrameType::OuterData,
+                        link.local.clone(),
+                        link.remote.clone(),
+                        link.ssid,
+                        p.to_bytes().unwrap(),
+                    )
+                })
+                .collect();
+            for frame in frames {
+                station.handle_session_outer_data(frame, 2).await;
+            }
+            station.engine.set_speed_level(4).unwrap();
+            let until = station.session_link.as_ref().unwrap().block_ack_at.unwrap();
+            let now = clock_now();
+            if until > now {
+                tokio::time::advance(until - now).await;
+            }
+            let generation = station.tx_generation;
+            station.flush_block_ack().await;
+            assert!(station.tx_generation > generation, "the block ACK keyed");
+            assert_eq!(station.phy_mode().0, Some(LinkPhyMode::Ofdm { level: 4 }));
+            let _ = read_all(&mut consumer);
+            station.handle_ptt_change(false).await;
+            // The level-2 burst goes unacknowledged and is resent at its
+            // pinned level.
+            let rto = station.session_link.as_ref().unwrap().tx.rto();
+            tokio::time::advance(rto + Duration::from_secs(1)).await;
+            let generation = station.tx_generation;
+            station.check_session_retransmits().await;
+            assert!(station.tx_generation > generation, "the burst was resent");
+            assert_eq!(station.phy_mode().0, Some(LinkPhyMode::Ofdm { level: 2 }));
         }
 
         /// COP-69 test rig: a station pinned to level 8 on `HF_STANDARD`
@@ -22840,7 +23723,7 @@ mod tests {
                 config
             }
 
-            /// Raise `RateLoop` the way peer ACKs do (raise_dwell = 5).
+            /// Raise `RateLoop` the way peer ACKs do (`RATE_LOOP_RAISE_DWELL`).
             fn climb_to(event_loop: &mut EventLoop, level: u8) {
                 while event_loop.rate_loop.current_level() < level {
                     event_loop.rate_loop.on_ack(9, true);
@@ -23065,7 +23948,7 @@ mod tests {
                 }
                 station.apply_reload(file);
                 // Ordinary single-codeword frames clear the segment override.
-                station.set_session_segment_floor(100, 100, 1);
+                station.set_session_segment_floor(100, 100, 1, LinkPhyMode::Ofdm { level: 1 });
                 let level = station.engine.speed_level();
                 let expected = coppa_protocol::arq::rto_floor(
                     SESSION_ARQ_WINDOW,
@@ -24633,7 +25516,7 @@ mod tests {
             };
             // 0.6.0 has no outer bits; disabling them produces exactly its caps.
             assert_eq!(
-                local_link_caps(&legacy_config).to_bytes(),
+                local_link_caps(&legacy_config, false).to_bytes(),
                 legacy_caps.to_bytes()
             );
             let payload = vec![47; 200];
@@ -26500,5 +27383,1734 @@ mod tests {
         a.handle_ptt_change(false).await;
         assert!(a.kiss_datagrams.is_empty());
         take_leg(&mut audio, "second datagram");
+    }
+
+    // COP-196: the daemon half of the COP-190 connect bar. The fixed trial
+    // contract (ten trials, seeds 0x16910000+index, 48 kHz, constant -6 dB
+    // AWGN on the channel's 3 kHz reference, 960-sample blocks on one sample
+    // clock, both ends confirmed by sample 2_880_000) lives in
+    // crates/coppa-engine/tests/floor_session.rs; these trials drive the same
+    // contract through two daemon EventLoops, their real audio rings and
+    // session handlers, paused Tokio time and the production `clock_now()`
+    // timer paths. The daemon runs COP-195's shared floor controller
+    // (COP-202), so the trials measure real floor establishment rather than
+    // faking it. No `fast_session_rto`, fabricated ACKs, injected state,
+    // decoder resets or manual PTT releases are used: the dial goes out
+    // through `handle_host_event`, PTT keys and releases through the
+    // completion task's `TxComplete` dispatch, and both stations decode
+    // through `poll_audio_input` from their audio-in rings.
+    mod floor_connect {
+        use super::*;
+        use coppa_channel::persistent::{PersistentChannel, SnrProfile};
+
+        const TRIALS: usize = 10;
+        const SEED_BASE: u64 = 0x1691_0000;
+        const SNR_DB: f32 = -6.0;
+        const BLOCK: usize = 960;
+        const DEADLINE_SAMPLES: usize = 2_880_000;
+        const SAMPLE_RATE: f32 = 48_000.0;
+
+        /// Clean active reference power of the production floor waveform at
+        /// its transmitted amplitude, measured once per run (never from
+        /// silence, never from the noisy channel output).
+        fn floor_reference_power() -> f32 {
+            let core = coppa_engine::CoppaCore::new();
+            let clean = core.floor().encode(b"connect bar reference").unwrap();
+            clean.iter().map(|x| x * x).sum::<f32>() / clean.len() as f32
+        }
+
+        /// One station of a paired trial: an EventLoop on its real audio rings
+        /// (`set_audio_out` / `set_audio_in`), plus the persistent channel of
+        /// this station's transmit direction. Direction 0 is A to B, 1 is B to
+        /// A, exactly as in the engine contract.
+        struct FloorStation {
+            station: EventLoop,
+            air_in: coppa_audio::AudioRingProducer,
+            air_out: coppa_audio::AudioRingConsumer,
+            channel: PersistentChannel,
+            /// COP-210: model "no OFDM response arrives". `move_block` sends
+            /// silence for this station's transmit block while its last
+            /// keyed session frame (`phy_tx`) is not a floor frame, like the
+            /// library trial's `pump(.., erase_ofdm)`.
+            erase_ofdm: bool,
+        }
+
+        impl FloorStation {
+            fn new(callsign: &str, seed: u64, direction: u8, reference_power: f32) -> Self {
+                Self::with_snr(callsign, seed, direction, reference_power, SNR_DB)
+            }
+
+            fn with_snr(
+                callsign: &str,
+                seed: u64,
+                direction: u8,
+                reference_power: f32,
+                snr_db: f32,
+            ) -> Self {
+                let mut config = DaemonConfig::default();
+                config.engine.callsign = callsign.to_string();
+                config.radio.ptt_pre_delay_ms = 0;
+                config.radio.ptt_tail_delay_ms = 0;
+                let mut station = EventLoop::new(config).unwrap();
+                station.listening = true;
+                let (out_producer, air_out) = coppa_audio::audio_ring(8_000_000);
+                station.set_audio_out(out_producer);
+                let (air_in, air_in_consumer) = coppa_audio::audio_ring(8_000_000);
+                station.set_audio_in(air_in_consumer);
+                let channel = PersistentChannel::new(
+                    SAMPLE_RATE,
+                    None,
+                    Some(SnrProfile::constant(snr_db)),
+                    reference_power,
+                    seed,
+                    direction,
+                );
+                Self {
+                    station,
+                    air_in,
+                    air_out,
+                    channel,
+                    erase_ofdm: false,
+                }
+            }
+
+            /// Dispatch every queued self-event (the production `run` select
+            /// arm), so a `TxComplete` releases PTT through the normal path.
+            async fn dispatch_pending(&mut self) {
+                while let Ok(event) = self.station.event_rx.try_recv() {
+                    self.station.dispatch_event(Some(event)).await;
+                }
+            }
+        }
+
+        struct Outcome {
+            index: usize,
+            seed: u64,
+            connected: bool,
+            elapsed_s: f32,
+            a_state: String,
+            b_state: String,
+            failure_reason: String,
+        }
+
+        /// Session-side state of one station for the recording: CONNECTED when
+        /// the session manager holds an established session with a live MAC
+        /// link, CONNECTING while a dial or handshake is pending, else IDLE.
+        fn station_state(station: &EventLoop) -> &'static str {
+            let established = station.session_mgr.active_sessions().iter().any(|&id| {
+                station
+                    .session_mgr
+                    .get(id)
+                    .is_some_and(|s| s.is_established())
+            });
+            if established && station.session_link.is_some() {
+                "CONNECTED"
+            } else if station.session_link.is_some()
+                || station.pending_dial.is_some()
+                || station.session_mgr.active_sessions().iter().any(|&id| {
+                    station
+                        .session_mgr
+                        .get(id)
+                        .is_some_and(|s| s.state == SessionState::Connecting)
+                })
+            {
+                "CONNECTING"
+            } else {
+                "IDLE"
+            }
+        }
+
+        /// Both ends confirmed: each station holds an established session and
+        /// a live session link whose peer identity matches the other station.
+        /// The three-leg handshake only reaches this state through decoded
+        /// audio, so a connected verdict always rests on actual handshake
+        /// traffic at both ends.
+        fn both_confirmed(a: &EventLoop, b: &EventLoop, b_call: &str, a_call: &str) -> bool {
+            let confirmed = |station: &EventLoop, peer: &str| {
+                station
+                    .session_link
+                    .as_ref()
+                    .is_some_and(|l| l.remote.as_str() == peer)
+                    && station.session_mgr.active_sessions().iter().any(|&id| {
+                        station
+                            .session_mgr
+                            .get(id)
+                            .is_some_and(|s| s.is_established())
+                    })
+            };
+            confirmed(a, b_call) && confirmed(b, a_call)
+        }
+
+        /// Move one full `BLOCK` through each direction's channel (COP-202
+        /// harness fix): a station that played fewer samples this tick
+        /// contributes silence for the rest of the block, and the channel adds
+        /// its noise to that silence, as the library Link trial does. Each
+        /// peer decodes this audio on the next tick's poll, so call ordering
+        /// gives neither side an instantaneous response. Returns the blocks
+        /// written into B's and A's input rings.
+        fn move_block(
+            a: &mut FloorStation,
+            b: &mut FloorStation,
+            tx_a: &mut [f32],
+            tx_b: &mut [f32],
+            muted: bool,
+        ) -> (Vec<f32>, Vec<f32>) {
+            let n_a = a.air_out.read(tx_a);
+            let n_b = b.air_out.read(tx_b);
+            tx_a[n_a..].fill(0.0);
+            tx_b[n_b..].fill(0.0);
+            for (station, tx) in [(&*a, &mut *tx_a), (&*b, &mut *tx_b)] {
+                if station.erase_ofdm && station.station.phy_tx != Some(LinkPhyMode::Floor) {
+                    tx.fill(0.0);
+                }
+            }
+            let heard_by_b = if muted {
+                vec![0.0; BLOCK]
+            } else {
+                a.channel.process(tx_a)
+            };
+            let heard_by_a = if muted {
+                vec![0.0; BLOCK]
+            } else {
+                b.channel.process(tx_b)
+            };
+            let mut written = 0;
+            while written < heard_by_b.len() {
+                written += b.air_in.write(&heard_by_b[written..]);
+            }
+            let mut written = 0;
+            while written < heard_by_a.len() {
+                written += a.air_in.write(&heard_by_a[written..]);
+            }
+            (heard_by_b, heard_by_a)
+        }
+
+        /// The production `run` loop's poll cadence on the virtual clock.
+        struct PairClock {
+            start: tokio::time::Instant,
+            next_fast_poll: Duration,
+            next_slow_poll: Duration,
+        }
+
+        impl PairClock {
+            fn new(start: tokio::time::Instant) -> Self {
+                Self {
+                    start,
+                    next_fast_poll: Duration::from_millis(500),
+                    next_slow_poll: Duration::from_secs(5),
+                }
+            }
+        }
+
+        /// One 20 ms block of a paired run, before virtual time advances:
+        /// the production `run` select arms on their own cadence, queued
+        /// self-events, then both stations' decode paths (which may key a
+        /// reply) and one block of played audio through each channel.
+        async fn step_pair(
+            a: &mut FloorStation,
+            b: &mut FloorStation,
+            clock: &mut PairClock,
+            tx_a: &mut [f32],
+            tx_b: &mut [f32],
+            muted: bool,
+        ) {
+            step_stations(a, b, clock).await;
+            move_block(a, b, tx_a, tx_b, muted);
+        }
+
+        /// The stations' half of `step_pair`: everything before this tick's
+        /// audio moves, so a test can act on what they just keyed.
+        async fn step_stations(a: &mut FloorStation, b: &mut FloorStation, clock: &mut PairClock) {
+            if clock.start.elapsed() >= clock.next_fast_poll {
+                for station in [&mut a.station, &mut b.station] {
+                    station.enforce_ptt_backstop().await;
+                    station.check_arq_retransmits().await;
+                    station.repeat_pending_dial().await;
+                    station.check_session_retransmits().await;
+                    station.retry_held_tx_drain().await;
+                    station.finish_drained_disconnect().await;
+                    // COP-210: the 500 ms snapshot publish, as `run()` does.
+                    station.publish_ws_snapshot().await;
+                }
+                clock.next_fast_poll += Duration::from_millis(500);
+            }
+            if clock.start.elapsed() >= clock.next_slow_poll {
+                for station in [&mut a.station, &mut b.station] {
+                    station.reap_timed_out_sessions().await;
+                    station.send_due_keepalives().await;
+                }
+                clock.next_slow_poll += Duration::from_secs(5);
+            }
+            a.dispatch_pending().await;
+            b.dispatch_pending().await;
+            // Both stations run one block on the common sample clock: the
+            // production decode path first (it may key a reply), then this
+            // tick's played audio leaves the speaker ring, through the
+            // station's transmit channel, and into the peer's mic ring.
+            a.station.poll_audio_input().await;
+            b.station.poll_audio_input().await;
+            a.station.flush_pending_audio_out();
+            b.station.flush_pending_audio_out();
+        }
+
+        /// Run one trial: fresh stations and channels per trial, persistent
+        /// state throughout, the deadline starting at the initial connect
+        /// request, audio drained at playback rate (the 960 samples each
+        /// 20 ms tick plays), both directions processed every block including
+        /// noisy silence and turnarounds, and one block of pipeline delay (a
+        /// station hears the peer's previous block) so neither side gets an
+        /// instantaneous response. `muted` suppresses all peer audio for the
+        /// negative control.
+        async fn run_trial(index: usize, muted: bool, deadline_samples: usize) -> Outcome {
+            let seed = SEED_BASE + index as u64;
+            let reference_power = floor_reference_power();
+            let mut a = FloorStation::new("VK3ABC", seed, 0, reference_power);
+            let mut b = FloorStation::new("W1AW", seed, 1, reference_power);
+            let start = tokio::time::Instant::now();
+            // The deadline starts at the initial connect request, including
+            // its initial OFDM attempts and any automatic fallback.
+            a.station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "W1AW".into(),
+                })
+                .await;
+            let mut tx_a = vec![0.0f32; BLOCK];
+            let mut tx_b = vec![0.0f32; BLOCK];
+            let mut samples = 0usize;
+            let mut connected_at: Option<usize> = None;
+            let mut clock = PairClock::new(start);
+            while samples < deadline_samples {
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, muted).await;
+                samples += BLOCK;
+                if both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC") {
+                    connected_at = Some(samples);
+                    break;
+                }
+                // Move virtual time one block forward on the shared clock.
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            let a_state = station_state(&a.station).to_string();
+            let b_state = station_state(&b.station).to_string();
+            let a_established = a.station.session_mgr.active_sessions().iter().any(|&id| {
+                a.station
+                    .session_mgr
+                    .get(id)
+                    .is_some_and(|s| s.is_established())
+            });
+            let b_established = b.station.session_mgr.active_sessions().iter().any(|&id| {
+                b.station
+                    .session_mgr
+                    .get(id)
+                    .is_some_and(|s| s.is_established())
+            });
+            let (connected, elapsed_s, failure_reason) = match connected_at {
+                Some(at) => (true, at as f32 / SAMPLE_RATE, String::new()),
+                None => (
+                    false,
+                    deadline_samples as f32 / SAMPLE_RATE,
+                    format!(
+                        "timeout: A={} B={} established=({} / {})",
+                        a_state, b_state, a_established, b_established
+                    )
+                    .replace(',', ";"),
+                ),
+            };
+            Outcome {
+                index,
+                seed,
+                connected,
+                elapsed_s,
+                a_state,
+                b_state,
+                failure_reason,
+            }
+        }
+
+        /// Run all ten trials, print every outcome including failures, and
+        /// export the evidence CSV when `COPPA_FLOOR_CONNECT_OUT` names an
+        /// output directory. Default test execution writes nothing.
+        async fn run_trials() -> Vec<Outcome> {
+            let reference_power = floor_reference_power();
+            println!("reference power {reference_power:.6} (clean floor mean square)");
+            let mut outcomes = Vec::new();
+            for index in 0..TRIALS {
+                let outcome = run_trial(index, false, DEADLINE_SAMPLES).await;
+                println!(
+                    "daemon trial {} seed {:#x}: connected={} elapsed={:.1}s A={} B={} reason={}",
+                    outcome.index,
+                    outcome.seed,
+                    outcome.connected,
+                    outcome.elapsed_s,
+                    outcome.a_state,
+                    outcome.b_state,
+                    outcome.failure_reason
+                );
+                outcomes.push(outcome);
+            }
+            if let Ok(dir) = std::env::var("COPPA_FLOOR_CONNECT_OUT") {
+                let path = std::path::Path::new(&dir).join("daemon.csv");
+                let mut csv = String::from(
+                    "trial,seed,snr_db,connected,elapsed_s,a_state,b_state,failure_reason\n",
+                );
+                for outcome in &outcomes {
+                    csv.push_str(&format!(
+                        "{},{:#x},{},{},{:.1},{},{},{}\n",
+                        outcome.index,
+                        outcome.seed,
+                        SNR_DB,
+                        outcome.connected,
+                        outcome.elapsed_s,
+                        outcome.a_state,
+                        outcome.b_state,
+                        if outcome.failure_reason.is_empty() {
+                            "-"
+                        } else {
+                            &outcome.failure_reason
+                        }
+                    ));
+                }
+                std::fs::write(&path, csv)
+                    .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+                println!("wrote {}", path.display());
+            }
+            outcomes
+        }
+
+        /// COP-196 AC2: two daemon EventLoops, beginning unconnected, must
+        /// reach confirmed establishment at both ends within 60 simulated
+        /// seconds at -6 dB AWGN in at least nine of the ten fixed-seed
+        /// trials, through their real audio queues and session handlers.
+        ///
+        /// Ignored because a full ten-trial release run is expensive; run
+        /// explicitly per `results/cop-190/connect/metadata.md`. COP-202: the
+        /// daemon runs COP-195's shared floor controller, so the trials
+        /// measure it. A missed bar is a reason to investigate timing, not to
+        /// change seeds, thresholds, gains or deadlines.
+        #[tokio::test(start_paused = true)]
+        #[ignore = "expensive release measurement; see results/cop-190/connect/metadata.md"]
+        async fn floor_daemon_connect_minus6() {
+            let outcomes = run_trials().await;
+            let connected = outcomes.iter().filter(|o| o.connected).count();
+            println!(
+                "daemon connected {connected}/{} at {SNR_DB} dB",
+                outcomes.len()
+            );
+            assert!(
+                connected >= 9,
+                "connect bar not met: {connected}/{} trials connected; failures: {}",
+                outcomes.len(),
+                outcomes
+                    .iter()
+                    .filter(|o| !o.connected)
+                    .map(|o| format!("seed {:#x}: {}", o.seed, o.failure_reason))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+        }
+
+        /// Negative control for the trial runner: with all peer audio
+        /// suppressed the same runner must not report establishment at either
+        /// end, so a passing bar can never come from local intent (the dial
+        /// and its retries) rather than decoded peer traffic.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_muted_peers_never_connect() {
+            let outcome = run_trial(0, true, 5 * SAMPLE_RATE as usize).await;
+            assert!(
+                !outcome.connected,
+                "muted peers cannot establish a session: A={} B={}",
+                outcome.a_state, outcome.b_state
+            );
+            assert_eq!(
+                (outcome.a_state.as_str(), outcome.b_state.as_str()),
+                ("CONNECTING", "IDLE"),
+                "with no peer audio the dial is still pending and the listener idle"
+            );
+        }
+
+        /// COP-202 AC2: every tick moves one full block through each
+        /// direction's channel, so a station that plays nothing still hears
+        /// the channel's noise, as in the library Link trial.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_trial_carries_noisy_silence() {
+            let reference_power = floor_reference_power();
+            let mut a = FloorStation::new("VK3ABC", SEED_BASE, 0, reference_power);
+            let mut b = FloorStation::new("W1AW", SEED_BASE, 1, reference_power);
+            let (mut tx_a, mut tx_b) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+            let (mut to_b, mut to_a) = (Vec::new(), Vec::new());
+            for _ in 0..50 {
+                let (heard_by_b, heard_by_a) =
+                    move_block(&mut a, &mut b, &mut tx_a, &mut tx_b, false);
+                to_b.extend(heard_by_b);
+                to_a.extend(heard_by_a);
+            }
+            for heard in [&to_b, &to_a] {
+                assert_eq!(heard.len(), 50 * BLOCK);
+                let mean_square = heard.iter().map(|x| x * x).sum::<f32>() / heard.len() as f32;
+                assert!(mean_square > 0.0, "the channel adds noise to silence");
+            }
+        }
+
+        /// One station dialing with no peer at all: the production poll arms
+        /// on their cadence, played audio drained and discarded. `on_tick`
+        /// sees the station and the virtual time after every 20 ms block.
+        async fn drive_alone(
+            a: &mut FloorStation,
+            seconds: u64,
+            mut on_tick: impl FnMut(&EventLoop, Duration),
+        ) {
+            let start = tokio::time::Instant::now();
+            let mut tx = vec![0.0f32; BLOCK];
+            let mut next_fast_poll = Duration::from_millis(500);
+            let mut next_slow_poll = Duration::from_secs(5);
+            while start.elapsed() < Duration::from_secs(seconds) {
+                if start.elapsed() >= next_fast_poll {
+                    a.station.enforce_ptt_backstop().await;
+                    a.station.repeat_pending_dial().await;
+                    a.station.check_session_retransmits().await;
+                    next_fast_poll += Duration::from_millis(500);
+                }
+                if start.elapsed() >= next_slow_poll {
+                    a.station.reap_timed_out_sessions().await;
+                    next_slow_poll += Duration::from_secs(5);
+                }
+                a.dispatch_pending().await;
+                a.station.flush_pending_audio_out();
+                while a.air_out.read(&mut tx) > 0 {}
+                on_tick(&a.station, start.elapsed());
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+        }
+
+        async fn dial(station: &mut EventLoop) {
+            station
+                .handle_host_event(HostEvent::ConnectRequest {
+                    client_id: 1,
+                    source: "VK3ABC".into(),
+                    destination: "W1AW".into(),
+                })
+                .await;
+        }
+
+        /// Every connect request keyed, as `(virtual time, waveform)`: the
+        /// first at the dial, each repeat when the pending dial's count drops.
+        async fn dial_key_ups(
+            a: &mut FloorStation,
+            seconds: u64,
+        ) -> (Vec<(Duration, LinkPhyMode)>, Option<Duration>) {
+            dial(&mut a.station).await;
+            let mut keys = vec![(
+                Duration::ZERO,
+                a.station.phy_tx.expect("first request keyed"),
+            )];
+            let mut left = a.station.pending_dial.as_ref().map(|d| d.left);
+            let mut reaped = None;
+            drive_alone(a, seconds, |station, t| {
+                let now_left = station.pending_dial.as_ref().map(|d| d.left);
+                if let (Some(before), Some(after)) = (left, now_left) {
+                    if after < before {
+                        keys.push((t, station.phy_tx.expect("repeat keyed")));
+                    }
+                }
+                left = now_left.or(left);
+                if reaped.is_none() && station.session_mgr.active_sessions().is_empty() {
+                    reaped = Some(t);
+                }
+            })
+            .await;
+            (keys, reaped)
+        }
+
+        /// COP-202 Decision 8: the station-ID allowance reserves the ID the
+        /// peer may prepend, which the peer's own timer decides, so a station
+        /// with automatic ID off (`id_interval_secs = 0`) still reserves it
+        /// in its floor request windows and floor RTO floors.
+        #[tokio::test]
+        async fn station_id_allowance_ignores_local_id_setting() {
+            let allowance = |id_interval_secs| {
+                let mut config = DaemonConfig::default();
+                config.engine.callsign = "VK3ABC".to_string();
+                config.station_id.id_interval_secs = id_interval_secs;
+                EventLoop::new(config).unwrap().station_id_allowance()
+            };
+            let with_local_id = allowance(540);
+            assert!(with_local_id > Duration::ZERO);
+            assert_eq!(allowance(0), with_local_id);
+        }
+
+        /// COP-202 AC4/AC5: an Auto dial whose host never sent RETRIES keys
+        /// two OFDM requests, then falls back to the floor after the second
+        /// unanswered window, exactly as a fresh shared `FloorController`
+        /// decides; the floor repeat waits the floor response window plus the
+        /// station-ID allowance, and the session outlives the last request by
+        /// the handshake timeout.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_two_window_fallback() {
+            let mut a = FloorStation::new("VK3ABC", SEED_BASE, 0, floor_reference_power());
+            let level = a.station.engine.speed_level();
+            let turnaround = a.station.turnaround();
+            let allowance = a.station.station_id_allowance();
+            let (keys, reaped) = dial_key_ups(&mut a, 75).await;
+            let modes: Vec<_> = keys.iter().map(|&(_, m)| m).collect();
+            let mut reference = FloorController::default();
+            let mut expected = vec![reference.mode(level)];
+            for _ in 0..3 {
+                reference.timeout(true);
+                expected.push(reference.mode(level));
+            }
+            assert_eq!(modes, expected);
+            assert_eq!(
+                modes,
+                [
+                    LinkPhyMode::Ofdm { level },
+                    LinkPhyMode::Ofdm { level },
+                    LinkPhyMode::Floor,
+                    LinkPhyMode::Floor
+                ]
+            );
+            let pdu_airtime = {
+                let station = &a.station;
+                let req = coppa_protocol::session::Session::new(
+                    0,
+                    Callsign::new("VK3ABC").unwrap(),
+                    Callsign::new("W1AW").unwrap(),
+                    0,
+                    local_link_caps(&station.config, true),
+                    clock_now(),
+                )
+                .initiate(clock_now())
+                .unwrap()
+                .to_bytes();
+                Duration::from_secs_f64(
+                    station.engine.encode_bytes(&req).unwrap().len() as f64 / SAMPLE_RATE as f64,
+                )
+            };
+            // A floor-enabled dial's OFDM window also covers A's prepended
+            // first station ID and the peer's (Decision 8); both are the same
+            // level-1 ID frame.
+            let ofdm_interval =
+                coppa_protocol::session::connect_req_retry_interval(pdu_airtime, turnaround)
+                    + allowance * 2;
+            let gap = |i: usize| keys[i].0 - keys[i - 1].0;
+            // Repeats run on the 500 ms poll, so each lands within one poll.
+            assert!(
+                gap(1) >= ofdm_interval && gap(1) <= ofdm_interval + Duration::from_millis(520),
+                "{keys:?}"
+            );
+            assert!(
+                gap(2) >= ofdm_interval && gap(2) <= ofdm_interval + Duration::from_millis(520),
+                "{keys:?}"
+            );
+            let floor_window =
+                FloorController::response_window(LinkPhyMode::Floor, Duration::ZERO, turnaround);
+            assert!(allowance > Duration::ZERO);
+            assert!(gap(3) >= floor_window + allowance, "{keys:?}");
+            let reaped = reaped.expect("the unanswered dial is reaped");
+            assert!(
+                reaped >= keys[3].0 + Duration::from_secs(30),
+                "reaped at {reaped:?}: {keys:?}"
+            );
+            assert!(
+                a.station.pending_dial.is_none()
+                    || a.station.pending_dial.as_ref().is_some_and(|d| d.left == 0)
+            );
+        }
+
+        /// COP-202 AC5: an explicit RETRIES is honoured exactly, and only the
+        /// unset default reaches the floor.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_explicit_retries_are_honored() {
+            for (retries, expected) in [(0u8, 1usize), (1, 2)] {
+                let mut a = FloorStation::new("VK3ABC", SEED_BASE, 0, floor_reference_power());
+                a.station.vara_clients.entry(1).or_default().connect_retries = Some(retries);
+                let level = a.station.engine.speed_level();
+                let (keys, _) = dial_key_ups(&mut a, 40).await;
+                if retries == 0 {
+                    assert!(keys.len() == 1);
+                }
+                assert_eq!(
+                    keys.iter().map(|&(_, m)| m).collect::<Vec<_>>(),
+                    vec![LinkPhyMode::Ofdm { level }; expected],
+                    "RETRIES {retries}"
+                );
+            }
+            let mut a = FloorStation::new("VK3ABC", SEED_BASE, 0, floor_reference_power());
+            a.station.vara_clients.entry(1).or_default().connect_retries = Some(0);
+            dial(&mut a.station).await;
+            assert!(
+                a.station.pending_dial.is_none(),
+                "RETRIES 0 schedules no repeat"
+            );
+        }
+
+        /// COP-202 AC5: with a long turnaround the floor window plus
+        /// turnaround exceeds the flat 30 s handshake timeout; the dialing
+        /// session must survive until its scheduled floor repeat keys.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_dial_survives_long_turnaround() {
+            let mut a = FloorStation::new("VK3ABC", SEED_BASE, 0, floor_reference_power());
+            a.station.config.radio.turnaround_ms = 6000;
+            let (keys, _) = dial_key_ups(&mut a, 90).await;
+            let modes: Vec<_> = keys.iter().map(|&(_, m)| m).collect();
+            assert_eq!(modes.len(), 4, "request 4 keyed: {keys:?}");
+            assert_eq!(modes[3], LinkPhyMode::Floor);
+            assert!(keys[3].0 - keys[2].0 > Duration::from_secs(30), "{keys:?}");
+        }
+
+        /// COP-202 AC6: a pinned speed level clears capability bit 6, and an
+        /// unset-RETRIES dial keys exactly one OFDM request, never a floor
+        /// frame.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_manual_level_pins_ofdm() {
+            let mut a = FloorStation::new("VK3ABC", SEED_BASE, 0, floor_reference_power());
+            assert!(local_link_caps(&a.station.config, a.station.floor_enabled()).robust_floor);
+            a.station
+                .handle_host_event(HostEvent::SetSpeedLevel {
+                    client_id: 1,
+                    level: Some(2),
+                })
+                .await;
+            assert!(!a.station.floor_enabled());
+            assert!(!local_link_caps(&a.station.config, a.station.floor_enabled()).robust_floor);
+            let (keys, _) = dial_key_ups(&mut a, 40).await;
+            assert_eq!(
+                keys.iter().map(|&(_, m)| m).collect::<Vec<_>>(),
+                vec![LinkPhyMode::Ofdm { level: 2 }]
+            );
+            assert!(a.station.pending_dial.is_none());
+        }
+
+        /// COP-202 AC6: a floor-enabled daemon (Auto) and a pinned,
+        /// floor-disabled daemon connect on OFDM over a clean channel,
+        /// negotiate `robust_floor = false` at both ends, key no floor frame
+        /// and deliver data on OFDM.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_v1_peer_stays_ofdm() {
+            let reference_power = floor_reference_power();
+            let mut a = FloorStation::with_snr("VK3ABC", SEED_BASE, 0, reference_power, 60.0);
+            let mut b = FloorStation::with_snr("W1AW", SEED_BASE, 1, reference_power, 60.0);
+            b.station
+                .handle_host_event(HostEvent::SetSpeedLevel {
+                    client_id: 1,
+                    level: Some(2),
+                })
+                .await;
+            assert!(a.station.floor_enabled() && !b.station.floor_enabled());
+            dial(&mut a.station).await;
+            let start = tokio::time::Instant::now();
+            let mut clock = PairClock::new(start);
+            let (mut tx_a, mut tx_b) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+            let mut connected = false;
+            let mut floor_keyed = false;
+            let (data_tx, mut data_rx) = mpsc::unbounded_channel();
+            let mut delivered = Vec::new();
+            let payload: Vec<u8> = (0..50).collect();
+            while start.elapsed() < Duration::from_secs(40) {
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, false).await;
+                for station in [&a.station, &b.station] {
+                    floor_keyed |= station.phy_tx == Some(LinkPhyMode::Floor);
+                }
+                if !connected && both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC") {
+                    connected = true;
+                    b.station.set_response_tx(data_tx.clone());
+                    a.station
+                        .handle_host_event(HostEvent::DataReceived {
+                            client_id: 1,
+                            data: payload.clone(),
+                        })
+                        .await;
+                }
+                while let Ok(response) = data_rx.try_recv() {
+                    if let HostResponse::DataOut { data, .. } = response {
+                        delivered.extend(data);
+                    }
+                }
+                if delivered.len() >= payload.len() {
+                    break;
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            assert!(connected, "the OFDM handshake completes on a clean channel");
+            assert!(!floor_keyed, "neither station keys a floor frame");
+            for station in [&a.station, &b.station] {
+                let negotiated = station
+                    .session_mgr
+                    .active_sessions()
+                    .into_iter()
+                    .find_map(|id| station.session_mgr.get(id)?.negotiated.clone())
+                    .expect("negotiated caps");
+                assert!(!negotiated.robust_floor);
+            }
+            assert_eq!(delivered, payload, "delivered once, in order");
+        }
+
+        /// COP-202 AC9: two floor-enabled daemons on a clean channel connect
+        /// on the first OFDM exchange, key no floor frame, and a 500-byte
+        /// write still leaves A in one multi-codeword OFDM frame.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_clean_channel_keeps_ofdm_segments() {
+            let reference_power = floor_reference_power();
+            let mut a = FloorStation::with_snr("VK3ABC", SEED_BASE, 0, reference_power, 60.0);
+            let mut b = FloorStation::with_snr("W1AW", SEED_BASE, 1, reference_power, 60.0);
+            assert!(a.station.floor_enabled() && b.station.floor_enabled());
+            dial(&mut a.station).await;
+            let initial_left = a.station.pending_dial.as_ref().map(|d| d.left);
+            assert!(
+                initial_left.is_some(),
+                "an unset-RETRIES Auto dial schedules repeats"
+            );
+            let mut repeated = false;
+            let start = tokio::time::Instant::now();
+            let mut clock = PairClock::new(start);
+            let (mut tx_a, mut tx_b) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+            let mut connected_at = None;
+            let mut floor_keyed = false;
+            let mut first_data_codewords = None;
+            while start.elapsed() < Duration::from_secs(20) {
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, false).await;
+                for station in [&a.station, &b.station] {
+                    floor_keyed |= station.phy_tx == Some(LinkPhyMode::Floor);
+                }
+                if connected_at.is_none() {
+                    repeated |= a
+                        .station
+                        .pending_dial
+                        .as_ref()
+                        .is_some_and(|d| Some(d.left) != initial_left);
+                }
+                if connected_at.is_none()
+                    && both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC")
+                {
+                    connected_at = Some(start.elapsed());
+                    a.station
+                        .handle_host_event(HostEvent::DataReceived {
+                            client_id: 1,
+                            // Incompressible bytes, so compression cannot
+                            // shrink the write into a single codeword.
+                            data: {
+                                let mut x = 0x2545_f491_u32;
+                                (0..500)
+                                    .map(|_| {
+                                        x ^= x << 13;
+                                        x ^= x >> 17;
+                                        x ^= x << 5;
+                                        x as u8
+                                    })
+                                    .collect()
+                            },
+                        })
+                        .await;
+                }
+                if connected_at.is_some() && first_data_codewords.is_none() {
+                    first_data_codewords = a
+                        .station
+                        .session_link
+                        .as_ref()
+                        .filter(|l| l.tx.in_flight() > 0)
+                        .map(|l| (l.tx_codewords, l.has_backlog()));
+                }
+                if first_data_codewords.is_some() {
+                    break;
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            connected_at.expect("connected on a clean channel");
+            assert!(
+                !repeated,
+                "connected on the first OFDM request, with no repeat"
+            );
+            assert!(!floor_keyed, "no floor frame on a clean channel");
+            let (codewords, backlog_left) = first_data_codewords.expect("A keyed data");
+            assert!(
+                codewords > 1,
+                "one multi-codeword OFDM frame, not floor segments"
+            );
+            assert!(!backlog_left, "the 500-byte write left in one frame");
+        }
+
+        /// One session key-up on A after the connection, with data in
+        /// flight: its waveform, the in-flight segment's sequence number,
+        /// length and MAC frame length, and the link's codeword count and
+        /// outer-code state.
+        #[derive(Debug, Clone, Copy)]
+        struct DataKeyUp {
+            mode: Option<LinkPhyMode>,
+            seq: u8,
+            segment_len: usize,
+            frame_len: usize,
+            codewords: u8,
+            outer: bool,
+        }
+
+        fn data_key_up(station: &EventLoop) -> Option<DataKeyUp> {
+            let link = station.session_link.as_ref()?;
+            if link.tx.in_flight() == 0 {
+                return None;
+            }
+            let seq = link.tx.send_base();
+            let data = link.tx.get_segment_data(seq)?;
+            Some(DataKeyUp {
+                mode: station.phy_tx,
+                seq,
+                segment_len: data.len(),
+                frame_len: session_stream_frame(link, link.tx_stream, seq, data).len(),
+                codewords: link.tx_codewords,
+                outer: link.tx_outer.is_some(),
+            })
+        }
+
+        /// Two stations at -6 dB that both request fade protection, with B's
+        /// host output captured.
+        fn delivery_pair(
+            seed: u64,
+        ) -> (
+            FloorStation,
+            FloorStation,
+            mpsc::UnboundedReceiver<HostResponse>,
+            f32,
+        ) {
+            let reference_power = floor_reference_power();
+            let mut a = FloorStation::new("VK3ABC", seed, 0, reference_power);
+            let mut b = FloorStation::new("W1AW", seed, 1, reference_power);
+            for station in [&mut a.station, &mut b.station] {
+                station.config.session.fade_protection = crate::config::FadeProtection::Request;
+            }
+            let (tx, rx) = mpsc::unbounded_channel();
+            b.station.set_response_tx(tx);
+            (a, b, rx, reference_power)
+        }
+
+        fn drain_host_data(rx: &mut mpsc::UnboundedReceiver<HostResponse>, out: &mut Vec<u8>) {
+            while let Ok(resp) = rx.try_recv() {
+                if let HostResponse::DataOut { data, .. } = resp {
+                    out.extend_from_slice(&data);
+                }
+            }
+        }
+
+        /// COP-202 AC7: two daemons at -6 dB connect over the floor, then a
+        /// 100-byte host write reaches B's host exactly once and in order.
+        /// Every floor key-up carries one floor-sized PDU with one codeword
+        /// and no outer code, although `multi_frame_ack` and
+        /// `fade_protection = "request"` are negotiated. The sixth segment is
+        /// the level-1 OFDM probe; it goes unanswered at -6 dB and is resent
+        /// on the floor.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_pair_connects_and_delivers() {
+            let (mut a, mut b, mut b_host, _) = delivery_pair(SEED_BASE);
+            let payload: Vec<u8> = (0..100).collect();
+            dial(&mut a.station).await;
+            let start = tokio::time::Instant::now();
+            let mut clock = PairClock::new(start);
+            let (mut tx_a, mut tx_b) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+            let mut connected = false;
+            let mut a_keyed = false;
+            let mut key_ups = Vec::new();
+            let mut delivered = Vec::new();
+            while start.elapsed() < Duration::from_secs(240) {
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, false).await;
+                if connected && a.station.is_transmitting && !a_keyed {
+                    key_ups.extend(data_key_up(&a.station));
+                }
+                a_keyed = a.station.is_transmitting;
+                if !connected && both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC") {
+                    connected = true;
+                    assert!(
+                        a.station.session_floor_negotiated(),
+                        "both stations negotiated the floor"
+                    );
+                    a.station
+                        .handle_host_event(HostEvent::DataReceived {
+                            client_id: 1,
+                            data: payload.clone(),
+                        })
+                        .await;
+                }
+                drain_host_data(&mut b_host, &mut delivered);
+                if delivered.len() >= payload.len()
+                    && a.station
+                        .session_link
+                        .as_ref()
+                        .is_some_and(|l| l.tx.in_flight() == 0 && !l.has_backlog())
+                {
+                    break;
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            assert!(connected, "connected at -6 dB");
+            assert_eq!(
+                delivered, payload,
+                "B's host got the write exactly once and in order; key-ups: {key_ups:?}"
+            );
+            for k in key_ups
+                .iter()
+                .filter(|k| k.mode == Some(LinkPhyMode::Floor))
+            {
+                assert!(
+                    k.frame_len <= FLOOR_MAX_PAYLOAD && k.codewords == 1 && !k.outer,
+                    "a floor key-up carries one floor PDU, one codeword, no outer code: {k:?}"
+                );
+            }
+            let probes: Vec<usize> = key_ups
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| k.mode == Some(LinkPhyMode::Ofdm { level: 1 }))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(probes.len(), 1, "exactly one probe: {key_ups:?}");
+            let probe = key_ups[probes[0]];
+            assert_eq!(probe.seq, 5, "the sixth segment is the probe: {key_ups:?}");
+            let resent = key_ups
+                .get(probes[0] + 1)
+                .expect("the unanswered probe is resent");
+            assert_eq!(
+                (resent.mode, resent.seq),
+                (Some(LinkPhyMode::Floor), probe.seq),
+                "the unanswered probe is resent on the floor: {key_ups:?}"
+            );
+        }
+
+        /// COP-202 AC8: after five newly acknowledged floor exchanges, the
+        /// probe's matching OFDM ACK returns the sender to OFDM. Both
+        /// directions turn noiseless on the tick A keys the probe; B answers
+        /// it on level 1, A's next segment is cut at the OFDM budget, and the
+        /// whole write arrives once.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_five_ack_probe() {
+            let (mut a, mut b, mut b_host, reference_power) = delivery_pair(SEED_BASE);
+            let payload: Vec<u8> = (0..300).map(|i| i as u8).collect();
+            dial(&mut a.station).await;
+            let start = tokio::time::Instant::now();
+            let mut clock = PairClock::new(start);
+            let (mut tx_a, mut tx_b) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+            let mut connected = false;
+            let (mut a_keyed, mut b_keyed) = (false, false);
+            let mut key_ups = Vec::new();
+            let mut delivered = Vec::new();
+            let mut floor_data = false;
+            let mut swapped = false;
+            let mut probe_ack = None;
+            while start.elapsed() < Duration::from_secs(240) {
+                step_stations(&mut a, &mut b, &mut clock).await;
+                if connected && a.station.is_transmitting && !a_keyed {
+                    key_ups.extend(data_key_up(&a.station));
+                }
+                a_keyed = a.station.is_transmitting;
+                floor_data |= connected && a.station.phy_tx == Some(LinkPhyMode::Floor);
+                if swapped && probe_ack.is_none() && b.station.is_transmitting && !b_keyed {
+                    probe_ack = Some(b.station.phy_tx);
+                }
+                b_keyed = b.station.is_transmitting;
+                if !swapped
+                    && floor_data
+                    && a.station.phy_tx == Some(LinkPhyMode::Ofdm { level: 1 })
+                {
+                    // COP-210 AC4: hosts see the probe as OFDM level 1 TX.
+                    assert_eq!(
+                        a.station.phy_mode().0,
+                        Some(LinkPhyMode::Ofdm { level: 1 }),
+                        "the reported TX waveform is the probe's"
+                    );
+                    // Before this tick's audio moves.
+                    swapped = true;
+                    for (station, direction) in [(&mut a, 0u8), (&mut b, 1u8)] {
+                        station.channel = PersistentChannel::new(
+                            SAMPLE_RATE,
+                            None,
+                            Some(SnrProfile::constant(60.0)),
+                            reference_power,
+                            SEED_BASE,
+                            direction,
+                        );
+                    }
+                }
+                move_block(&mut a, &mut b, &mut tx_a, &mut tx_b, false);
+                if !connected && both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC") {
+                    connected = true;
+                    a.station
+                        .handle_host_event(HostEvent::DataReceived {
+                            client_id: 1,
+                            data: payload.clone(),
+                        })
+                        .await;
+                }
+                drain_host_data(&mut b_host, &mut delivered);
+                if delivered.len() >= payload.len()
+                    && a.station
+                        .session_link
+                        .as_ref()
+                        .is_some_and(|l| l.tx.in_flight() == 0 && !l.has_backlog())
+                {
+                    break;
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            assert!(connected, "connected at -6 dB");
+            assert!(swapped, "A keyed the probe: {key_ups:?}");
+            assert_eq!(
+                probe_ack,
+                Some(Some(LinkPhyMode::Ofdm { level: 1 })),
+                "B answered the probe on level 1"
+            );
+            let probe = key_ups
+                .iter()
+                .position(|k| k.mode == Some(LinkPhyMode::Ofdm { level: 1 }))
+                .expect("the probe key-up");
+            let next = key_ups
+                .get(probe + 1)
+                .expect("a data key-up after the probe");
+            let level = a.station.engine.speed_level();
+            assert_eq!(
+                next.mode,
+                Some(LinkPhyMode::Ofdm { level }),
+                "A is back on OFDM at the engine level: {key_ups:?}"
+            );
+            assert!(
+                next.segment_len > floor_policy::floor_segment_limit(u16::MAX),
+                "the segment after the probe is cut at the OFDM budget: {next:?}"
+            );
+            assert_eq!(delivered, payload, "the whole write arrived once");
+        }
+
+        /// COP-210: the `status.phy_mode` JSON the station's snapshot
+        /// serves right now.
+        #[cfg(feature = "websocket")]
+        async fn snapshot_phy_mode(station: &EventLoop) -> serde_json::Value {
+            let status = station.ws_status.as_ref().expect("snapshot attached");
+            let reply = status.lock().await.clone().reply(Some(1));
+            serde_json::to_value(reply).unwrap()["phy_mode"].clone()
+        }
+
+        /// COP-210: every `phy_mode` push the station sent, as `(tx, rx)`.
+        #[cfg(feature = "websocket")]
+        fn phy_mode_pushes(
+            station: &EventLoop,
+        ) -> Vec<(
+            Option<coppa_host::websocket::PhyMode>,
+            Option<coppa_host::websocket::PhyMode>,
+        )> {
+            use coppa_host::websocket::WsServerMessage;
+            station
+                .ws_pushed
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|m| match m {
+                    WsServerMessage::PhyMode { tx, rx } => Some((*tx, *rx)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// COP-210 AC6: the reported waveform pair follows a daemon floor
+        /// session and its change to OFDM, and clears when the session ends.
+        /// `phy_mode()` is `(None, None)` before any session activity; a
+        /// -6 dB floor session reports floor TX and validated floor RX at both
+        /// ends; a rejected numbered selection changes nothing; a successful
+        /// one on an opened channel makes the next session frame OFDM level 2
+        /// (no floor key-up after it), which B reports as its RX; a host
+        /// DISCONNECT on A and the received DISCONNECT on B clear both pairs.
+        /// With the `websocket` feature, the snapshot serves the same values
+        /// and a reliable `phy_mode` push follows each change and only a
+        /// change. Audio moves through the rings; no session is injected.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_phy_mode_reporting() {
+            let (mut a, mut b, mut b_host, reference_power) = delivery_pair(SEED_BASE);
+            #[cfg(feature = "websocket")]
+            for station in [&mut a.station, &mut b.station] {
+                station.set_ws_status(Arc::new(Mutex::new(
+                    coppa_host::websocket::WsStatus::default(),
+                )));
+                station.publish_ws_snapshot().await;
+            }
+            assert_eq!(
+                a.station.phy_mode(),
+                (None, None),
+                "no session activity yet"
+            );
+            assert_eq!(
+                b.station.phy_mode(),
+                (None, None),
+                "no session activity yet"
+            );
+            #[cfg(feature = "websocket")]
+            for station in [&a.station, &b.station] {
+                assert_eq!(
+                    snapshot_phy_mode(station).await,
+                    serde_json::json!({"tx": null, "rx": null})
+                );
+                assert_eq!(phy_mode_pushes(station), vec![(None, None)]);
+            }
+
+            dial(&mut a.station).await;
+            let start = tokio::time::Instant::now();
+            let mut clock = PairClock::new(start);
+            let (mut tx_a, mut tx_b) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+            let floor = Some(LinkPhyMode::Floor);
+            let on_floor = |station: &EventLoop| station.phy_mode() == (floor, floor);
+            let mut connected = false;
+            while start.elapsed() < Duration::from_secs(240) {
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, false).await;
+                connected |= both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC");
+                if connected && on_floor(&a.station) && on_floor(&b.station) {
+                    break;
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            assert!(connected, "connected at -6 dB");
+            assert!(a.station.session_floor_negotiated());
+            assert!(
+                on_floor(&a.station) && on_floor(&b.station),
+                "both stations report the floor: a={:?} b={:?}",
+                a.station.phy_mode(),
+                b.station.phy_mode()
+            );
+            #[cfg(feature = "websocket")]
+            let pushes_on_floor = {
+                use coppa_host::websocket::PhyMode;
+                for station in [&mut a.station, &mut b.station] {
+                    station.publish_ws_snapshot().await;
+                    assert_eq!(
+                        snapshot_phy_mode(station).await,
+                        serde_json::json!({"tx": "floor", "rx": "floor"})
+                    );
+                    assert_eq!(
+                        phy_mode_pushes(station).last(),
+                        Some(&(Some(PhyMode::Floor), Some(PhyMode::Floor))),
+                        "a push follows the change to the floor"
+                    );
+                    let pushes = phy_mode_pushes(station);
+                    assert!(
+                        pushes.windows(2).all(|w| w[0] != w[1]),
+                        "no push repeats an unchanged pair: {pushes:?}"
+                    );
+                }
+                let count = phy_mode_pushes(&a.station).len();
+                a.station.publish_ws_snapshot().await;
+                assert_eq!(
+                    phy_mode_pushes(&a.station).len(),
+                    count,
+                    "no push when nothing changed"
+                );
+                count
+            };
+
+            // A rejected manual selection keeps the prior mode.
+            let before = a.station.phy_mode();
+            a.station
+                .handle_host_event(HostEvent::SetSpeedLevel {
+                    client_id: 1,
+                    level: Some(99),
+                })
+                .await;
+            a.station.publish_ws_snapshot().await;
+            assert_eq!(
+                a.station.phy_mode(),
+                before,
+                "a rejected selection changes nothing"
+            );
+            assert!(a.station.floor_enabled(), "the floor stays enabled");
+            #[cfg(feature = "websocket")]
+            assert_eq!(phy_mode_pushes(&a.station).len(), pushes_on_floor);
+
+            // Open the air, then select level 2 on A: the next session frame
+            // A keys is OFDM level 2, and B reports it as validated RX.
+            for (station, direction) in [(&mut a, 0u8), (&mut b, 1u8)] {
+                station.channel = PersistentChannel::new(
+                    SAMPLE_RATE,
+                    None,
+                    Some(SnrProfile::constant(60.0)),
+                    reference_power,
+                    SEED_BASE,
+                    direction,
+                );
+            }
+            a.station
+                .handle_host_event(HostEvent::SetSpeedLevel {
+                    client_id: 1,
+                    level: Some(2),
+                })
+                .await;
+            assert!(!a.station.floor_enabled());
+            let ofdm2 = Some(LinkPhyMode::Ofdm { level: 2 });
+            let payload: Vec<u8> = (0..10).collect();
+            // Every waveform A keys from the selection on, as the sequence of
+            // changes to the last keyed session waveform. A frame queued
+            // behind one already on air adds no PTT edge, so edges miss it.
+            let mut a_modes = vec![a.station.phy_tx];
+            a.station
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: payload.clone(),
+                })
+                .await;
+            let mut delivered = Vec::new();
+            let resumed = tokio::time::Instant::now();
+            let note_mode = |modes: &mut Vec<Option<LinkPhyMode>>, station: &EventLoop| {
+                if modes.last() != Some(&station.phy_tx) {
+                    modes.push(station.phy_tx);
+                }
+            };
+            note_mode(&mut a_modes, &a.station);
+            while resumed.elapsed() < Duration::from_secs(120) {
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, false).await;
+                note_mode(&mut a_modes, &a.station);
+                drain_host_data(&mut b_host, &mut delivered);
+                if delivered.len() >= payload.len()
+                    && a.station.phy_mode().0 == ofdm2
+                    && b.station.phy_mode().1 == ofdm2
+                {
+                    break;
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(delivered, payload, "the write arrived once, in order");
+            assert!(
+                a_modes.len() >= 2 && a_modes[1..].iter().all(|&m| m == ofdm2),
+                "after the selection A keys only OFDM level 2: {a_modes:?}"
+            );
+            assert_eq!(a.station.phy_mode().0, ofdm2, "A reports OFDM level 2 TX");
+            assert_eq!(b.station.phy_mode().1, ofdm2, "B reports OFDM level 2 RX");
+            #[cfg(feature = "websocket")]
+            {
+                a.station.publish_ws_snapshot().await;
+                b.station.publish_ws_snapshot().await;
+                assert_eq!(snapshot_phy_mode(&a.station).await["tx"], "ofdm:2");
+                assert_eq!(snapshot_phy_mode(&b.station).await["rx"], "ofdm:2");
+                assert!(phy_mode_pushes(&a.station).len() > pushes_on_floor);
+            }
+
+            // Host DISCONNECT on A, received DISCONNECT on B: both clear.
+            a.station
+                .handle_host_event(HostEvent::DisconnectRequest { client_id: 1 })
+                .await;
+            let closing = tokio::time::Instant::now();
+            while closing.elapsed() < Duration::from_secs(60) {
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, false).await;
+                if a.station.live_session_id().is_none()
+                    && b.station.live_session_id().is_none()
+                    && !a.station.is_transmitting
+                    && !b.station.is_transmitting
+                {
+                    break;
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            for station in [&a.station, &b.station] {
+                assert!(station.live_session_id().is_none(), "the session ended");
+                assert_eq!(station.phy_mode(), (None, None), "the pair clears");
+            }
+            #[cfg(feature = "websocket")]
+            for station in [&mut a.station, &mut b.station] {
+                station.publish_ws_snapshot().await;
+                assert_eq!(
+                    snapshot_phy_mode(station).await,
+                    serde_json::json!({"tx": null, "rx": null})
+                );
+                assert_eq!(phy_mode_pushes(station).last(), Some(&(None, None)));
+            }
+        }
+
+        /// COP-210: what one simultaneous-call run saw.
+        struct CrossedRun {
+            a_lines: Vec<String>,
+            b_lines: Vec<String>,
+            b_data: Vec<u8>,
+            floor_keyed: bool,
+            connected_at: Duration,
+        }
+
+        /// COP-210: VK3ABC and W1AW dial each other in the same tick; once
+        /// both ends confirm, VK3ABC writes `payload`. Stops when W1AW has
+        /// received `payload.len()` bytes or `limit` of virtual time passes.
+        async fn crossed_run(
+            a: &mut FloorStation,
+            b: &mut FloorStation,
+            payload: &[u8],
+            limit: Duration,
+        ) -> CrossedRun {
+            let (a_tx, mut a_host) = mpsc::unbounded_channel();
+            a.station.set_response_tx(a_tx);
+            let (b_tx, mut b_host) = mpsc::unbounded_channel();
+            b.station.set_response_tx(b_tx);
+            let drain = |rx: &mut mpsc::UnboundedReceiver<HostResponse>,
+                         data: &mut Vec<u8>,
+                         lines: &mut Vec<String>| {
+                while let Ok(resp) = rx.try_recv() {
+                    match resp {
+                        HostResponse::DataOut { data: d, .. } => data.extend_from_slice(&d),
+                        HostResponse::StatusUpdate { status, .. } => lines.push(status),
+                    }
+                }
+            };
+            let (mut a_data, mut a_lines) = (Vec::new(), Vec::new());
+            let (mut b_data, mut b_lines) = (Vec::new(), Vec::new());
+            for (station, source, destination) in [
+                (&mut a.station, "VK3ABC", "W1AW"),
+                (&mut b.station, "W1AW", "VK3ABC"),
+            ] {
+                station
+                    .handle_host_event(HostEvent::ConnectRequest {
+                        client_id: 1,
+                        source: source.into(),
+                        destination: destination.into(),
+                    })
+                    .await;
+            }
+            let start = tokio::time::Instant::now();
+            let mut clock = PairClock::new(start);
+            let (mut tx_a, mut tx_b) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+            let mut floor_keyed = false;
+            let mut connected_at = None;
+            while start.elapsed() < limit && b_data.len() < payload.len() {
+                step_stations(a, b, &mut clock).await;
+                floor_keyed |= [&a.station, &b.station]
+                    .iter()
+                    .any(|s| s.phy_tx == Some(LinkPhyMode::Floor));
+                move_block(a, b, &mut tx_a, &mut tx_b, false);
+                drain(&mut a_host, &mut a_data, &mut a_lines);
+                drain(&mut b_host, &mut b_data, &mut b_lines);
+                if connected_at.is_none()
+                    && both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC")
+                {
+                    connected_at = Some(start.elapsed());
+                    a.station
+                        .handle_host_event(HostEvent::DataReceived {
+                            client_id: 1,
+                            data: payload.to_vec(),
+                        })
+                        .await;
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            println!(
+                "crossed run: connected at {connected_at:?}, {} bytes by {:?}; \
+                 a_lines={a_lines:?} b_lines={b_lines:?}",
+                b_data.len(),
+                start.elapsed()
+            );
+            assert!(
+                both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC"),
+                "both ends confirmed one session: a_lines={a_lines:?} b_lines={b_lines:?}"
+            );
+            assert_eq!(
+                (
+                    a.station.session_mgr.active_sessions().len(),
+                    b.station.session_mgr.active_sessions().len()
+                ),
+                (1, 1),
+                "one session each"
+            );
+            CrossedRun {
+                a_lines,
+                b_lines,
+                b_data,
+                floor_keyed,
+                connected_at: connected_at.expect("connected"),
+            }
+        }
+
+        /// COP-210 AC2 (ticket scenario 2, "both sides call at once"): two
+        /// Auto daemons with `LISTEN OFF` dial each other in the same tick on
+        /// floor-only air (every OFDM session frame is erased). W1AW sorts
+        /// after VK3ABC, so it staggers its repeats, hears VK3ABC's first
+        /// floor request, drops its own dial and answers. Each host sees one
+        /// `CONNECTED` for its own call and no `PENDING`; a 40-byte write
+        /// arrives exactly once. Also AC1's floor-only fallback proof.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_simultaneous_calls() {
+            let reference_power = floor_reference_power();
+            let mut a = FloorStation::with_snr("VK3ABC", SEED_BASE, 0, reference_power, 60.0);
+            let mut b = FloorStation::with_snr("W1AW", SEED_BASE, 1, reference_power, 60.0);
+            for station in [&mut a, &mut b] {
+                station.station.listening = false;
+                station.erase_ofdm = true;
+            }
+            let payload: Vec<u8> = (0..40).collect();
+            let run = crossed_run(&mut a, &mut b, &payload, Duration::from_secs(240)).await;
+            assert!(
+                run.floor_keyed,
+                "OFDM never arrives, so the floor carries the call"
+            );
+            for lines in [&run.a_lines, &run.b_lines] {
+                assert_eq!(
+                    lines.iter().filter(|l| l.starts_with("CONNECTED ")).count(),
+                    1,
+                    "{lines:?}"
+                );
+                assert!(!lines.iter().any(|l| l == "PENDING"), "{lines:?}");
+                assert!(!lines.iter().any(|l| l == "CANCELPENDING"), "{lines:?}");
+            }
+            assert!(
+                run.a_lines.iter().any(|l| l == "CONNECTED W1AW"),
+                "{:?}",
+                run.a_lines
+            );
+            assert!(
+                run.b_lines.iter().any(|l| l == "CONNECTED VK3ABC"),
+                "{:?}",
+                run.b_lines
+            );
+            assert_eq!(run.b_data, payload, "the write arrived once and in order");
+            assert!(
+                run.connected_at > Duration::from_secs(16),
+                "{:?}",
+                run.connected_at
+            );
+        }
+
+        /// COP-210 AC2, clean channel: the same crossed dial at 60 dB with
+        /// `LISTEN ON` connects on OFDM without any floor key-up, one
+        /// session and one `CONNECTED` per host, no `PENDING`, and a 40-byte
+        /// write arrives exactly once.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_simultaneous_calls_clean_channel() {
+            let reference_power = floor_reference_power();
+            let mut a = FloorStation::with_snr("VK3ABC", SEED_BASE, 0, reference_power, 60.0);
+            let mut b = FloorStation::with_snr("W1AW", SEED_BASE, 1, reference_power, 60.0);
+            let payload: Vec<u8> = (0..40).collect();
+            let run = crossed_run(&mut a, &mut b, &payload, Duration::from_secs(120)).await;
+            assert!(!run.floor_keyed, "a clean channel never keys the floor");
+            for lines in [&run.a_lines, &run.b_lines] {
+                assert_eq!(
+                    lines.iter().filter(|l| l.starts_with("CONNECTED ")).count(),
+                    1,
+                    "{lines:?}"
+                );
+                assert!(!lines.iter().any(|l| l == "PENDING"), "{lines:?}");
+            }
+            assert_eq!(run.b_data, payload, "the write arrived once and in order");
+            assert!(
+                run.connected_at < Duration::from_secs(16),
+                "{:?}",
+                run.connected_at
+            );
+        }
+
+        /// COP-210 AC3: handshake frames that repeat after establishment
+        /// leave one established session per station. The pair connects on a
+        /// clean channel and delivers 50 bytes; then the CONNECT_REQ,
+        /// CONNECT_ACK and CONNECT_CFM audio each station keyed during the
+        /// handshake is played into the peer's input ring again, and the
+        /// CONNECT_REQ and CONNECT_CFM are also played as floor audio (both
+        /// carry the `robust_floor` caps). Each station keeps its one
+        /// session, no host hears a second `CONNECTED`, the reported RX
+        /// waveform never moves for a replayed frame, and 50 more bytes
+        /// arrive. The 100 bytes arrive exactly once, in order.
+        #[tokio::test(start_paused = true)]
+        async fn floor_daemon_duplicate_handshake() {
+            let reference_power = floor_reference_power();
+            let mut a = FloorStation::with_snr("VK3ABC", SEED_BASE, 0, reference_power, 60.0);
+            let mut b = FloorStation::with_snr("W1AW", SEED_BASE, 1, reference_power, 60.0);
+            let (a_tx, mut a_host) = mpsc::unbounded_channel();
+            a.station.set_response_tx(a_tx);
+            let (b_tx, mut b_host) = mpsc::unbounded_channel();
+            b.station.set_response_tx(b_tx);
+            let connected_lines =
+                |lines: &[String]| lines.iter().filter(|l| l.starts_with("CONNECTED ")).count();
+            let drain = |rx: &mut mpsc::UnboundedReceiver<HostResponse>,
+                         data: &mut Vec<u8>,
+                         lines: &mut Vec<String>| {
+                while let Ok(resp) = rx.try_recv() {
+                    match resp {
+                        HostResponse::DataOut { data: d, .. } => data.extend_from_slice(&d),
+                        HostResponse::StatusUpdate { status, .. } => lines.push(status),
+                    }
+                }
+            };
+            let (mut a_data, mut a_lines) = (Vec::new(), Vec::new());
+            let (mut b_data, mut b_lines) = (Vec::new(), Vec::new());
+
+            dial(&mut a.station).await;
+            let req = a
+                .station
+                .pending_dial
+                .as_ref()
+                .expect("an Auto dial schedules repeats")
+                .request
+                .clone();
+            let start = tokio::time::Instant::now();
+            let mut clock = PairClock::new(start);
+            let (mut tx_a, mut tx_b) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+            // The handshake audio each station keyed, as played on air.
+            let (mut a_air, mut b_air) = (Vec::new(), Vec::new());
+            let mut cfm = None;
+            while start.elapsed() < Duration::from_secs(30) {
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, false).await;
+                a_air.extend_from_slice(&tx_a);
+                b_air.extend_from_slice(&tx_b);
+                if cfm.is_none() {
+                    cfm = a
+                        .station
+                        .session_mgr
+                        .active_sessions()
+                        .iter()
+                        .find_map(|&id| {
+                            a.station
+                                .session_mgr
+                                .get(id)?
+                                .last_cfm
+                                .as_ref()
+                                .map(|p| p.to_bytes())
+                        });
+                }
+                if both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC")
+                    && !a.station.is_transmitting
+                    && !b.station.is_transmitting
+                {
+                    break;
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC"),
+                "connected on a clean channel"
+            );
+            assert!(a.station.session_floor_negotiated(), "both advertise bit 6");
+            let cfm = cfm.expect("A cached its CONNECT_CFM");
+            let ids = (
+                a.station.session_mgr.active_sessions(),
+                b.station.session_mgr.active_sessions(),
+            );
+            assert_eq!((ids.0.len(), ids.1.len()), (1, 1), "one session each");
+
+            let payload: Vec<u8> = (0..100).collect();
+            let write = |half: &[u8]| HostEvent::DataReceived {
+                client_id: 1,
+                data: half.to_vec(),
+            };
+            a.station.handle_host_event(write(&payload[..50])).await;
+            let sent = tokio::time::Instant::now();
+            while sent.elapsed() < Duration::from_secs(60) && b_data.len() < 50 {
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, false).await;
+                drain(&mut a_host, &mut a_data, &mut a_lines);
+                drain(&mut b_host, &mut b_data, &mut b_lines);
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(b_data, payload[..50], "the first write arrived once");
+            // Let the ACK land, so the link is quiet before the replay.
+            for _ in 0..250 {
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, false).await;
+                drain(&mut a_host, &mut a_data, &mut a_lines);
+                drain(&mut b_host, &mut b_data, &mut b_lines);
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            let connected_before = (connected_lines(&a_lines), connected_lines(&b_lines));
+            let rx_before = (a.station.phy_mode().1, b.station.phy_mode().1);
+            assert!(rx_before.0.is_some() && rx_before.1.is_some());
+
+            // The replay: OFDM handshake audio as keyed, then floor audio of
+            // the CONNECT_REQ and CONNECT_CFM, into each peer's input ring.
+            let mut to_b = a_air;
+            to_b.extend(
+                a.station
+                    .encode_session_mode(&req, LinkPhyMode::Floor)
+                    .expect("floor REQ"),
+            );
+            to_b.extend(vec![0.0f32; 48_000]);
+            to_b.extend(
+                a.station
+                    .encode_session_mode(&cfm, LinkPhyMode::Floor)
+                    .expect("floor CFM"),
+            );
+            to_b.extend(vec![0.0f32; 96_000]);
+            let mut to_a = b_air;
+            to_a.extend(vec![0.0f32; 96_000]);
+            let replay_blocks = to_b.len().max(to_a.len()).div_ceil(BLOCK);
+            // Proof the replayed floor audio was decoded and dispatched: the
+            // controller input `phy_rx` reads the floor while it is handled.
+            let mut b_dispatched_floor = false;
+            to_b.resize(replay_blocks * BLOCK, 0.0);
+            to_a.resize(replay_blocks * BLOCK, 0.0);
+            for i in 0..replay_blocks {
+                step_stations(&mut a, &mut b, &mut clock).await;
+                // Whatever the stations key during the replay still plays,
+                // through the channel, with the replayed block added on air.
+                fn play(
+                    from: &mut FloorStation,
+                    to: &mut FloorStation,
+                    tx: &mut [f32],
+                    replay: &[f32],
+                ) {
+                    let n = from.air_out.read(tx);
+                    tx[n..].fill(0.0);
+                    let mut heard = from.channel.process(tx);
+                    for (h, r) in heard.iter_mut().zip(replay) {
+                        *h += r;
+                    }
+                    let mut written = 0;
+                    while written < heard.len() {
+                        written += to.air_in.write(&heard[written..]);
+                    }
+                }
+                let block = i * BLOCK..(i + 1) * BLOCK;
+                play(&mut a, &mut b, &mut tx_a, &to_b[block.clone()]);
+                play(&mut b, &mut a, &mut tx_b, &to_a[block]);
+                b_dispatched_floor |= b.station.phy_rx == Some(LinkPhyMode::Floor);
+                drain(&mut a_host, &mut a_data, &mut a_lines);
+                drain(&mut b_host, &mut b_data, &mut b_lines);
+                assert_eq!(
+                    (a.station.phy_mode().1, b.station.phy_mode().1),
+                    rx_before,
+                    "a replayed handshake frame never moves the reported RX waveform"
+                );
+                for station in [&a.station, &b.station] {
+                    assert_eq!(
+                        station.session_mgr.active_sessions().len(),
+                        1,
+                        "one session per station during the replay"
+                    );
+                }
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                (
+                    a.station.session_mgr.active_sessions(),
+                    b.station.session_mgr.active_sessions()
+                ),
+                ids,
+                "the replay replaced no session"
+            );
+            assert!(b_dispatched_floor, "B decoded the replayed floor frames");
+            assert!(
+                both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC"),
+                "both sessions stay established"
+            );
+            assert_eq!(
+                (connected_lines(&a_lines), connected_lines(&b_lines)),
+                connected_before,
+                "no host hears a second CONNECTED: a={a_lines:?} b={b_lines:?}"
+            );
+
+            a.station.handle_host_event(write(&payload[50..])).await;
+            let sent = tokio::time::Instant::now();
+            while sent.elapsed() < Duration::from_secs(60) && b_data.len() < payload.len() {
+                step_pair(&mut a, &mut b, &mut clock, &mut tx_a, &mut tx_b, false).await;
+                drain(&mut a_host, &mut a_data, &mut a_lines);
+                drain(&mut b_host, &mut b_data, &mut b_lines);
+                tokio::time::advance(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(b_data, payload, "100 bytes arrived exactly once, in order");
+            assert!(a_data.is_empty(), "nothing flowed back to A's host");
+            for station in [&a.station, &b.station] {
+                assert_eq!(station.session_mgr.active_sessions().len(), 1);
+            }
+        }
     }
 }

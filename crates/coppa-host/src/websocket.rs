@@ -104,6 +104,84 @@ pub enum SpeedLevelMode {
     Manual,
 }
 
+/// COP-210: the waveform a session frame used, for `status.phy_mode` and the
+/// `phy_mode` push. Serialized as `"floor"` or `"ofdm:<level>"` (level 1-9).
+/// Not the 4-bit PHY header field of the same name (SPEC §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PhyMode {
+    /// The COP-190 low-rate floor waveform.
+    Floor,
+    /// OFDM at the given speed level.
+    Ofdm { level: u8 },
+}
+
+impl PhyMode {
+    /// The wire string: `"floor"` or `"ofdm:<level>"`.
+    pub fn as_wire(&self) -> String {
+        match self {
+            PhyMode::Floor => "floor".to_owned(),
+            PhyMode::Ofdm { level } => format!("ofdm:{level}"),
+        }
+    }
+
+    /// Parse the wire string. Accepts `"floor"` and `"ofdm:1"` to `"ofdm:9"`.
+    pub fn from_wire(text: &str) -> Option<Self> {
+        if text == "floor" {
+            return Some(PhyMode::Floor);
+        }
+        let digits = text.strip_prefix("ofdm:")?;
+        if digits.len() != 1 {
+            return None;
+        }
+        let level: u8 = digits.parse().ok()?;
+        (1..=9).contains(&level).then_some(PhyMode::Ofdm { level })
+    }
+}
+
+impl Serialize for PhyMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_wire())
+    }
+}
+
+impl<'de> Deserialize<'de> for PhyMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        PhyMode::from_wire(&text).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "invalid phy_mode {text:?}: expected \"floor\" or \"ofdm:1\" to \"ofdm:9\""
+            ))
+        })
+    }
+}
+
+impl JsonSchema for PhyMode {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "PhyMode".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "COP-210: the waveform a session frame used: \"floor\" or \"ofdm:<level>\".",
+            "type": "string",
+            "pattern": "^(floor|ofdm:[1-9])$"
+        })
+    }
+}
+
+/// COP-210: the waveform pair `status.phy_mode` reports. `tx` is the waveform
+/// of the last session frame keyed; `rx` is the waveform of the last session
+/// frame a session handler accepted. Both are `null` before session activity
+/// and after the session ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct PhyModeReport {
+    #[serde(default)]
+    pub tx: Option<PhyMode>,
+    #[serde(default)]
+    pub rx: Option<PhyMode>,
+}
+
 /// COP-83: the session ARQ link's state, for `status.link`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct LinkStats {
@@ -224,6 +302,11 @@ pub enum WsServerMessage {
         /// `false` while a session without it is up, absent with no session.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chat: Option<bool>,
+        /// COP-210: the waveform of the last session frame keyed (`tx`) and
+        /// accepted (`rx`). Present once the daemon has published; both
+        /// members are `null` with no session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phy_mode: Option<PhyModeReport>,
     },
     /// Data received from remote station.
     #[serde(rename = "data")]
@@ -288,6 +371,13 @@ pub enum WsServerMessage {
     /// whenever either changes. Reliable.
     #[serde(rename = "speed_level")]
     SpeedLevel { level: u8, mode: SpeedLevelMode },
+    /// COP-210: the session waveform pair, sent whenever `tx` or `rx`
+    /// changes, and with both `null` when the session ends. Reliable.
+    #[serde(rename = "phy_mode")]
+    PhyMode {
+        tx: Option<PhyMode>,
+        rx: Option<PhyMode>,
+    },
     #[serde(rename = "log")]
     Log {
         level: String,
@@ -665,6 +755,9 @@ pub struct WsStatus {
     pub link: Option<LinkStats>,
     /// COP-121: whether the session negotiated chat; `None` with no session.
     pub chat: Option<bool>,
+    /// COP-210: the session waveform pair; `Some` once the daemon has
+    /// published.
+    pub phy_mode: Option<PhyModeReport>,
 }
 
 impl WsStatus {
@@ -701,6 +794,7 @@ impl WsStatus {
             heard: self.heard,
             link: self.link.map(Box::new),
             chat: self.chat,
+            phy_mode: self.phy_mode,
         }
     }
 
@@ -2067,6 +2161,9 @@ mod tests {
             r#"{"type":"chat_receipt","message_id":8,"state":"failed","reason":"The session ended before the peer acknowledged the message","timestamp_ms":10}"#,
             r#"{"type":"chat_history","id":4,"messages":[{"message_id":7,"direction":"out","text":"Good morning","remote_call":"W1AW","timestamp_ms":7,"state":"delivered"}]}"#,
             r#"{"type":"status","id":3,"connected":true,"remote_call":"W1AW","cp_desync_episodes":0,"chat":true}"#,
+            r#"{"type":"phy_mode","tx":"floor","rx":"ofdm:2"}"#,
+            r#"{"type":"phy_mode","tx":null,"rx":null}"#,
+            r#"{"type":"status","id":4,"connected":true,"remote_call":"W1AW","cp_desync_episodes":0,"speed_level":2,"speed_level_mode":"auto","phy_mode":{"tx":"floor","rx":null}}"#,
         ]
     }
 
@@ -3928,6 +4025,82 @@ mod cop83_tests {
         assert_eq!(
             json,
             r#"{"type":"status","id":1,"connected":false,"cp_desync_episodes":0}"#
+        );
+    }
+
+    /// COP-210: `phy_mode` values are the strings `"floor"` and
+    /// `"ofdm:<level>"`, level 1-9; anything else is refused.
+    #[test]
+    fn phy_mode_values_serialize_as_strings() {
+        assert_eq!(
+            serde_json::to_string(&PhyMode::Floor).unwrap(),
+            r#""floor""#
+        );
+        assert_eq!(
+            serde_json::to_string(&PhyMode::Ofdm { level: 2 }).unwrap(),
+            r#""ofdm:2""#
+        );
+        assert_eq!(
+            serde_json::from_str::<PhyMode>(r#""floor""#).unwrap(),
+            PhyMode::Floor
+        );
+        assert_eq!(
+            serde_json::from_str::<PhyMode>(r#""ofdm:2""#).unwrap(),
+            PhyMode::Ofdm { level: 2 }
+        );
+        for bad in [r#""ofdm:0""#, r#""ofdm:10""#, r#""bogus""#, r#""ofdm:""#] {
+            assert!(serde_json::from_str::<PhyMode>(bad).is_err(), "{bad}");
+        }
+        let report = PhyModeReport {
+            tx: Some(PhyMode::Floor),
+            rx: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&report).unwrap(),
+            r#"{"tx":"floor","rx":null}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<PhyModeReport>("{}").unwrap(),
+            PhyModeReport::default()
+        );
+    }
+
+    /// COP-210: a client that predates `phy_mode` still reads the new status.
+    #[test]
+    fn legacy_status_reader_ignores_phy_mode() {
+        #[derive(Deserialize)]
+        struct LegacyStatus {
+            connected: bool,
+        }
+        let snapshot = WsStatus {
+            connected: true,
+            phy_mode: Some(PhyModeReport {
+                tx: Some(PhyMode::Floor),
+                rx: Some(PhyMode::Ofdm { level: 1 }),
+            }),
+            ..WsStatus::default()
+        };
+        let json = serde_json::to_string(&snapshot.reply(Some(1))).unwrap();
+        assert!(
+            json.contains(r#""phy_mode":{"tx":"floor","rx":"ofdm:1"}"#),
+            "{json}"
+        );
+        let legacy: LegacyStatus = serde_json::from_str(&json).unwrap();
+        assert!(legacy.connected);
+    }
+
+    #[tokio::test]
+    async fn phy_mode_travels_on_the_reliable_queue() {
+        let message = WsServerMessage::PhyMode {
+            tx: Some(PhyMode::Floor),
+            rx: None,
+        };
+        assert!(!is_lossy_telemetry(&message));
+        let (mut ws, _events, push) = serve(WsStatus::default()).await;
+        push.push(&message);
+        assert_eq!(
+            next_json(&mut ws).await,
+            serde_json::json!({"type":"phy_mode","tx":"floor","rx":null})
         );
     }
 

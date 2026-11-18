@@ -13,13 +13,16 @@
 //! it). `COPPA_CHROME` names the browser binary when it is not on `PATH`.
 
 #![cfg(feature = "websocket")]
+// COP-142: the std-clock ban in clippy.toml targets event_loop only.
+#![allow(clippy::disallowed_methods)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use coppa_daemon::web::INDEX_HTML;
 use futures_util::{SinkExt, StreamExt};
@@ -35,10 +38,15 @@ const HEIGHT: f64 = 844.0;
 /// Apple's guidance, and the ticket's figure).
 const MIN_TARGET: f64 = 44.0;
 
-/// How long the browser may take to print its DevTools URL.
-const STARTUP: Duration = Duration::from_secs(30);
-/// How long any one DevTools command or awaited event may take.
-const STEP: Duration = Duration::from_secs(10);
+/// How long the browser may take to print its DevTools URL. A cold start
+/// on a loaded CI runner took longer than 30 s (COP-209). A browser that
+/// exits before it listens is reported at once, not at this deadline.
+const STARTUP: Duration = Duration::from_secs(120);
+/// How long any one DevTools command or awaited event may take. The load
+/// that slows the browser's start slows its first replies too (COP-209).
+const STEP: Duration = Duration::from_secs(60);
+/// How often the startup wait checks whether the browser has exited.
+const POLL: Duration = Duration::from_millis(100);
 /// How long the browser's helper processes may take to exit after the kill.
 const SHUTDOWN: Duration = Duration::from_secs(10);
 
@@ -142,71 +150,12 @@ const TAP_RESULT: &str = "Speed level 3: refused: not connected";
 
 #[tokio::test]
 async fn every_dashboard_control_is_a_44px_touch_target_at_390px() {
-    let Some(binary) = find_browser() else {
-        let required = std::env::var("COPPA_REQUIRE_BROWSER").is_ok_and(|value| value == "1");
-        assert!(
-            !required,
-            "COPPA_REQUIRE_BROWSER=1 but no browser was found: set COPPA_CHROME to a Chrome or \
-             Chromium binary, or put one of {BROWSERS:?} on PATH"
-        );
-        eprintln!(
-            "skipping dashboard_touch: no Chrome or Chromium found (set COPPA_CHROME to a browser \
-             binary, or COPPA_REQUIRE_BROWSER=1 to fail instead of skipping)"
-        );
+    let Some(binary) = browser_or_skip() else {
         return;
     };
 
-    let url = serve_page();
-    let (browser, devtools_url) = Browser::launch(&binary);
-    let mut cdp = Cdp::connect(&devtools_url).await;
-
-    let target = cdp
-        .call(None, "Target.createTarget", json!({ "url": "about:blank" }))
-        .await;
-    let target_id = target["targetId"]
-        .as_str()
-        .expect("Target.createTarget returns a targetId")
-        .to_string();
-    let attached = cdp
-        .call(
-            None,
-            "Target.attachToTarget",
-            json!({ "targetId": target_id, "flatten": true }),
-        )
-        .await;
-    let session = attached["sessionId"]
-        .as_str()
-        .expect("Target.attachToTarget returns a sessionId")
-        .to_string();
+    let (browser, mut cdp, session) = open_dashboard(&binary).await;
     let session = Some(session.as_str());
-
-    cdp.call(
-        session,
-        "Emulation.setDeviceMetricsOverride",
-        json!({ "width": WIDTH, "height": HEIGHT, "deviceScaleFactor": 3, "mobile": true }),
-    )
-    .await;
-    cdp.call(
-        session,
-        "Emulation.setTouchEmulationEnabled",
-        json!({ "enabled": true, "maxTouchPoints": 5 }),
-    )
-    .await;
-    cdp.call(session, "Page.enable", json!({})).await;
-    cdp.events.clear();
-    let navigated = cdp
-        .call(session, "Page.navigate", json!({ "url": url }))
-        .await;
-    assert!(
-        navigated.get("errorText").is_none(),
-        "Page.navigate to {url} failed: {navigated}"
-    );
-    cdp.wait_event(session, "Page.loadEventFired").await;
-    let ready = format!(
-        "document.readyState === \"complete\" && location.href === {} && typeof handle === \"function\"",
-        json!(url)
-    );
-    cdp.wait_until(session, &ready).await;
 
     let measured = cdp.evaluate(session, MEASURE).await;
     let states = measured
@@ -235,6 +184,138 @@ async fn every_dashboard_control_is_a_44px_touch_target_at_390px() {
         !profile.exists(),
         "closing the browser left its profile directory {} behind",
         profile.display()
+    );
+}
+
+/// Launches the browser, opens the served page in a 390 px mobile tab with
+/// touch emulation, and waits until the page's `handle()` exists. Returns the
+/// browser, the DevTools connection and the tab's session id.
+async fn open_dashboard(binary: &Path) -> (Browser, Cdp, String) {
+    let url = serve_page();
+    let (browser, devtools_url) = Browser::launch(binary);
+    let mut cdp = Cdp::connect(&devtools_url).await;
+
+    let target = cdp
+        .call(None, "Target.createTarget", json!({ "url": "about:blank" }))
+        .await;
+    let target_id = target["targetId"]
+        .as_str()
+        .expect("Target.createTarget returns a targetId")
+        .to_string();
+    let attached = cdp
+        .call(
+            None,
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+        )
+        .await;
+    let session_id = attached["sessionId"]
+        .as_str()
+        .expect("Target.attachToTarget returns a sessionId")
+        .to_string();
+    let session = Some(session_id.as_str());
+
+    cdp.call(
+        session,
+        "Emulation.setDeviceMetricsOverride",
+        json!({ "width": WIDTH, "height": HEIGHT, "deviceScaleFactor": 3, "mobile": true }),
+    )
+    .await;
+    cdp.call(
+        session,
+        "Emulation.setTouchEmulationEnabled",
+        json!({ "enabled": true, "maxTouchPoints": 5 }),
+    )
+    .await;
+    cdp.call(session, "Page.enable", json!({})).await;
+    cdp.events.clear();
+    let navigated = cdp
+        .call(session, "Page.navigate", json!({ "url": url }))
+        .await;
+    assert!(
+        navigated.get("errorText").is_none(),
+        "Page.navigate to {url} failed: {navigated}"
+    );
+    cdp.wait_event(session, "Page.loadEventFired").await;
+    let ready = format!(
+        "document.readyState === \"complete\" && location.href === {} && typeof handle === \"function\"",
+        json!(url)
+    );
+    cdp.wait_until(session, &ready).await;
+    (browser, cdp, session_id)
+}
+
+/// The browser to drive, or `None` (after saying why) when none is found and
+/// `COPPA_REQUIRE_BROWSER=1` is not set.
+fn browser_or_skip() -> Option<PathBuf> {
+    let binary = find_browser();
+    if binary.is_none() {
+        let required = std::env::var("COPPA_REQUIRE_BROWSER").is_ok_and(|value| value == "1");
+        assert!(
+            !required,
+            "COPPA_REQUIRE_BROWSER=1 but no browser was found: set COPPA_CHROME to a Chrome or \
+             Chromium binary, or put one of {BROWSERS:?} on PATH"
+        );
+        eprintln!(
+            "skipping dashboard_touch: no Chrome or Chromium found (set COPPA_CHROME to a browser \
+             binary, or COPPA_REQUIRE_BROWSER=1 to fail instead of skipping)"
+        );
+    }
+    binary
+}
+
+/// COP-210: plays `hello`, a `status` with `phy_mode`, then `speed_level` and
+/// `phy_mode` pushes through the page's `handle()`, a socket loss
+/// (`resetLive()`), and a `status` from a daemon without `phy_mode`, and
+/// returns the Speed level card's two lines after each step.
+const WAVEFORM_STEPS: &str = r##"(() => {
+  const lines = () => [
+    document.getElementById("tx-level").textContent,
+    document.getElementById("rx-level").textContent,
+  ];
+  const levels = [1, 2, 3, 4, 5, 6, 7, 8];
+  const steps = [];
+  handle({ type: "hello", version: 1 });
+  handle({ type: "status", speed_levels: levels, speed_level: 2, speed_level_mode: "auto",
+           level: 2, phy_mode: { tx: "floor", rx: "floor" } });
+  steps.push(lines());
+  handle({ type: "speed_level", level: 2, mode: "manual" });
+  steps.push(lines());
+  handle({ type: "phy_mode", tx: "ofdm:2", rx: "ofdm:2" });
+  steps.push(lines());
+  handle({ type: "speed_level", level: 2, mode: "auto" });
+  handle({ type: "phy_mode", tx: null, rx: null });
+  steps.push(lines());
+  handle({ type: "phy_mode", tx: "floor", rx: null });
+  steps.push(lines());
+  resetLive();
+  handle({ type: "status", speed_levels: levels, speed_level: 3, speed_level_mode: "auto", level: 3 });
+  steps.push(lines());
+  return steps;
+})()"##;
+
+/// COP-210 AC8: the Speed level card names the floor while the session is
+/// on it, shows the pinned level after a numbered selection, and falls back
+/// to the integer text when `phy_mode` is null or absent.
+#[tokio::test]
+async fn speed_card_shows_the_active_waveform() {
+    let Some(binary) = browser_or_skip() else {
+        return;
+    };
+    let (browser, mut cdp, session) = open_dashboard(&binary).await;
+    let steps = cdp.evaluate(Some(session.as_str()), WAVEFORM_STEPS).await;
+    drop(browser);
+    assert_eq!(
+        steps,
+        json!([
+            ["TX floor · auto", "RX floor (last decoded frame)"],
+            ["TX 2 · manual", "RX floor (last decoded frame)"],
+            ["TX 2 · manual", "RX 2 (last decoded frame)"],
+            ["TX 2 · auto", "RX 2 (last decoded frame)"],
+            ["TX floor · auto", "RX 2 (last decoded frame)"],
+            ["TX 3 · auto", "RX 3 (last decoded frame)"],
+        ]),
+        "the Speed level card's TX and RX lines after each step"
     );
 }
 
@@ -422,22 +503,38 @@ struct Browser {
     stderr_closed: mpsc::Receiver<()>,
 }
 
+/// Numbers each launch, so tests running in parallel in one process never
+/// share, or remove, each other's profile directory.
+static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+
 impl Browser {
     /// Starts `binary` and returns it with its browser-level DevTools URL.
+    /// Panics if the browser exits first, or prints no URL within `STARTUP`.
     fn launch(binary: &Path) -> (Self, String) {
-        let profile =
-            std::env::temp_dir().join(format!("coppa-dashboard-touch-{}", std::process::id()));
+        Self::start(Command::new(binary), STARTUP).unwrap_or_else(|message| panic!("{message}"))
+    }
+
+    /// Runs `command` with the headless browser flags and waits up to
+    /// `startup` for its DevTools URL. Fails at once if the process exits
+    /// first, and with the stderr it wrote either way.
+    fn start(mut command: Command, startup: Duration) -> Result<(Self, String), String> {
+        let name = Path::new(command.get_program()).display().to_string();
+        let launch = LAUNCHES.fetch_add(1, Ordering::Relaxed);
+        let profile = std::env::temp_dir().join(format!(
+            "coppa-dashboard-touch-{}-{launch}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&profile);
         // `create_dir`, not `create_dir_all`: a path that survived the
         // removal (another user's directory or symlink in a shared temp
         // dir) fails here instead of becoming the browser's profile.
-        std::fs::create_dir(&profile).unwrap_or_else(|error| {
-            panic!(
+        std::fs::create_dir(&profile).map_err(|error| {
+            format!(
                 "create the browser profile directory {}: {error}",
                 profile.display()
             )
-        });
-        let mut child = Command::new(binary)
+        })?;
+        let spawned = command
             .args([
                 "--headless=new",
                 "--no-sandbox",
@@ -449,24 +546,33 @@ impl Browser {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|error| panic!("start {}: {error}", binary.display()));
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&profile);
+                return Err(format!("start {name}: {error}"));
+            }
+        };
         let stderr = child.stderr.take().expect("the browser's stderr is piped");
         let (stderr_open, stderr_closed) = mpsc::channel::<()>();
-        let browser = Self {
+        let mut browser = Self {
             child,
             profile,
             stderr_closed,
         };
 
         // Read stderr on a thread so the wait is bounded, and keep draining
-        // it afterwards so a full pipe never stalls the browser.
-        let (sender, receiver) = mpsc::channel();
+        // it afterwards so a full pipe never stalls the browser. The thread
+        // sends the URL, or `None` at EOF without one, and keeps every line
+        // before the URL for the failure message.
+        let before = Arc::new(Mutex::new(Vec::new()));
+        let lines = Arc::clone(&before);
+        let (sender, receiver) = mpsc::channel::<Option<String>>();
         std::thread::spawn(move || {
             // Dropped when this thread ends, at EOF: see `stderr_closed`.
             let _stderr_open = stderr_open;
             let mut sent = false;
-            let mut before = Vec::new();
             let mut reader = BufReader::new(stderr);
             for line in reader.by_ref().lines() {
                 let Ok(line) = line else { break };
@@ -475,30 +581,46 @@ impl Browser {
                 }
                 match line.strip_prefix("DevTools listening on ") {
                     Some(url) => {
-                        let _ = sender.send(Ok(url.trim().to_string()));
+                        let _ = sender.send(Some(url.trim().to_string()));
                         sent = true;
                     }
-                    None => before.push(line),
+                    None => lines.lock().expect("the stderr lines").push(line),
                 }
             }
             if !sent {
-                let _ = sender.send(Err(before.join("\n")));
+                let _ = sender.send(None);
             }
             // A line that is not UTF-8 ends the loop early; read on to EOF.
             let _ = std::io::copy(&mut reader, &mut std::io::sink());
         });
-        let url = match receiver.recv_timeout(STARTUP) {
-            Ok(Ok(url)) => url,
-            Ok(Err(output)) => panic!(
-                "{} exited before DevTools listened:\n{output}",
-                binary.display()
-            ),
-            Err(_) => panic!(
-                "{} printed no DevTools URL within {STARTUP:?}",
-                binary.display()
-            ),
+
+        let deadline = Instant::now() + startup;
+        let failure = loop {
+            match receiver.recv_timeout(POLL) {
+                Ok(Some(url)) => return Ok((browser, url)),
+                Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break "exited before DevTools listened".to_string()
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            // The stderr pipe closes only once every helper process has
+            // exited too, so poll the browser process itself.
+            let exited = browser
+                .child
+                .try_wait()
+                .unwrap_or_else(|error| panic!("poll {name}: {error}"));
+            if let Some(status) = exited {
+                break format!("exited with {status} before DevTools listened");
+            }
+            if Instant::now() >= deadline {
+                break format!("printed no DevTools URL within {startup:?}");
+            }
         };
-        (browser, url)
+        // `Drop` kills the browser and waits for its stderr to close, so the
+        // message below carries every line it wrote.
+        drop(browser);
+        let output = before.lock().expect("the stderr lines").join("\n");
+        Err(format!("{name} {failure}; its stderr:\n{output}"))
     }
 }
 
@@ -633,5 +755,97 @@ impl Cdp {
                 return serde_json::from_str(text).expect("DevTools sends JSON");
             }
         }
+    }
+}
+
+/// The startup wait against fake browsers: `/bin/sh` scripts that print a
+/// DevTools URL late, exit early, or never listen, so each outcome is
+/// proven in seconds without a real browser.
+#[cfg(unix)]
+mod startup {
+    use super::*;
+
+    /// A fake browser: `/bin/sh` running `script`, with the browser flags as
+    /// `$@`. `sh -c` writes no script file, so a test thread forking at the
+    /// same moment can never make it fail with `ETXTBSY`.
+    fn fake(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script, "fake-browser"]);
+        command
+    }
+
+    #[test]
+    fn a_browser_that_listens_late_is_waited_for() {
+        let url = "ws://127.0.0.1:9/devtools/browser/fake";
+        let script = format!("sleep 2; echo 'DevTools listening on {url}' >&2; exec sleep 60");
+        let started = Instant::now();
+        let (browser, devtools_url) = Browser::start(fake(&script), Duration::from_secs(20))
+            .unwrap_or_else(|message| panic!("a browser that listens after 2 s: {message}"));
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "returned after {:?}, before the fake printed its URL",
+            started.elapsed()
+        );
+        assert_eq!(devtools_url, url);
+        let profile = browser.profile.clone();
+        assert!(
+            profile.is_dir(),
+            "the profile {} exists while the browser runs",
+            profile.display()
+        );
+        drop(browser);
+        assert!(
+            !profile.exists(),
+            "closing the browser left its profile directory {} behind",
+            profile.display()
+        );
+    }
+
+    #[test]
+    fn a_browser_that_exits_is_reported_at_once_while_a_helper_holds_stderr() {
+        // The background `sleep` keeps stderr open after the main process
+        // exits, as a Chromium helper process does.
+        let script = "echo 'fake: giving up' >&2; sleep 4 & exit 7";
+        let budget = Duration::from_secs(30);
+        let started = Instant::now();
+        let Err(message) = Browser::start(fake(script), budget) else {
+            panic!("a browser that exits 7 was reported as listening");
+        };
+        assert!(
+            started.elapsed() < budget,
+            "an exit took {:?} to report, the whole {budget:?} budget: {message}",
+            started.elapsed()
+        );
+        assert!(
+            message.contains("exited with exit status: 7"),
+            "the message names the exit status: {message}"
+        );
+        assert!(
+            message.contains("fake: giving up"),
+            "the message carries the browser's stderr: {message}"
+        );
+    }
+
+    #[test]
+    fn a_browser_that_never_listens_fails_at_the_deadline() {
+        let script = "echo 'fake: still starting' >&2; exec sleep 60";
+        let budget = Duration::from_secs(2);
+        let started = Instant::now();
+        let Err(message) = Browser::start(fake(script), budget) else {
+            panic!("a browser that never listens was reported as listening");
+        };
+        assert!(
+            started.elapsed() >= budget,
+            "failed after {:?}, before the {budget:?} deadline: {message}",
+            started.elapsed()
+        );
+        assert!(
+            message.contains("printed no DevTools URL within 2s"),
+            "the message names the deadline: {message}"
+        );
+        assert!(
+            message.contains("fake: still starting"),
+            "the message carries the browser's stderr: {message}"
+        );
     }
 }

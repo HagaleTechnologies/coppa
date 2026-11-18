@@ -70,6 +70,33 @@ receiver in `coppa-protocol` (`modem/floor.rs`). The frozen parameters:
   starts on OFDM and falls back after two unanswered windows. Five newly
   acknowledged floor exchanges allow one sequence-bound OFDM level-1 probe.
   A failed probe retries the bounded segment on the floor.
-  The daemon controller and the −6 dB connection probability bar remain open.
+- COP-202 amendment: coppad reuses the same `FloorController` and the shared
+  policy helpers in `coppa_protocol::floor_controller` for its handshake; it
+  does not embed Link or keep a second controller. The floor is enabled while
+  the speed level is automatic. An unset VARA `RETRIES` means three repeats in
+  Auto. Floor request windows add one level-1 station-ID frame. The daemon
+  keeps its 30 s inbound handshake timeout, replays no lost CONNECT_CFM and
+  does not stagger discovery. Both adapters meet the −6 dB connect bar in the
+  recorded direction (`results/cop-190/connect/`). A floor-negotiated daemon
+  session carries data on the floor: segments are floor-sized only while the
+  controller is on the floor or probing, so good-channel frames keep their
+  multi-codeword size, and (COP-211) two unanswered data windows return a
+  floor-negotiated session to the floor mid-session, as in Link; a segment
+  already in flight at OFDM
+  size or as an RS(12,6) outer block keeps the OFDM fade hold; see
+  `docs/LIMITATIONS.md`.
+- COP-210 amendment: coppad reports the active waveform to hosts. The
+  WebSocket `status` reply gains an optional `phy_mode` object (`tx`, `rx`,
+  each `null`, `"floor"` or `"ofdm:<level>"`), a reliable `phy_mode` push
+  follows each change, and the dashboard's Speed level card shows `floor`.
+  RX counts only frames a session handler accepted, as `Link::phy_mode()`
+  does, and both values clear when the session ends. Host API stays version
+  1; the `coppa-host` type additions take the workspace to 0.17.0. The
+  simultaneous-call tie break and retry stagger move into
+  `coppa_protocol::floor_controller` (`answers_simultaneous_call`,
+  `calling_retry_stagger`) and both adapters call them: a daemon that hears
+  the station it is dialing call it back answers when its callsign sorts
+  higher, even with `LISTEN OFF`, and its host sees the call complete as its
+  own `CONNECTED`.
 - Version 2 spends one of the fourteen remaining version values; the next
   incompatible format allocates 3.

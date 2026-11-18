@@ -711,6 +711,7 @@ In a session, `remote_call`, `snr`, `level` and `cfo` appear as before, and
 | `speed_level` | Speed level our next frame is encoded at |
 | `speed_level_mode` | `auto` (the rate loop chooses) or `manual` (pinned by `set_speed_level`) |
 | `speed_levels` | Levels `set_speed_level` accepts on this engine (HF 1-8, VHF 1-9) |
+| `phy_mode` | `{"tx":..,"rx":..}`: the waveform of the last session frame keyed (`tx`) and of the last session frame a session handler accepted (`rx`), each `null`, `"floor"` or `"ofdm:<level>"`. Both are `null` before session activity and after the session ends. Frames for other stations, stale ACKs and replayed handshakes do not change `rx` (0.17.0) |
 | `mycall` | Callsign in force; absent when none |
 | `max_tx_s` | `[radio] max_tx_duration_s` |
 | `max_tune_s` | Longest TUNE accepted: the smaller of `max_tx_s` and 120 |
@@ -720,7 +721,7 @@ In a session, `remote_call`, `snr`, `level` and `cfo` appear as before, and
 | `chat` | `true` while a session that negotiated chat is up, `false` while a session without it is up; absent with no session. See [Chat](#chat) |
 
 Every reliable state push (`session`, `ptt`, `busy`, `snr`, `level`, `heard`,
-`buffer`, `speed_level`) has a matching `status` field, and the daemon updates
+`buffer`, `speed_level`, `phy_mode`) has a matching `status` field, and the daemon updates
 the field before it pushes. A client that sends `status` after connecting
 therefore never ends on an older value than the pushes it then receives.
 `chat` and `chat_receipt` pushes match the `chat_history` reply instead: the
@@ -1024,7 +1025,11 @@ below. The page makes no external requests. Each card:
   CFO is the last decoded frame's offset.
 - **Speed level**: `TX <n> · auto` or `TX <n> · manual` (ours), `RX <n>` (the
   peer's last decoded frame), `Auto` plus one button per level the profile
-  accepts, and the buffer count.
+  accepts, and the buffer count. While the session is on the low-rate floor
+  (`status.phy_mode`), the lines read `TX floor · auto` and
+  `RX floor (last decoded frame)`. After a numbered selection the TX line
+  shows the pinned level, because the next frame goes on OFDM. After a
+  socket loss the page shows the integer text until the next `status`.
 - **TUNE**: `Seconds` (default 10, at most `max_tune_s`), `Two-tone` and
   `Single tone 1500 Hz`. Disabled while PTT is keyed. A TUNE cannot be stopped
   early; it ends after its seconds.
@@ -1128,6 +1133,13 @@ station's host gets every byte once, in order.
   The one exception is a repeat from a caller whose inbound attempt is still
   pending (it did not hear the first answer): coppad answers it again (see
   "Inbound connect attempts" below).
+  A second exception is a crossed call (COP-210): while coppad is dialing a
+  station and hears that station's `CONNECT_REQ` to it, the station whose
+  callsign sorts higher drops its own dial and answers, even with
+  `LISTEN OFF`. Its host sees no `PENDING`; it gets `CONNECTED` for its own
+  `CONNECT`, or `DISCONNECTED` if that handshake fails. In Auto the higher
+  caller waits longer between its OFDM repeats, so it hears the lower
+  station's floor request.
   A host `CONNECT` is answered `DISCONNECTED`, to the dialling host only. Send
   `DISCONNECT` to end the current session before dialling again. A session
   nobody ends blocks every caller: an idle connected session does not time

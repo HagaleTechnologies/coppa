@@ -2,6 +2,7 @@
 
 pub mod adaptive_goodput;
 pub mod afsk_direwolf;
+pub mod compare;
 pub mod cp_arm;
 pub mod floor_candidate;
 pub mod floor_sweep;
@@ -10,6 +11,7 @@ pub mod impairment;
 pub mod metrics;
 pub mod per_frame_link;
 pub mod profile_ab;
+pub mod rate_replay;
 pub mod report;
 pub mod runner;
 pub mod scenario;

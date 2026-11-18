@@ -14,9 +14,11 @@
 //! receiver as a continuous detector with bounded audio retention.
 //!
 //! This framing is a separate air format from the OFDM speed ladder: it
-//! changes no version-1 constant, vector or serializer. The engine and
-//! daemon session controller that switch onto the floor are not built yet
-//! (`docs/LIMITATIONS.md`, COP-169 section).
+//! changes no version-1 constant, vector or serializer. Both session
+//! adapters switch onto it through the shared
+//! [`FloorController`](crate::floor_controller::FloorController): the
+//! library Link for whole sessions, coppad for the handshake (COP-202).
+//! Open gaps: `docs/LIMITATIONS.md`, COP-169 section.
 
 use crate::fec::ldpc::rate_match::{rate_dematch, rate_match};
 use crate::fec::ldpc::NrLdpc;
