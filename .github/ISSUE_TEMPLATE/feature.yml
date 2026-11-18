@@ -1,0 +1,28 @@
+name: Feature request
+description: Ask for a capability coppa does not have.
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [ROADMAP.md](https://github.com/HagaleTechnologies/coppa/blob/main/ROADMAP.md) and [docs/LIMITATIONS.md](https://github.com/HagaleTechnologies/coppa/blob/main/docs/LIMITATIONS.md) first.
+        coppa will not add RF compatibility with VARA or any other proprietary modem.
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: The job you want done, and where coppa gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like coppa to do?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Optional. Other tools, workarounds or designs you looked at.
