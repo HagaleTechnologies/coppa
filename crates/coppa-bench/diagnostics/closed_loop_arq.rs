@@ -177,30 +177,64 @@
 //! through the real `decode_and_dispatch_audio`. Rebuilding `EventLoop` inside a throughput bench
 //! would answer a question this ticket does not ask.
 //!
+//! # COP-183: re-measure on main and the raise-dwell candidate
+//!
+//! COP-183 re-measured this bench on main and tried exactly one controller candidate, faster
+//! convergence: `RateLoop`'s raise dwell drops from 5 to 1, and nothing else changes (probing stays
+//! (2, 1), the CP gate, schedule, seeds and comparators are untouched). At dwell 1 every ACK leaves
+//! `raise_run` at zero, so the probe stall gate never engages and arm B probes one level up on
+//! every second frame. The candidate, the reopened parameter, the four adoption gates and the stop
+//! conditions were pre-registered before any acceptance-seed run; the benchmark log
+//! `docs/benchmarks/2026-11-16-cop-183-rate-loop-dwell.md` restates them and records the verdict.
+//!
+//! - **Arms A-d1 and B-d1** are arms A and B with `ControllerSpec::CANDIDATE`. They run after every
+//!   pre-existing arm, and every pre-existing arm keeps `ControllerSpec::BASELINE`, so all output
+//!   above the first `=== COP-183` header is what this bench printed before COP-183.
+//! - **Verdict: adopted.** All four gates held on both profiles, so raise dwell 1 ships in
+//!   `RateLoop::default_coppa()` and coppad. **Arms A-d1 and B-d1 are now the shipped controller;
+//!   arms A and B (and C, C', B0, P, which share their controller) are the pre-COP-183 control.**
+//!   THE BAR block and the historical sections above still describe arm B, i.e. the control; the
+//!   shipped controller's bar numbers are the `COP-183` lines. The bar stays unmet: standard
+//!   arm B-d1 x1 is 1.1055 of best-fixed but 0.7630 of the oracle, and the robust historical
+//!   slot-count comparison falls to 0.8389 / 0.7013.
+//! - **Replay.** Every frame here is independent (its own channel seed, its IR-HARQ accumulator
+//!   evicted after decode), so an adaptive arm's frame at `(CP mode, level)` is the fixed cell's
+//!   frame at the same pair. `coppa_bench::rate_replay::replay` therefore scores any `RateLoop`
+//!   parameter set from the 18 cells by table lookup, driving the real `RateLoop` and `CpPolicy`.
+//!   The `COP-183 REPLAY SELF-CHECK` block replays arms A, B, A-d1 and B-d1 on every run and must
+//!   print `total_mismatches=0`; the dwell sweep and the coppad-default guard are void otherwise.
+//!   Replay is not valid for anything that changes the PHY, the receiver's recommendation, the
+//!   channel or transceiver state carried between frames.
+//! - **`COPPA_CL_SEED_OFFSET`** (default 0) shifts the run seeds: offset 5 runs development seeds
+//!   5..=9, disjoint from the acceptance seeds 0..=4. Every decisional predicate requires the seeds
+//!   to equal `SEEDS`, so an offset run prints a banner and decides nothing.
+//!
 //! # Reproduce
 //!
 //! ```text
 //! cargo run -p coppa-bench --release --example closed_loop_arq              # robust base (default)
 //! cargo run -p coppa-bench --release --example closed_loop_arq -- standard  # hf_standard CP pair
 //! COPPA_CL_FRAMES=24 COPPA_CL_SEEDS=1 cargo run -p coppa-bench --release --example closed_loop_arq
+//! COPPA_CL_SEED_OFFSET=5 cargo run -p coppa-bench --release --example closed_loop_arq -- standard  # COP-183 development seeds
 //! ```
 //!
 //! CI never runs this file, so these figures carry **no regression protection**. The
 //! `COPPA_CL_FRAMES` / `COPPA_CL_SEEDS` overrides exist so a wiring bug shows up in seconds instead
 //! of only at full scale -- a bench nobody will re-run is a bench that rots.
 use coppa_bench::adaptive_goodput::{
-    best_arm, best_arm_by_bits, delivered_bits, goodput_bps, legacy_rate_bars, oracle_bits,
-    oracle_goodput_bps, standard_rate_bars, FrameSlot,
+    adoption_gates, best_arm, best_arm_by_bits, delivered_bits, goodput_bps, legacy_rate_bars,
+    oracle_bits, oracle_goodput_bps, standard_rate_bars, AdoptionInputs, FrameSlot,
 };
 use coppa_bench::cp_arm::{
     self, frame_seed, goodput_with_switch_cost_bps, same_profile, switch_airtime_s, CpPolicy,
     CpSwitch, SpreadHistogram, MAX_FRAMES, SEEDS, SEED_STRIDE, SWITCH_LATENCY_FRAMES,
 };
+use coppa_bench::rate_replay::{replay, CellObs, CellTable, ControllerSpec, CpShape, ReplayRun};
 use coppa_bench::scenario::{mode_for_level, profile_by_name, ChannelSpec, SAMPLE_RATE};
 use coppa_channel::watterson::WattersonPreset;
 use coppa_codec::ofdm::frame::{CoppaFrameType, CoppaHeader};
 use coppa_codec::ofdm::CoppaProfile;
-use coppa_ml::{RateLoop, VALID_SPEED_LEVELS};
+use coppa_ml::VALID_SPEED_LEVELS;
 use coppa_protocol::cp_negotiator::CpMode;
 use coppa_protocol::modem::frame_airtime_s;
 use coppa_protocol::modem::transceiver::CoppaTransceiver;
@@ -451,17 +485,31 @@ enum ArmKind {
     /// One fixed level and one fixed CP mode: a comparator cell.
     Fixed { level: u8, mode: CpMode },
     /// Adaptive rate, one fixed CP mode for the whole run. `LongCp` is arm A (the control);
-    /// `ShortCp` is arm C, B's CP-isolation control -- see `SeedResult::arm_c`'s doc.
-    FixedCpAdaptiveRate { mode: CpMode },
+    /// `ShortCp` is arm C, B's CP-isolation control -- see `SeedResult::arm_c`'s doc. With
+    /// `spec: ControllerSpec::CANDIDATE` and `LongCp` it is COP-183's arm A-d1, the shipped
+    /// controller since COP-183; with `ControllerSpec::BASELINE` it is the pre-COP-183 control.
+    FixedCpAdaptiveRate { mode: CpMode, spec: ControllerSpec },
     /// Arm P: identical to arm A, but rebuilds the transceiver on exactly the frames arm B
     /// switched on, with the SAME profile. Isolates the rebuild from the CP change.
-    Placebo { rebuild_at: Vec<usize> },
-    /// Arms B / B0: `CpGate`-driven CP switching at the given switch latency.
-    CpAdaptive { latency: usize },
+    Placebo {
+        rebuild_at: Vec<usize>,
+        spec: ControllerSpec,
+    },
+    /// Arms B / B0: `CpGate`-driven CP switching at the given switch latency. With
+    /// `spec: ControllerSpec::CANDIDATE` and `SWITCH_LATENCY_FRAMES` it is COP-183's arm B-d1, the
+    /// shipped controller since COP-183; arm B with `ControllerSpec::BASELINE` is the pre-COP-183
+    /// control.
+    CpAdaptive {
+        latency: usize,
+        spec: ControllerSpec,
+    },
 }
 
 struct ArmResult {
     slots: Vec<FrameSlot>,
+    /// What the receiver reported for each frame (COP-183). For a fixed cell this is the
+    /// table [`replay`] scores controllers from; output only, nothing in the arm reads it.
+    obs: Vec<CellObs>,
     switches: Vec<CpSwitch>,
     hist: [SpreadHistogram; 4],
     trace: Vec<(usize, f32, u8)>,
@@ -485,6 +533,7 @@ fn run_arm(
     header_bandwidth_override: Option<u8>,
 ) -> ArmResult {
     let mut slots: Vec<FrameSlot> = Vec::with_capacity(n);
+    let mut obs: Vec<CellObs> = Vec::with_capacity(n);
     let mut trace: Vec<(usize, f32, u8)> = Vec::new();
     let mut hist: [SpreadHistogram; 4] = Default::default();
     let mut rebuilds = 0usize;
@@ -495,27 +544,27 @@ fn run_arm(
     // would let an arm boundary's seq-0 reuse combine into another arm's leftover accumulator
     // from a different level entirely.
     let boot_mode = match kind {
-        ArmKind::Fixed { mode, .. } | ArmKind::FixedCpAdaptiveRate { mode } => *mode,
+        ArmKind::Fixed { mode, .. } | ArmKind::FixedCpAdaptiveRate { mode, .. } => *mode,
         // Both boot on LongCp, matching `CpNegotiator::new` and `CpGate`'s initial state.
         ArmKind::Placebo { .. } | ArmKind::CpAdaptive { .. } => CpMode::LongCp,
     };
     let mut tx = CoppaTransceiver::new(pair.for_mode(boot_mode), 1);
 
     let mut policy = match kind {
-        ArmKind::CpAdaptive { latency } => Some(CpPolicy::new(*latency)),
+        ArmKind::CpAdaptive { latency, .. } => Some(CpPolicy::new(*latency)),
         _ => None,
     };
     let mut loop_ctl = match kind {
         ArmKind::Fixed { .. } => None,
-        // `.with_probing(2, 1)` is the (probe_interval, probe_offset) combination measured best via
-        // an exhaustive sweep; `raise_dwell = 5` is `RateLoop::default_coppa()`'s unchanged default.
-        // Left byte-for-byte as it was pre-COP-2: this ticket must not confound a metric change
-        // with a tuning change.
-        _ => Some(
-            RateLoop::new(VALID_SPEED_LEVELS.to_vec(), 5, 1)
-                .unwrap()
-                .with_probing(2, 1),
-        ),
+        // Every pre-existing adaptive arm passes `ControllerSpec::BASELINE`: dwell 5 and probing
+        // (2, 1), the controller main ran before COP-183, kept on purpose so arms A / B / B0 / C /
+        // C' / P stay the re-measure of COP-152's baseline. Only COP-183's arms A-d1 and B-d1 pass
+        // `ControllerSpec::CANDIDATE`. COP-2 left this controller untouched so a metric change was
+        // not confounded with a tuning change; COP-183 adds its candidate BESIDE it for the same
+        // reason.
+        ArmKind::FixedCpAdaptiveRate { spec, .. }
+        | ArmKind::Placebo { spec, .. }
+        | ArmKind::CpAdaptive { spec, .. } => Some(spec.build()),
     };
 
     let mut switch_air_s = 0.0f64;
@@ -550,7 +599,7 @@ fn run_arm(
                 rebuilds += 1;
             }
         }
-        if let ArmKind::Placebo { rebuild_at } = kind {
+        if let ArmKind::Placebo { rebuild_at, .. } = kind {
             if rebuild_at.contains(&f) {
                 // Same profile, same rebuild. This is the control that makes the rebuild's
                 // inertness measured rather than argued.
@@ -584,6 +633,11 @@ fn run_arm(
             FrameSlot::for_level(level, tx.profile(), out.delivered)
                 .expect("levels come from VALID_SPEED_LEVELS and the profile has data carriers"),
         );
+        obs.push(CellObs {
+            delivered: out.delivered,
+            recommended: out.recommended,
+            delay_spread_ms: out.delay_spread_ms,
+        });
         hist[segment(f, n)].observe(out.delay_spread_ms);
 
         // Review finding (P2, declined): production feeds `cp_gate.observe` on EVERY
@@ -630,6 +684,7 @@ fn run_arm(
 
     ArmResult {
         slots,
+        obs,
         switches: policy
             .as_ref()
             .map(|p| p.switches().to_vec())
@@ -722,6 +777,12 @@ struct SeedResult {
     arm_c_bw_ablation: ArmResult,
     /// The 18 comparator cells, `[LongCp 9 levels..., ShortCp 9 levels...]`.
     cells: Vec<Vec<FrameSlot>>,
+    /// The receiver's per-frame reports for the same 18 cells, in the same order (COP-183).
+    cell_obs: Vec<Vec<CellObs>>,
+    /// COP-183 arm A-d1: arm A with `ControllerSpec::CANDIDATE` (raise dwell 1).
+    arm_a_d1: ArmResult,
+    /// COP-183 arm B-d1: arm B with `ControllerSpec::CANDIDATE` (raise dwell 1).
+    arm_b_d1: ArmResult,
 }
 
 impl SeedResult {
@@ -742,6 +803,7 @@ impl SeedResult {
 fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
     // 18 comparator cells: level x CP mode (D4).
     let mut cells: Vec<Vec<FrameSlot>> = Vec::with_capacity(2 * VALID_SPEED_LEVELS.len());
+    let mut cell_obs: Vec<Vec<CellObs>> = Vec::with_capacity(2 * VALID_SPEED_LEVELS.len());
     for mode in [CpMode::LongCp, CpMode::ShortCp] {
         for &lvl in VALID_SPEED_LEVELS.iter() {
             let r = run_arm(&ArmKind::Fixed { level: lvl, mode }, pair, seed, n, None);
@@ -753,12 +815,14 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
                 goodput_bps(&r.slots)
             );
             cells.push(r.slots);
+            cell_obs.push(r.obs);
         }
     }
 
     let arm_a = run_arm(
         &ArmKind::FixedCpAdaptiveRate {
             mode: CpMode::LongCp,
+            spec: ControllerSpec::BASELINE,
         },
         pair,
         seed,
@@ -773,6 +837,7 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
     let arm_c = run_arm(
         &ArmKind::FixedCpAdaptiveRate {
             mode: CpMode::ShortCp,
+            spec: ControllerSpec::BASELINE,
         },
         pair,
         seed,
@@ -795,6 +860,7 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
     let arm_c_bw_ablation = run_arm(
         &ArmKind::FixedCpAdaptiveRate {
             mode: CpMode::ShortCp,
+            spec: ControllerSpec::BASELINE,
         },
         pair,
         seed,
@@ -810,6 +876,7 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
     let arm_b = run_arm(
         &ArmKind::CpAdaptive {
             latency: SWITCH_LATENCY_FRAMES,
+            spec: ControllerSpec::BASELINE,
         },
         pair,
         seed,
@@ -822,7 +889,16 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
         arm_b.switches.len()
     );
 
-    let arm_b0 = run_arm(&ArmKind::CpAdaptive { latency: 0 }, pair, seed, n, None);
+    let arm_b0 = run_arm(
+        &ArmKind::CpAdaptive {
+            latency: 0,
+            spec: ControllerSpec::BASELINE,
+        },
+        pair,
+        seed,
+        n,
+        None,
+    );
     eprintln!(
         "  seed {seed} arm B0 : {:.1} bps, {} switches",
         goodput_bps(&arm_b0.slots),
@@ -831,7 +907,16 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
 
     // Arm P rebuilds on exactly arm B's switch frames, so it must run after B.
     let rebuild_at: Vec<usize> = arm_b.switches.iter().map(|s| s.effective_from).collect();
-    let arm_p = run_arm(&ArmKind::Placebo { rebuild_at }, pair, seed, n, None);
+    let arm_p = run_arm(
+        &ArmKind::Placebo {
+            rebuild_at,
+            spec: ControllerSpec::BASELINE,
+        },
+        pair,
+        seed,
+        n,
+        None,
+    );
     // Arm B's rebuild count is printed BESIDE arm P's, not just P's own. The placebo is only a
     // control while the two rebuild sets match, and `CpPolicy::applied_on` now makes them match by
     // construction -- but a mismatch printed is a mismatch someone can see, whereas the divergence
@@ -850,6 +935,38 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
         );
     }
 
+    // COP-183's candidate arms: the same two shapes as arms A and B, with raise dwell 1 and
+    // nothing else changed. Run last so every pre-existing arm runs exactly as before.
+    let arm_a_d1 = run_arm(
+        &ArmKind::FixedCpAdaptiveRate {
+            mode: CpMode::LongCp,
+            spec: ControllerSpec::CANDIDATE,
+        },
+        pair,
+        seed,
+        n,
+        None,
+    );
+    eprintln!(
+        "  seed {seed} arm A-d1: {:.1} bps (arm A, raise dwell 1 -- COP-183 candidate)",
+        goodput_bps(&arm_a_d1.slots)
+    );
+    let arm_b_d1 = run_arm(
+        &ArmKind::CpAdaptive {
+            latency: SWITCH_LATENCY_FRAMES,
+            spec: ControllerSpec::CANDIDATE,
+        },
+        pair,
+        seed,
+        n,
+        None,
+    );
+    eprintln!(
+        "  seed {seed} arm B-d1: {:.1} bps, {} switches (arm B, raise dwell 1 -- COP-183 candidate)",
+        goodput_bps(&arm_b_d1.slots),
+        arm_b_d1.switches.len()
+    );
+
     SeedResult {
         arm_a,
         arm_p,
@@ -858,6 +975,9 @@ fn run_seed(pair: &CpProfilePair, seed: u64, n: usize) -> SeedResult {
         arm_c,
         arm_c_bw_ablation,
         cells,
+        cell_obs,
+        arm_a_d1,
+        arm_b_d1,
     }
 }
 
@@ -898,7 +1018,21 @@ fn main() {
     let n_seeds = env_usize("COPPA_CL_SEEDS", SEEDS.len())
         .min(SEEDS.len())
         .max(1);
-    let seeds = &SEEDS[..n_seeds];
+    // COP-183: `COPPA_CL_SEED_OFFSET` shifts the run seeds to a disjoint development set
+    // (offset 5 runs seeds 5..=9, frame seeds 5120..=9515). Every decisional predicate below
+    // requires `seeds == SEEDS`, so an offset run is screening only.
+    let seed_offset = env_usize("COPPA_CL_SEED_OFFSET", 0) as u64;
+    // An offset below `SEEDS.len()` would mix acceptance seeds into a "development" run, and a
+    // huge one would overflow `frame_seed`'s `run_seed * SEED_STRIDE + f`. Refuse both.
+    assert!(
+        seed_offset == 0
+            || (seed_offset >= SEEDS.len() as u64
+                && seed_offset < u64::MAX / SEED_STRIDE - SEEDS.len() as u64),
+        "COPPA_CL_SEED_OFFSET={seed_offset} is out of range: use 0, or an offset of at least {} \
+         so the development seeds stay disjoint from the acceptance seeds {SEEDS:?}",
+        SEEDS.len()
+    );
+    let seeds: Vec<u64> = SEEDS[..n_seeds].iter().map(|s| s + seed_offset).collect();
 
     println!("=== Closed-loop adaptive rate + CP contrast (COP-2) ===");
     println!("base pair    : {}", pair.label);
@@ -906,6 +1040,9 @@ fn main() {
         "frames/run   : {n}   seeds: {seeds:?}   runs: {}",
         n_seeds * 24
     );
+    if seed_offset != 0 {
+        println!("DEVELOPMENT SEEDS {seeds:?}: screening only; no predicate below is decisional");
+    }
     if pair.synthetic {
         println!(
             "NOTE         : the short-CP half of this pair is a BENCH-LOCAL SYNTHETIC profile with an\n\
@@ -1046,6 +1183,9 @@ fn main() {
     }
 
     // ---- Ratios against the bar -------------------------------------------------
+    // Since COP-183 this block measures arm B, the pre-COP-183 control (raise dwell 5). The shipped
+    // controller is arm B-d1; its bar operands are the `COP-183 standard arm-B-d1-x1` line. The
+    // printed text is left unchanged so the pre-COP-183 output stays byte-identical.
     println!("\n=== THE BAR (adaptive/best-fixed > 1.0, adaptive/oracle >= 0.8) ===");
     println!(
         "Each ratio is printed at BOTH switch-cost multipliers: x0 (arm B's data airtime only) and\n\
@@ -1250,7 +1390,7 @@ fn main() {
         .map(|v| [v.arm_b_x1, v.bf_joint, v.orc_joint])
         .collect();
     let bars = if base == "standard" {
-        standard_rate_bars(seeds, n, &operands)
+        standard_rate_bars(&seeds, n, &operands)
     } else {
         None
     };
@@ -1416,7 +1556,13 @@ fn main() {
     // D9 sense, and printing it as a DIRECTIONAL result turns a wiring smoke test
     // into an apparently valid experimental conclusion. Only emit the D9 verdict
     // language for a full run; label anything smaller as non-decisional.
-    if n_seeds_run == SEEDS.len() {
+    if seed_offset != 0 {
+        println!(
+            "  NON-DECISIONAL: development seeds {seeds:?} (COPPA_CL_SEED_OFFSET) -- the D9\n\
+             sign-consistency rule is defined on the pre-committed seeds {SEEDS:?}. This run is\n\
+             COP-183 screening only; it is not evidence of a directional result either way."
+        );
+    } else if n_seeds_run == SEEDS.len() {
         println!(
             "  Sign-consistent (all {} seeds one way) => a DIRECTIONAL result. Mixed signs => no result,\n\
              and the write-up must say the delta is inside this bench's own run-to-run band rather than\n\
@@ -1481,6 +1627,9 @@ fn main() {
         total_sw as f64 / results.len() as f64
     );
 
+    // ---- COP-183: candidate arms, replay self-check, dwell sweep, adoption gates ----
+    cop183_report(&base, &pair, &seeds, n, &results, &agg);
+
     // ---- Level trace ------------------------------------------------------------
     println!(
         "\n frame   snr(dB)  level   (arm B, seed {}; level tracks the channel)",
@@ -1489,4 +1638,312 @@ fn main() {
     for (f, snr, lvl) in &results[0].arm_b.trace {
         println!("  {f:4}    {snr:5.1}     L{lvl}");
     }
+}
+
+/// Arm B-shaped goodput at switch cost x1: `(bits, data_air, switch_air, x1)`, charging each
+/// handshake on this run's pair as `run_arm` does.
+fn x1_parts(
+    pair: &CpProfilePair,
+    slots: &[FrameSlot],
+    switches: &[CpSwitch],
+) -> (usize, f64, f64, f64) {
+    let bits = delivered_bits(slots);
+    let data_air = total_airtime(slots);
+    let switch_air: f64 = switches
+        .iter()
+        .map(|sw| {
+            switch_airtime_s(sw, &pair.for_mode(sw.from), &pair.for_mode(sw.to))
+                .expect("switch level comes from VALID_SPEED_LEVELS")
+        })
+        .sum();
+    (
+        bits,
+        data_air,
+        switch_air,
+        goodput_with_switch_cost_bps(bits as f64, data_air, switch_air, 1.0),
+    )
+}
+
+/// Pooled x1 goodput of one arm over every seed in schedule segment `seg`:
+/// `(bits, data_air, switch_air, pooled_x1)`. Switch air is charged to the segment of the
+/// deciding frame, as the `COP-152 segment` lines charge it.
+fn pooled_segment(
+    pair: &CpProfilePair,
+    n: usize,
+    seg: usize,
+    arms: &[(&[FrameSlot], &[CpSwitch])],
+) -> (usize, f64, f64, f64) {
+    let mut bits = 0usize;
+    let mut data_air = 0.0f64;
+    let mut switch_air = 0.0f64;
+    for (slots, switches) in arms {
+        let in_seg: Vec<FrameSlot> = slots
+            .iter()
+            .enumerate()
+            .filter(|(f, _)| segment(*f, n) == seg)
+            .map(|(_, s)| *s)
+            .collect();
+        let decided: Vec<CpSwitch> = switches
+            .iter()
+            .filter(|sw| segment(sw.decided_at, n) == seg)
+            .copied()
+            .collect();
+        let (b, d, w, _) = x1_parts(pair, &in_seg, &decided);
+        bits += b;
+        data_air += d;
+        switch_air += w;
+    }
+    (
+        bits,
+        data_air,
+        switch_air,
+        goodput_with_switch_cost_bps(bits as f64, data_air, switch_air, 1.0),
+    )
+}
+
+/// COP-183's output blocks: the candidate arms beside the baseline, the replay self-check, the
+/// dwell sweep, the coppad-default guard and the pre-registered adoption gates. Printed after
+/// every pre-existing block and before the level trace, so the stdout above the first
+/// `=== COP-183` header is byte-for-byte what the bench printed before COP-183.
+fn cop183_report(
+    base: &str,
+    pair: &CpProfilePair,
+    seeds: &[u64],
+    n: usize,
+    results: &[SeedResult],
+    agg: &[SeedAgg],
+) {
+    let full_schedule = n == 300 && seeds == SEEDS;
+    let tables: Vec<CellTable<'_>> = results
+        .iter()
+        .map(|r| CellTable {
+            slots: &r.cells,
+            obs: &r.cell_obs,
+        })
+        .collect();
+    let arm_b_shape = CpShape::Adaptive {
+        latency_frames: SWITCH_LATENCY_FRAMES,
+    };
+    let arm_a_shape = CpShape::Fixed(CpMode::LongCp);
+    let run = |t: &CellTable<'_>, spec: ControllerSpec, cp: CpShape| -> ReplayRun {
+        replay(t, spec, cp).expect("run_seed builds 18 cells of n frames each")
+    };
+
+    println!(
+        "\n=== COP-183 CANDIDATE: raise_dwell 1 (probing (2,1), CP gate, schedule, seeds and comparators unchanged) ==="
+    );
+    println!(
+        "Arms A and B above are the baseline controller (raise dwell 5, probing (2,1)). Arms A-d1 and\n\
+         B-d1 are the same shapes with raise dwell 1 and nothing else changed. Each seed ran 26 arms\n\
+         (the 18 cells, A, C, C', B, B0, P, A-d1, B-d1); the header's `runs` count predates COP-183."
+    );
+    let mut b_x1 = [Vec::new(), Vec::new()];
+    let mut a_gp = [Vec::new(), Vec::new()];
+    for (si, r) in results.iter().enumerate() {
+        for (k, (name, arm)) in [("B", &r.arm_b), ("B-d1", &r.arm_b_d1)].iter().enumerate() {
+            // The arm's own accumulated switch air, exactly as `SeedAgg::arm_b_x1` charges it.
+            let bits = delivered_bits(&arm.slots);
+            let data_air = total_airtime(&arm.slots);
+            let x1 = goodput_with_switch_cost_bps(bits as f64, data_air, arm.switch_air_s, 1.0);
+            println!(
+                "COP-183 seed={} arm={name} bits={bits} data_air={data_air:.17} switch_air={:.17} x1={x1:.17}",
+                seeds[si], arm.switch_air_s
+            );
+            b_x1[k].push(x1);
+        }
+        for (k, (name, arm)) in [("A", &r.arm_a), ("A-d1", &r.arm_a_d1)].iter().enumerate() {
+            let gp = goodput_bps(&arm.slots);
+            println!("COP-183 seed={} arm={name} goodput={gp:.17}", seeds[si]);
+            a_gp[k].push(gp);
+        }
+    }
+    let operands: Vec<[f64; 3]> = agg
+        .iter()
+        .zip(&b_x1[1])
+        .map(|(v, &x1)| [x1, v.bf_joint, v.orc_joint])
+        .collect();
+    let bars = if base == "standard" {
+        standard_rate_bars(seeds, n, &operands)
+    } else {
+        None
+    };
+    println!(
+        "COP-183 standard arm-B-d1-x1 operands={operands:?} bars={bars:?} (None = non-decisional)"
+    );
+    for (si, r) in results.iter().enumerate() {
+        let ab = delivered_bits(&r.arm_a_d1.slots);
+        let (_, bb) = best_arm_by_bits(r.long_cells()).expect("9 long cells");
+        let ob = oracle_bits(&SeedResult::oracle_frames(r.long_cells(), n));
+        let bars = if base == "robust" && seeds[si] == 0 && full_schedule {
+            legacy_rate_bars(ab, bb, ob)
+        } else {
+            None
+        };
+        println!(
+            "COP-183 legacy seed={} arm=A-d1 adaptive={ab} fixed={bb} oracle={ob} bars={bars:?} (None = non-decisional)",
+            seeds[si]
+        );
+    }
+    let mut pooled = [[0.0f64; 2]; 2]; // [segment Good, Poor][baseline, candidate]
+    for (k, name) in ["B", "B-d1"].iter().enumerate() {
+        let arms: Vec<(&[FrameSlot], &[CpSwitch])> = results
+            .iter()
+            .map(|r| {
+                let a = if k == 0 { &r.arm_b } else { &r.arm_b_d1 };
+                (a.slots.as_slice(), a.switches.as_slice())
+            })
+            .collect();
+        for (gi, seg) in [2usize, 3].into_iter().enumerate() {
+            let (bits, data_air, switch_air, x1) = pooled_segment(pair, n, seg, &arms);
+            println!(
+                "COP-183 segment arm={name} segment={seg} bits={bits} data_air={data_air:.17} switch_air={switch_air:.17} pooled_x1={x1:.17}"
+            );
+            pooled[gi][k] = x1;
+        }
+    }
+
+    println!("\n=== COP-183 REPLAY SELF-CHECK ===");
+    println!(
+        "Each adaptive arm replayed from the 18 fixed cells with `coppa_bench::rate_replay::replay`\n\
+         (the real RateLoop and CpPolicy). Zero mismatches is what licenses the replay-only numbers\n\
+         below (the dwell sweep and the coppad-default guard)."
+    );
+    let mut total_mismatches = 0usize;
+    for (si, r) in results.iter().enumerate() {
+        let checks: [(&str, &ArmResult, ControllerSpec, CpShape); 4] = [
+            ("A", &r.arm_a, ControllerSpec::BASELINE, arm_a_shape),
+            ("B", &r.arm_b, ControllerSpec::BASELINE, arm_b_shape),
+            ("A-d1", &r.arm_a_d1, ControllerSpec::CANDIDATE, arm_a_shape),
+            ("B-d1", &r.arm_b_d1, ControllerSpec::CANDIDATE, arm_b_shape),
+        ];
+        for (name, arm, spec, cp) in checks {
+            let rp = run(&tables[si], spec, cp);
+            let slot_mismatches = rp
+                .slots
+                .iter()
+                .zip(&arm.slots)
+                .filter(|(a, b)| a != b)
+                .count()
+                + rp.slots.len().abs_diff(arm.slots.len());
+            let switch_mismatches = rp
+                .switches
+                .iter()
+                .zip(&arm.switches)
+                .filter(|(a, b)| a != b)
+                .count()
+                + rp.switches.len().abs_diff(arm.switches.len());
+            // A length-only mismatch has no differing frame in the shared prefix; report the
+            // first frame past it instead of `None`.
+            let first = rp
+                .slots
+                .iter()
+                .zip(&arm.slots)
+                .position(|(a, b)| a != b)
+                .or_else(|| {
+                    (rp.slots.len() != arm.slots.len()).then(|| rp.slots.len().min(arm.slots.len()))
+                });
+            println!(
+                "COP-183 replay-check seed={} arm={name} slot_mismatches={slot_mismatches} switch_mismatches={switch_mismatches} first_mismatch_frame={first:?}",
+                seeds[si]
+            );
+            total_mismatches += slot_mismatches + switch_mismatches;
+        }
+    }
+    println!("COP-183 replay-check total_mismatches={total_mismatches}");
+    if total_mismatches != 0 {
+        println!(
+            "COP-183 STOP: the replay is not exact on this run, so the dwell sweep, the coppad-default\n\
+             guard and gate G4 below are void (pre-registered stop condition)."
+        );
+    }
+
+    println!("\n=== COP-183 DWELL SWEEP (replay; probing (2,1) and off) ===");
+    println!(
+        "Ratios of five-seed sums. B = arm B shape (CP-adaptive, latency {SWITCH_LATENCY_FRAMES}) at x1 against\n\
+         the joint comparators; A = arm A shape (long CP fixed) against the long-CP comparators;\n\
+         legacy = arm A shape's delivered bits against the long-CP best-fixed and oracle bits."
+    );
+    let bf_joint: f64 = agg.iter().map(|v| v.bf_joint).sum();
+    let orc_joint: f64 = agg.iter().map(|v| v.orc_joint).sum();
+    let bf_long: f64 = agg.iter().map(|v| v.bf_long).sum();
+    let orc_long: f64 = agg.iter().map(|v| v.orc_long).sum();
+    let legacy_bf: usize = results
+        .iter()
+        .map(|r| best_arm_by_bits(r.long_cells()).expect("9 long cells").1)
+        .sum();
+    let legacy_orc: usize = results
+        .iter()
+        .map(|r| oracle_bits(&SeedResult::oracle_frames(r.long_cells(), n)))
+        .sum();
+    for (probe_label, (interval, offset)) in [("2,1", (2u32, 1usize)), ("off", (0, 0))] {
+        for dwell in [1u8, 2, 3, 4, 5, 6, 8] {
+            let spec = ControllerSpec {
+                raise_dwell: dwell,
+                probe_interval: interval,
+                probe_offset: offset,
+            };
+            let mut b_sum = 0.0f64;
+            let mut a_sum = 0.0f64;
+            let mut a_bits = 0usize;
+            for t in &tables {
+                let b = run(t, spec, arm_b_shape);
+                b_sum += x1_parts(pair, &b.slots, &b.switches).3;
+                let a = run(t, spec, arm_a_shape);
+                a_sum += goodput_bps(&a.slots);
+                a_bits += delivered_bits(&a.slots);
+            }
+            println!(
+                "COP-183 sweep probe={probe_label} dwell={dwell} armB_x1_sum={b_sum:.17} bf_joint_sum={bf_joint:.17} orc_joint_sum={orc_joint:.17} B/bf={:.4} B/orc={:.4} armA_sum={a_sum:.17} bf_long_sum={bf_long:.17} orc_long_sum={orc_long:.17} A/bf={:.4} A/orc={:.4} legacy_bits=[{a_bits},{legacy_bf},{legacy_orc}]",
+                b_sum / bf_joint.max(1e-9),
+                b_sum / orc_joint.max(1e-9),
+                a_sum / bf_long.max(1e-9),
+                a_sum / orc_long.max(1e-9),
+            );
+        }
+    }
+
+    println!("\n=== COP-183 COPPAD-DEFAULT GUARD (replay: long CP fixed, probing off) ===");
+    let mut coppad = [Vec::new(), Vec::new()];
+    for (si, t) in tables.iter().enumerate() {
+        let d5 = goodput_bps(&run(t, ControllerSpec::COPPAD_DEFAULT_BASELINE, arm_a_shape).slots);
+        let d1 = goodput_bps(&run(t, ControllerSpec::COPPAD_DEFAULT_CANDIDATE, arm_a_shape).slots);
+        println!(
+            "COP-183 coppad-default seed={} dwell5={d5:.17} dwell1={d1:.17}",
+            seeds[si]
+        );
+        coppad[0].push(d5);
+        coppad[1].push(d1);
+    }
+    println!(
+        "COP-183 coppad-default sum dwell5={:.17} dwell1={:.17}",
+        coppad[0].iter().sum::<f64>(),
+        coppad[1].iter().sum::<f64>()
+    );
+
+    println!("\n=== COP-183 ADOPTION GATES ===");
+    println!(
+        "Pre-registered (docs/benchmarks/ COP-183 log): G1 arm B-d1 x1 beats arm B x1 in the five-seed\n\
+         sum and on every seed; G2 pooled Watterson Good and Poor x1 goodput do not fall; G3 arm A-d1's\n\
+         sum does not fall below arm A's; G4 the replayed coppad default does not fall. All four, on\n\
+         both profiles, adopt raise dwell 1. None = non-decisional (not the five-seed 300-frame run)."
+    );
+    // A non-exact replay voids G4's inputs (pre-registered stop condition), so the gates are
+    // non-decisional on such a run rather than printed as if they held.
+    let gates = if total_mismatches == 0 {
+        adoption_gates(&AdoptionInputs {
+            seeds,
+            frames: n,
+            arm_b_x1: [&b_x1[0], &b_x1[1]],
+            good_x1: pooled[0],
+            poor_x1: pooled[1],
+            arm_a: [&a_gp[0], &a_gp[1]],
+            coppad_default: [&coppad[0], &coppad[1]],
+        })
+    } else {
+        None
+    };
+    println!(
+        "COP-183 gates base={base} gates={gates:?} all={:?}",
+        gates.map(|g| g.all())
+    );
 }

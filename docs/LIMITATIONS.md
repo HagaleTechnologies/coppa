@@ -16,7 +16,7 @@ amend.
 - PAPR clipping uses per-speed-level targets (6.0 dB at BPSK up to 14.0 dB at 64QAM, tuned in `SPEED_LEVELS`); the old flat/too-aggressive clipping this line used to describe was fixed well before Phase 1. **The levels 9/10 (64-QAM) LDPC-non-convergence-at-high-SNR issue this bullet used to describe is FIXED** by Task 4's NR BG2 mother code + level 10's rate-7/8→5/6 change. For old level 9 (64-QAM 2/3, now level 8) the evidence is COP-24's SSB-filtered AWGN sweep (`BENCHMARKS.md`'s "COP-24" section: every shipped HF level 0/50 from 18 to 60 dB). Old level 10 (64-QAM 5/6, now level 9 and VHF-only) decodes on `hf_standard` without the SSB filter (0/100 at 24 dB in the COP-70 manual sweep) but never clears 10% FER through it, which COP-24 attributes to band-edge attenuation. `coppa-bench`'s `waterfall_bracket_level_*` tests guard each level's unfiltered AWGN waterfall on every push. This bullet used to cite a `test_snr_fer_monte_carlo` run showing zero frame errors at every level; that run could not fail (COP-70): it used a full-band noise convention ~9 dB optimistic against the 3 kHz one, swept only above every level's waterfall, asserted nothing, and never ran in CI. That test is now an `#[ignore]`d manual sweep through `run_scenario` that straddles each waterfall and asserts on Wilson bounds
 - The Phase 2 Task 4 alpha-calibration process itself is a cautionary tale worth keeping in mind for future LDPC-parameter tuning: a normalized-min-sum scale picked from a sweep at **one** speed level (level 2) measurably improved that level's isolated FER but broke real convergence (100% frame loss, even on a clean channel) for level 10's very different operating point (highest rate, least redundancy, heaviest known-pad pinning at small payloads) — caught by `tests/phase_c_loopback.rs`'s existing tests, not by the new codec's own unit tests, which didn't happen to exercise that combination. Any future alpha/decoder-parameter change should be validated across the *whole* speed ladder (and payload-size extremes), not a single representative level, before being adopted as the shipped default
 - Daemon hardware audio requires the `cpal-backend` feature; without it the daemon runs but moves no audio
-- **PTT release on exit (COP-31) covers graceful exits, unwinds and restarts, plus an in-loop backstop (`max_tx_duration_s` + 2 s) and, for rigctld/GPIO/CM108 PTT, an out-of-process guardian (`[radio] ptt_guardian`) that releases PTT if `coppad` dies keyed.** Not covered: a cgroup-wide SIGKILL or `pkill -9 coppad` (both kill the guardian too), power loss, serial PTT (relies on the OS dropping DTR/RTS on close; not hardware-verified), a fully wedged event loop, and a second Ctrl-C in `coppa tx`/`coppa tune`, which exits without releasing PTT (the first one releases it, COP-86). A second stop signal to `coppad` releases PTT itself and exits 130 (COP-85); if that release cannot finish within 2 s (for example, a blocking rigctld call), `coppad` exits without it and only the guardian releases PTT. See `docs/OPERATING.md`'s "PTT safety when coppad stops". The process-level tests that prove these paths, `crates/coppa-daemon/tests/ptt_release.rs`, run only in a local `cargo test --workspace`, because every CI job skips them: the file is compiled out under `cpal-backend`, which `ci-full.yml`'s full-suite job enables, and `ci.yml` runs `--lib` only.
+- **PTT release on exit (COP-31) covers graceful exits, unwinds and restarts, plus an in-loop backstop (`max_tx_duration_s` + 2 s) and, for rigctld/GPIO/CM108 PTT, an out-of-process guardian (`[radio] ptt_guardian`) that releases PTT if `coppad` dies keyed.** Not covered: a cgroup-wide SIGKILL or `pkill -9 coppad` (both kill the guardian too), power loss, serial PTT (relies on the OS dropping DTR/RTS on close; not hardware-verified), a fully wedged event loop, and a second Ctrl-C in `coppa tx`/`coppa tune`, which exits without releasing PTT (the first one releases it, COP-86). A second stop signal to `coppad` releases PTT itself and exits 130 (COP-85); if that release cannot finish within 2 s (for example, a blocking rigctld call), `coppad` exits without it and only the guardian releases PTT. See `docs/OPERATING.md`'s "PTT safety when coppad stops". The process-level tests that prove these paths, `crates/coppa-daemon/tests/ptt_release.rs`, are compiled out under `cpal-backend`, so in CI only the `no-audio` group of `ci-full.yml`'s full-suite job runs them (`tools/ci/run-full-tests.sh`); `ci.yml` does not.
 - **Multi-instance `coppad --instance NAME` (COP-85) is tested only as two daemons with separate ports on one host.** Two instances sharing one audio device, and two mDNS instances (`coppad.local`, `coppad-NAME.local`) on one LAN, are untested. `/health`, the WebSocket `hello` and the mDNS TXT record do not carry the instance name. There is no lock file: two instances given the same file or ports fail on the second bind, not earlier.
 - **Windows `coppad` (COP-85) is covered by headless CI only.** `Platform Check (windows-latest)` builds the release binary with `serial-ptt`, runs `coppa-radio`'s serial PTT unit tests and `tests/runtime_smoke.rs` (VARA `VERSION`/`MYCALL`, guardian release after a kill, a missing COM port). No real audio device, COM port or rig has been tested; there is no SIGHUP reload and no Windows service integration. The guardian's own process group keeps a console Ctrl-C from reaching it, but that has not been tried in a real console. Closing the console window or a Windows shutdown starts the orderly stop, but Windows ends the process (and the guardian, which shares the console) shortly after, so PTT may not be released; no blocking console handler holds the process open.
 - **Character-device GPIO PTT (`gpio:<chip>:<line>`, COP-85) has not been run on real hardware.** The tests cover parsing, chip selection by path, name or label, the line range, the sysfs-number mapping, and the missing-chip error, in a container with no `/dev/gpiochip*`; no Raspberry Pi 4 or Pi 5 has keyed a rig through it, and the line's level after a clean stop and after `kill -9` is unrecorded. Once coppad drops the line request, the level is up to the kernel's GPIO driver: coppad drives RX first, and after a crash while keyed the guardian requests the line at its RX level and then frees it again; nothing holds the line once both have let go. `ptt_invert` (COP-52) is passed to the character-device open, so an inverted line is requested high (its RX level); that too is untested on hardware. The old `gpio:<number>` form is deprecated: it still uses sysfs GPIO with a startup warning where the kernel has `/sys/class/gpio`, and is a startup error where it does not. A label that two chips share is refused rather than guessed.
@@ -249,7 +249,7 @@ overshoot production cannot collect**, because `select_ofdm_profile` routes ever
 record to the bit under a controlled re-run (adaptive 326680 / best fixed L4 357424 / oracle 428936 /
 0.762 / 0.914), so the metric swap is provably accounting-only. See `BENCHMARKS.md`'s "Short-CP under
 closed-loop rate adaptation (COP-2)" section and `docs/adr/008-phase3-system-layer.md`'s COP-2
-update. The re-measure and redesign of this bar is tracked as COP-183, the successor to the retired COP-159.
+update. **UPDATE (2026-11-16, COP-183): re-measured on main; one controller candidate tried and adopted.** coppad still runs stop-and-wait with window 1 (COP-168's windowed primitives are not wired into it; COP-184), so this is not a windowed result. Main reproduces COP-152's baseline exactly: robust historical seed-0 slot counts 330144 / 358848 / 429256 (0.9200 / 0.7691), standard arm B x1 0.8911 / 0.6150. The one candidate was faster controller convergence: `RateLoop`'s raise dwell drops from 5 to 1 and nothing else changes. At dwell 1 the probe stall gate never fires, so with probing (2, 1) the bench controller probes on every second frame. It was screened on development seeds 5 to 9 and frozen there, then run once on the acceptance seeds 0 to 4. On the acceptance seeds, baseline then candidate: robust historical C1 0.9200 / 0.7691 then 0.8389 / 0.7013 (C1 counts bits per slot and cannot credit airtime); standard production C2 0.8911 / 0.6150 then 1.1055 / 0.7630; robust arm B x1 (descriptive) 0.7954 / 0.5529 then 1.0306 / 0.7163. All four pre-registered adoption gates held on both profiles: G1 arm B x1 rose in sum and on every seed, G2 pooled Watterson Good and Poor goodput rose (standard Poor 971.5 to 1261.7 bps), G3 arm A rose, and G4 coppad's default shape (long CP, probing off, replayed) rose from 7300.9 to 9709.8 bps summed on standard. Dwell 1 therefore ships in `RateLoop::default_coppa()` and coppad. The bar stays unmet: only the standard best-fixed predicate passes; the standard oracle half and both robust historical predicates fail. On development seeds no point in a 90-point controller grid reached adaptive/oracle 0.8 on the standard arm (maximum 0.7729), and the research's hindsight bound was 0.7568. That bound replaces both the AWGN ramps and the fading segments with hindsight best-fixed choices; the oracle stays out of reach because the fading segments draw an independent channel for every frame. See `docs/benchmarks/2026-11-16-cop-183-rate-loop-dwell.md`. The re-measure and redesign of this bar is tracked as COP-183, the successor to the retired COP-159.
 - **Connected-session data is ARQ-protected stop-and-wait from COP-38 (0.3.0).** Every session `Data` frame carries a `TransportPdu::Reliable` header, the receiver ACKs each one with a MAC `Ack` frame, and `check_session_retransmits` (on `run()`'s 500 ms tick, whatever `arq_enabled` says) retransmits a lost frame byte-identically; `BUFFER` falls on the ACK, not at PTT release. The single session link means one session at a time: while a session exists, every CONNECT_REQ (the current peer's included) goes unanswered and a host `CONNECT` is answered `DISCONNECTED` to the dialling client only, so a session nobody ends (an idle one never times out) blocks every caller until the host sends `DISCONNECT`; a session frame must match the session's `src`, `dest` and SSID. Costs: clean-link throughput is about 0.57-0.67x of the old fire-and-forget stream (simulated and analytic, `BENCHMARKS.md`'s COP-38 section); a dead link with data in flight is disconnected after the 5-retransmission budget (~3 minutes) plus, since COP-68, a fade hold that keeps retrying at the most robust level whose budget fits the segment and only gives up after 180 s with zero peer evidence (any decoded peer PDU, or a header that decodes while the payload fails, counts as evidence and re-grants the budget), so a completely dead link ends in ~3 + 3 minutes at the worst while a link whose peer stays decodable is held indefinitely; the session wire format broke (ADR-010), so both stations must run 0.3.0. Residuals: no RF or real-Pat test, no block-ACK/window >1, an idle Established session on a dead link still never times out (keepalives refresh it), and a lost CONNECT_CFM is still unhandled. Since COP-111 each session frame's timeout covers the audio it keyed, our own station ID included, but not a station ID the peer prepends to its ACK: the sender cannot see the peer's ID timer, and at level 2 with 8 codewords and coppad's default PTT timing the timeout then expires 0.615 s before that ACK can finish, about once per 540 s (the base RTO floor has the same gap for every frame). RTT samples from multi-codeword frames also feed the RFC 6298 estimator unnormalized, so they inflate the RTO of later short frames until about 40 of those have been ACKed (one 11.9 s sample then 3.6 s samples measured 8.63 s after 20, 4.95 s after 30 and 4.23 s after 40); this errs long, so it costs recovery time on a loss but never keys a duplicate. **Windowed session ARQ (COP-168) is only partly built.** `coppa-protocol` now defines the CONNECT capability flags bit 5 (`LinkCapabilities::windowed_arq`, negotiated as an AND and checked in CONNECT_CFM), `LinkCapabilities::windowed_window`, the PHY `seq_num` packing (`arq::windowed_phy_seq`), a per-level redundancy-version order (`arq::rv_for_session_attempt`, measured per HF level; see BENCHMARKS.md "COP-168 PHY HARQ schedule") and `ArqTx::unacked`. The receive and encode side of Phase 2 exists too: `modem::HarqPolicy` (`key_mask` keys the soft buffer on `seq_num & key_mask`, `rv0_starts_fresh` drops a key's buffer on an RV0 frame, `multi_codeword` enables per-codeword accumulation; the default is the old behaviour), a soft buffer that restarts when the payload length differs as well as the level, `harq_combined_successes`, `StreamingReceiver::take_failed_headers` (at most 16) and `CoppaCore::encode_bytes_tagged`, with `CoppaCore::set_harq_policy` surviving engine rebuilds. Nothing in coppad calls them yet. coppad does not advertise bit 5 and still runs stop-and-wait with RV0 on every attempt: the burst sender, the per-burst ACK, next-RV retransmissions, session throughput benches and SPEC §24 remain follow-up work under the COP-184 split. The PHY now supports opt-in multi-codeword soft combining via `HarqPolicy::multi_codeword`, bounded to 64 mother-codeword buffers with LRU eviction by frame key; every codeword must pass CRC in one attempt. The `session_harq` diagnostic measures the RV order separately from the deferred daemon integration. Two design points stay open for that work: an ACK carries HARQ key 0, the same key as data segments 0, 16, 32 and so on, so with data flowing both ways the receiver must keep ACK frames out of combining and out of the RV0 reset; and a retransmission never uses RV0, so a segment whose first RV0 frame was lost whole depends on RV1-RV3 frames combining with each other, which the `session_harq` measurement has to cover at levels where a lone RV1-RV3 frame does not decode.
 - **Nothing on the wire tells a MAC frame from a bare transport PDU, so some opt-in sessionless ARQ data is misclassified and dropped (COP-130).** The receiver tries the MAC parser first, then the transport parser, then raw delivery (`docs/SPEC.md` §16.2). A sessionless `Reliable` PDU of 14 bytes or more parses as a MAC frame when its first byte's low nibble is 0-8 and bytes 1-12 decode as two callsigns: `TransportPdu::new_reliable(0, 0, 0, b"ABCDEFGHIJ")` (`010000000000004142434445464748494a`, SPEC §21 vector N03) parses as a MAC `Ack` from `PTICQDUF` with SSID 7 and is dropped because no session matches. Every such PDU passes the MAC type check (its first byte `0x01` reads as MAC type `Ack`); its sequence number gives a valid MAC destination for 118 of the 256 values, and its first six payload bytes decide the rest, so the share lost depends on the traffic. Retransmissions are byte-identical, so an affected PDU fails every time until the retransmit budget runs out. It needs `arq_enabled` and sessionless host data, both off by default; connected-session traffic is always MAC-framed and is not affected. See SPEC §16.3.
 - **Sessionless ARQ data PDUs move the receiving station's own send window once its `send_base` reaches 128 (COP-130).** The sessionless receive path passes every inbound `Reliable` PDU's `ack_num`/`ack_bitmap` to the local `ArqTx::process_ack` (`crates/coppa-daemon/src/event_loop.rs`, `decode_and_dispatch_audio`), but data PDUs always carry `ack=0, bitmap=0`, and `ArqTx::process_ack` treats `ack_num = 0` as cumulatively acknowledging segments 128-255 (SPEC §19.2). Reproduced through `ArqTx` in `sessionless_zero_ack_moves_send_base_from_128` (`crates/coppa-protocol/tests/protocol_vectors.rs`): after 130 acknowledged sends with segment 130 in flight, `process_ack(0, 0)` reports 130 as newly acknowledged, moves `send_base` back to 0 and leaves 131 segments counted in flight, so the window stays full. It needs `arq_enabled`, sessionless data in both directions and at least 128 segments sent; connected sessions ignore the ACK fields of data frames and are not affected. See SPEC §19.5.
@@ -375,8 +375,33 @@ update. The re-measure and redesign of this bar is tracked as COP-183, the succe
   accepts floor handshakes, falls back after two unanswered response windows,
   and probes OFDM after five newly acknowledged floor exchanges. Its
   deterministic audio tests cover delivery and recovery, not connection
-  probability. The daemon controller and host mode reporting remain unbuilt.
-  The −6 dB connect bar (9 of 10 within 60 s) is unmet. Production development sweeps now
+  probability. COP-202: coppad now runs the same shared `FloorController` for
+  its handshake (bit 6 in Auto, floor CONNECT_REQ after two unanswered OFDM
+  windows, replies in the received waveform), and the −6 dB connect bar is
+  met for both adapters in the recorded direction (link 10/10, daemon 10/10,
+  `results/cop-190/connect/`). A daemon session established on the floor also
+  carries data, ACKs, keepalives and DISCONNECT through the controller:
+  floor-sized segments with no outer code while it is on the floor or
+  probing, the floor RTO floor, and one level-1 OFDM probe after five
+  acknowledged floor segments. Two unanswered data windows move a
+  floor-negotiated session to the floor mid-session (COP-211), but only an
+  in-flight segment whose frame fits one floor frame and carries no outer code
+  is resent there. Still open for the daemon: an OFDM-sized or RS(12,6)
+  outer-coded segment keeps the COP-68 retransmit and fade-hold path,
+  so a session that fades with one in flight ends 180 s after the hold starts
+  without peer evidence (measured after a successful probe for a 273-byte
+  frame and an 8-byte outer-coded segment; COP-222). A session that moves to
+  the floor mid-session keeps its 30 s keepalive interval; RS(12,6) block ACKs
+  stay on OFDM; no lost-CONNECT_CFM replay. Two daemons that dial each other at
+  once connect through the library's lexical tie break (COP-210), but a
+  lexically higher Auto caller staggers each OFDM repeat by one more retry
+  interval plus one floor response window, so on a weak channel it reaches the
+  floor later than a lower caller would. Hosts see the active waveform through
+  the WebSocket `status.phy_mode` field, the `phy_mode` push and the dashboard
+  (COP-210); the VARA command port and the C ABI do not report it. With a turnaround above
+  about 5.5 s, the last floor request's reply window and the inbound floor
+  handshake can outlast the flat 30 s handshake timeout. Link records 0/10 in the
+  reversed direction (lexically higher caller). Production development sweeps now
   cover batch and streaming reception on AWGN and Poor. COP-191 records
   final-seed 200-trial sweeps and adds `--waveform floor`; the Poor ramp,
   `connect` and `ramp` drivers still need the session controller.
@@ -399,7 +424,7 @@ update. The re-measure and redesign of this bar is tracked as COP-183, the succe
 - The 16-FSK design now exists twice: COP-190 moved it into the production
   crates, while the measurement-only bench copy (`floor_candidate.rs`)
   retains its historical measurements. Link uses the production floor for
-  negotiated sessions; the daemon controller still uses OFDM. The design's
+  negotiated sessions; coppad uses it for floor handshakes (COP-202). The design's
   development Poor sweep, measured on the frozen bench copy, fails the conservative sync-share clause:
   header sync dominates near the crossing. Production development sweeps
   also fail sync share, at −12 dB AWGN and −8/−6 dB Poor for both paths.
@@ -432,8 +457,9 @@ update. The re-measure and redesign of this bar is tracked as COP-183, the succe
 - COP-190 allocates the candidate's header version value 2 as production
   air-protocol version 2 (SPEC §0.3.3, ADR-014), freezing the tone
   alphabet, header layout, FEC envelope, 40-byte capacity, 8.0 s airtime
-  and receiver search bounds. Frozen v1 formats, host fields and C ABI are
-  unchanged.
+  and receiver search bounds. Frozen v1 formats and the C ABI are
+  unchanged; COP-210 adds the optional WebSocket `phy_mode` status field and
+  push.
 - See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for
   raw development evidence. COP-191 records final-seed sweeps below; no
   production session result is claimed.
@@ -470,8 +496,8 @@ and the root apt installation route were not run. Use a dwell of at least
 7 s so five intervals cover the 35 s handshake timeout; LISTEN OFF cancels
 a shorter scanner hold. A gateway dying mid-session leaves Pat waiting
 for dead-link detection (prior black-box measurements: DISCONNECT at 174 s,
-exit 1 at 263 s). RETRIES covers VARA-style dials only; Pat sends one
-request by default. LinBPQ needs a tmpfs working directory where the host
+exit 1 at 263 s). Pat never sends RETRIES, so it gets the unset default:
+four requests while the speed level is automatic, one with a pinned level. LinBPQ needs a tmpfs working directory where the host
 filesystem allocates inode numbers above 2**32. See [BPQ.md](BPQ.md).
 
 An idle session with no outstanding application data can keep sending
@@ -495,10 +521,11 @@ stall scenario does (`docs/testing/bpq-session.md`).
   `coppa-codec::floor`, and the framing plus a separately detected
   streaming receiver (`FloorFrame`, `FloorStream`) live in
   `coppa-protocol::modem::floor`, guarded by `air_v2_conformance.rs` and
-  `floor_receive.rs`. CoppaCore constructs a floor codec and continuous receive path, but
-  Link and daemon have no floor-aware session controller: capability
-  negotiation, connect-on-floor, OFDM fallback and the −6 dB connect bar
-  (9 of 10 within 60 s) remain unmet, as does Poor ramp acceptance. COP-191 adds the
+  `floor_receive.rs`. CoppaCore constructs a floor codec and continuous receive path.
+  COP-195 gives Link a floor-aware session controller and COP-202 runs the
+  same controller in coppad's sessions; the −6 dB connect bar (9 of 10
+  within 60 s) is met for both adapters in the recorded direction. Poor ramp
+  acceptance remains unmet. COP-191 adds the
   production sweep driver; `connect` and `ramp` remain blocked on the
   COP-190 production session controller.
 - COP-187 repairs the experimental 16-FSK candidate's independent hard header
@@ -530,8 +557,9 @@ stall scenario does (`docs/testing/bpq-session.md`).
 - COP-190 allocates the candidate's header version value 2 as production
   air-protocol version 2 (SPEC §0.3.3, ADR-014), freezing the tone
   alphabet, header layout, FEC envelope, 40-byte capacity, 8.0 s airtime
-  and receiver search bounds. Frozen v1 formats, host fields and C ABI are
-  unchanged.
+  and receiver search bounds. Frozen v1 formats and the C ABI are
+  unchanged; COP-210 adds the optional WebSocket `phy_mode` status field and
+  push.
 - See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for raw
   development evidence. COP-191's production final-seed sweeps are in
   [BENCHMARKS](../BENCHMARKS.md#cop-191-production-floor-sweeps): both receivers
@@ -540,3 +568,17 @@ stall scenario does (`docs/testing/bpq-session.md`).
   production session result is claimed.
 
 - **Full-CI hosted verdict budget (COP-200).** Local optimized groups pass below 25 minutes, but three same-revision hosted workflow verdicts below 30 minutes remain unverified. Other required jobs, runner queue time and cold caches can affect the complete result. See [full-CI measurements](testing/full-ci.md).
+- **Fast-tier duration (COP-203).** ci.yml's platform and feature jobs take 40-63.5 minutes, mostly `cargo test --workspace --lib`. The required `CI` verdict waits for them, so it cannot arrive under 30 minutes. The fan-in waits up to 75 minutes. Cutting that wall time is not done. See [the fast-tier wait](testing/full-ci.md#fast-tier-wait).
+
+## COP-170 same-simulator comparison (first slice)
+
+- **COP-214 black-box cable limits.** The Linux ALSA FIFO cable accepts f32le,
+  48 kHz, mono audio. The COP-214 planning probe found that ALSA `plug`
+  conversion at 12, 8 and 44.1 kHz gave RMS ratios of 0.772, 0.773 and
+  0.744, with about one third of samples zeroed. The f32 path passed the
+  integrity probe with correlation 1.000000, level error +0.00 dB and about
+  355 ms cable lead. Real-time trials keep fixed channel seeds but scheduling
+  can change their results. Other native audio formats are tracked by the
+  follow-up ticket filed with COP-214. PathSim's delay offset is not measured.
+
+- **`coppa-bench compare` publishes coppa rows only, with 8 trials in each of its 42 cells.** [docs/benchmarks/comparison.md](benchmarks/comparison.md) holds 8 trials per cell of the `link-l2` row (library `Link`, level 2, floor off) on WGN, MPG and MPP at 30 to 0 dB, for 2 KB and 16 KB transfers. COP-215 recorded the fading 16 KB cells, so the bare `compare` runs no trial on the committed data. With 8 trials a cell's 95% interval is wide wherever trials vary. The numbers come from two library `Link`s in virtual time, not from coppad, and the two stacks were seen to disagree under fading during COP-170 research. The runner writes the payload at the caller's CONNECTED, which avoids the half-open state that waiting for both ends hits under fading (COP-169 section). Each row's SNR reference is the clean frame power at that row's level, so rows at different levels see different absolute noise at one SNR label. The page's numbers were recorded on Linux x86_64 and are bit-reproducible there only. COP-214 adds a Linux ALSA FIFO black-box harness with an integrity probe and VARA-style, ARDOP and KISS adapters. The published self-test uses two unmodified coppad processes; its real-time results can vary with scheduling. The KISS adapter sends a datagram only while fewer than eight, coppad's queue depth, are unaccounted for at the receiver, and presumes the oldest lost after 60 s with nothing received. A KISS modem with a shorter queue, or one that pauses or takes longer than 60 s to send a datagram, can still drop datagrams before they reach the channel. The Watterson cross-check is now recorded in `results/compare/channel-check.csv` (COP-214): Good, Moderate and Poor met the delay, path-power, Doppler and 3 kHz noise tolerances at 48 kHz. The documented codec2 Poor delay is 1 ms, half coppa MPP's 2 ms; PathSim defines no matching preset delay, so its offset is not measured.

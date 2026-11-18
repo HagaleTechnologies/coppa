@@ -14,14 +14,83 @@ numbers separately, because they move independently:
 Older releases have no entry here. Their on-air breaks are listed in
 `docs/SPEC.md` §0.1.
 
+## Unreleased: 0.17.0
+
+- coppad reports the session waveform to WebSocket hosts and the dashboard
+  (COP-210). `status` gains an optional `phy_mode` object, `{"tx": .., "rx": ..}`,
+  each `null`, `"floor"` or `"ofdm:<level>"`. `tx` is the waveform of the last
+  session frame keyed. `rx` is the waveform of the last session frame a session
+  handler accepted, so frames for other stations, stale ACKs and replayed
+  handshakes do not move it. Both clear to `null` when the session ends. A new
+  reliable `phy_mode` push follows each change. The dashboard's Speed level card
+  shows `TX floor · auto` and `RX floor (last decoded frame)` during a floor
+  session. Clients that ignore the field keep working.
+- Two coppads that dial each other at once now make one session each
+  (COP-210). As in the library Link, the station whose callsign sorts higher
+  drops its own dial and answers the other's request, even with `LISTEN OFF`,
+  and its host sees the call complete as its own `CONNECTED` with no
+  `PENDING`. A lexically higher Auto caller waits one more retry interval plus
+  one floor response window before each OFDM repeat. New shared helpers
+  `coppa_protocol::floor_controller::answers_simultaneous_call` and
+  `calling_retry_stagger` carry the rule for both adapters.
+- **Rust API, breaking for struct literals and exhaustive matches:** new
+  `coppa_host::websocket::PhyMode` (non-exhaustive) and `PhyModeReport`, a new
+  `WsStatus.phy_mode` field, a new `phy_mode` field on `WsServerMessage::Status`
+  and a new `WsServerMessage::PhyMode` variant.
+- **Crate version:** 0.17.0. Minor bump over 0.16.0 for the `coppa-host` struct
+  and enum changes above.
+- **Air-protocol version:** unchanged.
+- **Host-API version:** 1, unchanged. The `phy_mode` status field and push are
+  additive.
+- **C ABI version:** unchanged.
+
 ## Unreleased: 0.16.0
 
+- Add `coppa-bench compare channel-check` (COP-214). It measures the three
+  Watterson presets through `PersistentChannel` at 48 kHz and records delay,
+  path-power balance, Doppler spread and 3 kHz noise-reference error in
+  `results/compare/channel-check.csv`.
+- Add `coppa-bench compare blackbox` (COP-214) on Linux with the
+  `cpal-backend` feature. It drives two unmodified modem processes through an
+  ALSA FIFO cable and rejects a failed 10 s signal integrity probe before
+  writing trials. The published CSV holds coppad self-test trials only.
+
+- Add `coppa-bench compare` (COP-170): runs coppa's library `Link` through
+  the WGN, MPG and MPP channels at the 2020 Winlink comparison's SNR grid for
+  2 KB and 16 KB transfers, records each trial in a resumable, seed-reproducible
+  CSV, and renders `docs/benchmarks/comparison.md`: mean net bytes/min with a
+  95% interval, completed/n and a replay command per cell. `compare --check`
+  reports a stale page. Coppa rows only; all 42 cells are recorded (COP-215).
+  COP-214 adds the black-box harness and the channel cross-check.
+- coppad's rate loop and `RateLoop::default_coppa()` now step up after one higher
+  recommendation instead of five (COP-183). On the simulated closed-loop bench this
+  lifts standard-profile adaptive goodput past the best fixed level; adaptive/oracle
+  stays below 0.8. Drops are unchanged. See BENCHMARKS.md's COP-183 log.
 - Add negotiated low-rate floor sessions to the Rust library Link. Discovery
   starts on OFDM, falls back after two unanswered windows, and probes OFDM
   after five distinct acknowledged floor exchanges. Set
   `LinkConfig.robust_floor = false` for the previous OFDM-only behavior.
 - Expose the last transmitted and validated received modes through
-  `Link::phy_mode()`. The daemon and host mode reporting remain open.
+  `Link::phy_mode()`. Host mode reporting remains open.
+- coppad negotiates the low-rate floor for its sessions (COP-202). In Auto it
+  advertises bit 6, sends a floor CONNECT_REQ after two unanswered OFDM
+  windows and answers in the received waveform, so two daemons connect at
+  −6 dB AWGN (10/10 recorded). It reuses the library's `FloorController`.
+  A session established on the floor sends floor-sized data segments on it,
+  probes OFDM level 1 after five acknowledged floor segments, and keys its
+  ACKs, keepalives and DISCONNECT through the same controller.
+- A coppad session that negotiated the floor returns to it after two unanswered
+  data windows, as the library Link does, including after a successful OFDM
+  probe (COP-211). Before, only a lost probe could return it, so a session
+  whose probe succeeded during a signal peak ended in the COP-68 fade hold
+  when the signal fell back.
+- An unset VARA `RETRIES` now means 3 additional connect requests while the
+  speed level is automatic (none with a pinned level). An explicit
+  `RETRIES n` is honoured exactly.
+- **Rust API, additive:** the shared
+  floor policy functions `admits_floor_pdu`, `floor_caps_unusable`,
+  `floor_segment_limit`, `floor_rto_floor`, `floor_keepalive_interval` and
+  `calling_handshake_timeout` in `coppa_protocol::floor_controller`.
 - Allocate capability flags byte bit 6 without changing legacy bytes or
   capability length.
 - **Crate version:** 0.16.0. Minor bump over 0.15.0 because
@@ -31,8 +100,9 @@ Older releases have no entry here. Their on-air breaks are listed in
 - **Air-protocol version:** unchanged (1, plus 2 for the floor from 0.14.0). In version 1,
   CONNECT capability flags bit 6 is now named `robust_floor` (SPEC §20.1). It is negotiated
   as an AND and CONNECT_CFM must carry exactly the AND
-  (`ProtocolError::RobustFloorMismatch`). The library Link sets it by default; coppad does
-  not set it.
+  (`ProtocolError::RobustFloorMismatch`). The library Link sets it by default; coppad sets
+  it while its speed level is automatic (flags `0x46`, `0x56` with the WebSocket API on,
+  `0x42` with `fade_protection = "off"`).
 - **Host-API version:** 1, unchanged.
 - **C ABI version:** unchanged.
 

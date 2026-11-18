@@ -112,6 +112,13 @@ docs/superpowers/
 !/results/cop-187/dev-cfo-plus150-poor/
 !/results/cop-187/dev-cfo-plus150-poor/metadata.txt
 !/results/cop-187/dev-cfo-plus150-poor/sweep.csv
+# COP-170 published comparison data, audited by compare_results.rs.
+!/results/compare/
+/results/compare/**
+!/results/compare/link-l2.csv
+!/results/compare/metadata.md
+!/results/compare/blackbox-coppad.csv
+!/results/compare/channel-check.csv
 # Catalyst orchestrator runtime state (worktree-local; never committed — see
 # catalyst's execution-core/worktree-safety.mjs MACHINE_LOCAL_NOISE list)
 .catalyst/.workflow-context.json
@@ -146,3 +153,9 @@ thoughts/
 !/results/cop-190/dev-poor/
 !/results/cop-190/dev-poor/sweep.csv
 !/results/cop-190/dev-poor/metadata.txt
+# COP-196: committed connect-bar evidence audited by floor_session.rs.
+!/results/cop-190/connect/
+/results/cop-190/connect/**
+!/results/cop-190/connect/link.csv
+!/results/cop-190/connect/daemon.csv
+!/results/cop-190/connect/metadata.md

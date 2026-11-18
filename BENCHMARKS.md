@@ -81,6 +81,7 @@ means the waterfall moved and the anchors need re-measuring.
 - **COP-133, 2026-11-04:** The same-frame residual candidate was not adopted; the rate-loop bar remains unmet. [Log](docs/benchmarks/2026-11-04-cop-133-same-frame-residual.md).
 - **COP-132, 2026-11-04:** Synthetic impulse, clipping, AGC and tilt presets use independent-frame decoding, including the control; they are distinct from the legacy transfer baseline. [Log](docs/benchmarks/2026-11-05-cop-132-synthetic-transfer-impairments.md).
 - **COP-152, 2026-11-06 merge date:** Bounded-prefix residual screening improved held-out scores, but production adoption was withdrawn after full-loop failure. [Log](docs/benchmarks/2026-11-06-cop-152-bounded-prefix-residual.md).
+- **COP-183, 2026-11-16:** The re-measure on main equals COP-152's baseline; raise dwell 1 was adopted after passing all four pre-registered gates on both profiles. The best-fixed half is met on standard (1.1055), and the oracle half (0.7630) and the robust historical comparison stay unmet. [Log](docs/benchmarks/2026-11-16-cop-183-rate-loop-dwell.md).
 
 ## Unmet bars
 
@@ -88,7 +89,7 @@ These are tracked in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md), which is
 the authority; see these bullets there:
 
 - "Phase 3's closed-loop rate adaptation (Task 4) does not meet its own
-  acceptance bar." (`RateLoop`)
+  acceptance bar." (`RateLoop`) Tracked as COP-183.
 - "The Phase 3 benchmark program (Task 8: `milstd`, `session`) does not clear
   its own acceptance targets"
 - "Decision 4's block-ACK cadence (Phase 3 Task 2) was never implemented."
@@ -109,6 +110,8 @@ cargo run -p coppa-bench --release -- --trials 50
 cargo run -p coppa-bench --release --example <name>
 # The per-level CI guard behind the table above
 cargo test -p coppa-bench --lib waterfall_bracket
+# The COP-170 same-simulator comparison page
+cargo run -p coppa-bench --release -- compare
 ```
 
 ## COP-169: floor-mode measurement contract and the `ofdm:1` baseline
@@ -207,6 +210,30 @@ integration remain unbuilt. The ticket's three scenarios remain unmet.
 This candidate was written using repository primitives and the ticket's
 parameters. No external modem source was read or copied.
 
+## COP-170 same-simulator comparison
+
+COP-214 adds `compare channel-check`; its 48 kHz measurements of Good,
+Moderate and Poor are in `results/compare/channel-check.csv` and the comparison
+page. All three meet the documented tolerances.
+`compare blackbox` runs two unmodified coppad processes through the same
+channel model over a Linux ALSA FIFO cable. Its separate self-test rows in
+`results/compare/blackbox-coppad.csv` use measured data-frame TX power and
+record real-time wall time and cable tick counts.
+
+[docs/benchmarks/comparison.md](docs/benchmarks/comparison.md) measures coppa
+through the channel grid of the 2020 Winlink comparison: WGN, Watterson Good
+(MPG) and Poor (MPP) at 30 to 0 dB SNR, for 2 KB and 16 KB transfers. Each cell
+gives the mean net bytes/min over its trials, failures included, with a 95%
+Student t interval, completed/n, and a link to the exact command and seed range
+that produced it. The page follows this file's conventions: SNR in a 3 kHz
+noise bandwidth against the clean mean power of the transmitted frame. One
+command regenerates it: `cargo run -p coppa-bench --release -- compare`, and
+`compare --check` tells whether it is stale. It publishes coppa rows only. All
+42 cells are recorded, 8 trials each (COP-215). `compare blackbox` drives two
+unmodified coppad processes through the same channel for a harness self-test,
+and `compare channel-check` measures the Watterson presets (COP-214,
+`docs/LIMITATIONS.md`).
+
 ## Log index
 
 Every section title of the pre-COP-146 file, in its original order. Grouped logs retain each section unchanged.
@@ -254,6 +281,7 @@ Every section title of the pre-COP-146 file, in its original order. Grouped logs
 | COP-133: Same-frame residual experiment | 2026-11-04 | [log](docs/benchmarks/2026-11-04-cop-133-same-frame-residual.md) |
 | Synthetic transfer impairments (COP-132) | 2026-11-04 | [log](docs/benchmarks/2026-11-05-cop-132-synthetic-transfer-impairments.md) |
 | COP-152: Bounded-prefix payload residual | 2026-11-06 (merge date) | [log](docs/benchmarks/2026-11-06-cop-152-bounded-prefix-residual.md) |
+| COP-183: rate-loop re-measure and raise-dwell candidate | 2026-11-16 | [log](docs/benchmarks/2026-11-16-cop-183-rate-loop-dwell.md) |
 
 ## COP-168 PHY HARQ schedule
 

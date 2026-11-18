@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-12T14:31:47Z",
-  "head_commit": "67eca7b",
+  "generated_at": "2026-11-16T00:52:17Z",
+  "head_commit": "364be57",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -157,7 +157,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:2b6fe19d394f76e72085327e426b11bd13e3a106e4f4de70ff3ae142977d0224",
+      "hash": "sha256:5e455eceae7b0a701c93fe40bd9a434644aea828efdacbe9dcb11a6bb033d337",
       "id": "adr-008-phase3-system-layer",
       "kind": "decision-digest",
       "links": [
@@ -466,7 +466,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:1310fd27302f68df34fbd91fe181e0759953074f6d6e16d1286c89ee706a948e",
+      "hash": "sha256:4eede69da1386af49448b44015b7857cbc4abb6bafc3f59b9f0aad92561e9733",
       "id": "daemon-test-ports",
       "kind": "gotcha",
       "links": [
@@ -478,17 +478,19 @@
       "sources": [
         "crates/coppa-daemon/tests/support/mod.rs",
         "crates/coppa-daemon/tests/runtime_smoke.rs",
+        "crates/coppa-daemon/tests/ptt_release.rs",
+        "crates/coppa-daemon/tests/reload.rs",
         "crates/coppa-daemon/tests/cli.rs",
         "crates/coppa-daemon/src/vara_wiring.rs"
       ],
       "status": "current",
       "title": "What will bite you when a test hands coppad a port?",
-      "verified_commit": "2662e93",
-      "verified_date": "2026-11-09",
+      "verified_commit": "06a2987",
+      "verified_date": "2026-11-16",
       "visibility": "public"
     },
     {
-      "hash": "sha256:997c40b71957491a63891faf189b547aae02fbfedf41bb4ec231c72b18176299",
+      "hash": "sha256:f373db613b781836501d11ab1b07404446b3db098eeb914982bb99c1fef99b9a",
       "id": "full-ci-tests",
       "kind": "gotcha",
       "links": [
@@ -506,8 +508,8 @@
       ],
       "status": "current",
       "title": "What keeps full CI coverage intact when splitting optimized tests?",
-      "verified_commit": "fa4de8e",
-      "verified_date": "2026-11-13",
+      "verified_commit": "c4e4ca8",
+      "verified_date": "2026-11-15",
       "visibility": "public"
     },
     {
@@ -558,7 +560,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:ea365d47d94ef69ddb33b6e0a67e692c7f79e6dab0a22d49d9816ad6e7ce45d8",
+      "hash": "sha256:a312996287acc43dde393ac2f340540eeb72b54ed773d8ceb35f7d8651bd4626",
       "id": "low-rate-floor",
       "kind": "gotcha",
       "links": [
@@ -573,12 +575,16 @@
         "docs/LIMITATIONS.md",
         "crates/coppa-bench/src/floor_candidate.rs",
         "crates/coppa-bench/src/floor_sweep.rs",
-        "crates/coppa-protocol/src/modem/floor.rs"
+        "crates/coppa-protocol/src/modem/floor.rs",
+        "crates/coppa-daemon/src/event_loop.rs",
+        "crates/coppa-protocol/src/floor_controller.rs",
+        "crates/coppa-host/src/websocket.rs",
+        "crates/coppa-daemon/src/web/index.html"
       ],
       "status": "current",
       "title": "What has the low-rate floor experiment measured?",
-      "verified_commit": "19948e9f8eb8e8139fb86b9237112cc83ed6095a",
-      "verified_date": "2026-11-12",
+      "verified_commit": "5244d4e2534428748155b10810d5835685d1c029",
+      "verified_date": "2026-11-16",
       "visibility": "public"
     },
     {

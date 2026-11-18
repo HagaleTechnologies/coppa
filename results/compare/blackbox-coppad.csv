@@ -1,0 +1,7 @@
+modem,adapter,version_reply,binary_sha256,mode,channel,snr_db,size_bytes,trial,seed,ref_power_a,ref_power_b,cap_s,outcome,connect_s,delivered_bytes,exact,transfer_s,net_bytes_per_min,drops,wall_s,cable_latency_ms,starved_ticks,overflow_ticks
+coppad,vara,VERSION Coppa 0.16.0,9b8b4957d0c18b1df65c23d26a97b2a855101fff94fb6902757ff0c1d6d1327e,HF_STANDARD,wgn,30,2048,0,0x17000000,0.022691,0.020689,600,complete,7.078,2048,true,51.477,2387.090,0,58.555,355,0,0
+coppad,vara,VERSION Coppa 0.16.0,9b8b4957d0c18b1df65c23d26a97b2a855101fff94fb6902757ff0c1d6d1327e,HF_STANDARD,wgn,30,2048,1,0x17000001,0.022691,0.020689,600,complete,7.079,2048,true,136.132,902.652,0,143.211,355,0,0
+coppad,vara,VERSION Coppa 0.16.0,9b8b4957d0c18b1df65c23d26a97b2a855101fff94fb6902757ff0c1d6d1327e,HF_STANDARD,wgn,30,2048,2,0x17000002,0.022691,0.020689,600,complete,7.079,2048,true,136.077,903.018,0,143.156,355,0,0
+coppad,vara,VERSION Coppa 0.16.0,9b8b4957d0c18b1df65c23d26a97b2a855101fff94fb6902757ff0c1d6d1327e,HF_STANDARD,mpg,20,2048,0,0x17120000,0.022691,0.020689,600,complete,7.132,2048,true,502.184,244.691,0,509.316,355,0,0
+coppad,vara,VERSION Coppa 0.16.0,9b8b4957d0c18b1df65c23d26a97b2a855101fff94fb6902757ff0c1d6d1327e,HF_STANDARD,mpg,20,2048,1,0x17120001,0.022691,0.020689,600,complete,7.118,2048,true,541.163,227.066,0,548.281,355,0,0
+coppad,vara,VERSION Coppa 0.16.0,9b8b4957d0c18b1df65c23d26a97b2a855101fff94fb6902757ff0c1d6d1327e,HF_STANDARD,mpg,20,2048,2,0x17120002,0.022691,0.020689,600,complete,7.135,2048,true,586.613,209.474,0,593.748,355,0,0

@@ -69,7 +69,8 @@ impl CpGate {
     /// minus a safety margin below its ~1 ms of nominal slop, so the gate recommends
     /// switching only while genuine headroom remains) and `consecutive_needed = 4`.
     ///
-    /// 4 was chosen the same way `RateLoop::default_coppa`'s `raise_dwell = 5` was chosen:
+    /// 4 was chosen the same way `RateLoop::default_coppa`'s original `raise_dwell = 5` was
+    /// chosen (COP-183 later moved that dwell to 1; see BENCHMARKS.md's COP-183 log):
     /// a small integer in the "don't flip on one good frame" range the brief itself suggests
     /// (3-5), picked slightly more cautious than `RateLoop`'s dwell because a wrong short-CP
     /// switch risks real ISI/frame loss (a channel-headroom mistake), not just a
@@ -79,9 +80,10 @@ impl CpGate {
     /// decode degradation until enough bad frames accumulate to revert," which argues for a
     /// touch more required evidence before switching. No sweep was run to justify a more
     /// precise value than that reasoning; if this ever needs tuning, follow the
-    /// `raise_dwell` sweep in `RateLoop::default_coppa`'s doc as the precedent for how to do
-    /// it (sweep across the whole speed ladder / channel conditions, not one representative
-    /// case — see `docs/LIMITATIONS.md`'s alpha-calibration cautionary tale).
+    /// `raise_dwell` re-measure in BENCHMARKS.md's COP-183 log as the precedent for how to do
+    /// it (pre-register the candidate, screen on development seeds, decide on held-out seeds,
+    /// across the whole speed ladder / channel conditions, not one representative case — see
+    /// `docs/LIMITATIONS.md`'s alpha-calibration cautionary tale).
     pub fn default_coppa() -> Self {
         Self::new(2.5, 4)
     }

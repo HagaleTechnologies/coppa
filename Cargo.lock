@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "coppa"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "coppa-audio",
  "coppa-bench",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-audio"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "coppa-dsp",
@@ -487,13 +487,14 @@ dependencies = [
 
 [[package]]
 name = "coppa-bench"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "clap",
  "coppa-audio",
  "coppa-channel",
  "coppa-codec",
+ "coppa-engine",
  "coppa-ml",
  "coppa-protocol",
  "crc",
@@ -506,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-channel"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "approx",
  "coppa-dsp",
@@ -516,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-cli"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -538,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-codec"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "approx",
  "coppa-channel",
@@ -553,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-daemon"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -581,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-dsp"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "approx",
  "num-complex",
@@ -590,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-engine"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "approx",
  "coppa-channel",
@@ -604,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-ffi"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "cbindgen",
  "coppa-engine",
@@ -612,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-host"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "base64",
  "coppa-engine",
@@ -631,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-ml"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "num-complex",
  "rustfft",
@@ -639,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-protocol"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "approx",
  "coppa-bench",
@@ -660,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "coppa-radio"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "gpiocdev",
@@ -1293,9 +1294,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.61.0"
+version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1324c9bebe052584e96e7c80d2f9cf2d86e1a6d83d621a46932c5636996be18"
+checksum = "0e37f27df77c7887edbc5f5a59ecd8e5ec4a669319266ec1b61068667a603183"
 dependencies = [
  "ahash",
  "bytecount",
