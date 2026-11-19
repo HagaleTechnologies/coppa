@@ -4,7 +4,7 @@ set -eu
 package=$1
 sudo apt-get install -y "./$package"
 test "$(systemctl is-active coppad.service)" = active
-for i in 1 2 3 4 5 6 7 8 9 10; do
+for _ in 1 2 3 4 5 6 7 8 9 10; do
   if curl --fail --silent http://127.0.0.1:8401/setup >/dev/null 2>&1; then break; fi
   sleep 1
 done
@@ -15,13 +15,13 @@ curl --fail --silent --show-error --output /dev/null \
   -X PUT -H "Host: 127.0.0.1:8401" -H 'Origin: http://127.0.0.1:8401' \
   -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
   --data "$body" http://127.0.0.1:8401/api/config
-for i in 1 2 3 4 5 6 7 8 9 10; do
+for _ in 1 2 3 4 5 6 7 8 9 10; do
   if curl --fail --silent --show-error http://127.0.0.1:8400/health >/dev/null 2>&1; then break; fi
   sleep 1
 done
 curl --fail --silent --show-error http://127.0.0.1:8400/health >/dev/null
 sudo systemctl restart coppad.service
-for i in 1 2 3 4 5 6 7 8 9 10; do
+for _ in 1 2 3 4 5 6 7 8 9 10; do
   if curl --fail --silent http://127.0.0.1:8400/health >/dev/null 2>&1; then break; fi
   sleep 1
 done
