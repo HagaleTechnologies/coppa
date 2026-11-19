@@ -560,7 +560,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:a312996287acc43dde393ac2f340540eeb72b54ed773d8ceb35f7d8651bd4626",
+      "hash": "sha256:7d7eca460a826a73dfb83f46a4e2ffa90d2b5f035b07bc7c45e11a5c8460c6a7",
       "id": "low-rate-floor",
       "kind": "gotcha",
       "links": [
@@ -573,6 +573,7 @@
       "sources": [
         "BENCHMARKS.md",
         "docs/LIMITATIONS.md",
+        "results/cop-190/connect/metadata.md",
         "crates/coppa-bench/src/floor_candidate.rs",
         "crates/coppa-bench/src/floor_sweep.rs",
         "crates/coppa-protocol/src/modem/floor.rs",
