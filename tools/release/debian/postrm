@@ -1,5 +1,8 @@
 #!/bin/sh
 set -e
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || echo 'coppad: warning: systemctl daemon-reload failed' >&2
+fi
 if [ "$1" = purge ]; then
     if [ -e /etc/coppa/.package-token ]; then
         rm -f /etc/coppa/setup-token /etc/coppa/.package-token
@@ -8,6 +11,9 @@ if [ "$1" = purge ]; then
     # rmdir only removes empty directories: a non-empty /etc/coppa holds an
     # admin-owned config and must stay. Say so instead of hiding it.
     rmdir /etc/coppa /var/lib/coppa-appliance 2>/dev/null || echo 'coppad: note: kept a Coppa directory that is not empty' >&2
-    if [ -x /usr/bin/deb-systemd-helper ]; then deb-systemd-helper purge coppad.service >/dev/null || echo 'coppad: warning: deb-systemd-helper purge failed' >&2; fi
+    if [ -x /usr/bin/deb-systemd-helper ]; then
+        deb-systemd-helper purge coppad.service >/dev/null || echo 'coppad: warning: deb-systemd-helper purge failed' >&2
+        deb-systemd-helper unmask coppad.service >/dev/null || echo 'coppad: warning: deb-systemd-helper unmask failed' >&2
+    fi
 fi
 exit 0

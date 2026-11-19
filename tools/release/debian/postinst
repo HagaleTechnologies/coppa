@@ -11,7 +11,9 @@ done
 # EACCES as a config it cannot inspect and exits before serving setup. The
 # directory stays root-owned and unlistable; only the token file inside is
 # secret and it remains root-only at mode 0600.
-install -d -o root -g root -m 0711 /etc/coppa
+# Create the directory only when it is missing, so an upgrade never resets
+# an administrator's ownership or mode on it.
+if [ ! -d /etc/coppa ]; then install -d -o root -g root -m 0711 /etc/coppa; fi
 if [ ! -e /etc/coppa/setup-token ]; then
     umask 077
     token=$(mktemp /etc/coppa/.setup-token.XXXXXX)
@@ -31,8 +33,14 @@ fi
 # and start the unit, or a fresh install can end disabled and stopped.
 if [ -x /usr/bin/deb-systemd-helper ]; then
     deb-systemd-helper unmask coppad.service >/dev/null || echo 'coppad: warning: deb-systemd-helper unmask failed' >&2
-    if [ -z "$2" ]; then deb-systemd-helper enable coppad.service >/dev/null || echo 'coppad: warning: deb-systemd-helper enable failed' >&2; fi
-    deb-systemd-helper update-state coppad.service >/dev/null || echo 'coppad: warning: deb-systemd-helper update-state failed' >&2
+    # was-enabled is true on a first install and remembers an administrator's
+    # `systemctl disable` across upgrades and reinstalls (the dh_installsystemd
+    # pattern), so only a unit that was never disabled is (re-)enabled.
+    if deb-systemd-helper --quiet was-enabled coppad.service; then
+        deb-systemd-helper enable coppad.service >/dev/null || echo 'coppad: warning: deb-systemd-helper enable failed' >&2
+    else
+        deb-systemd-helper update-state coppad.service >/dev/null || echo 'coppad: warning: deb-systemd-helper update-state failed' >&2
+    fi
 fi
 if [ -d /run/systemd/system ] && [ -x /usr/bin/deb-systemd-invoke ]; then
     systemctl daemon-reload

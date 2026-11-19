@@ -598,6 +598,7 @@ case "$(basename "$0")" in
   install) for arg do last=$arg; done; mkdir -p "$last" ;;
   systemctl) if [ "$1" = is-active ] || [ "$1" = is-enabled ]; then [ "$COPPA_TEST_DISABLED" != 1 ]; exit $?; fi ;;
   deb-systemd-invoke) [ "$COPPA_TEST_DENY_START" = 1 ] && exit 1 ;;
+  deb-systemd-helper) if [ "$1" = --quiet ] && [ "$2" = was-enabled ]; then [ "$COPPA_TEST_DISABLED" != 1 ]; exit $?; fi ;;
 esac
 exit 0
 """
@@ -682,6 +683,28 @@ exit 0
         # not fail the package configuration.
         _, commands = self.sandbox_script("postinst", "configure", deny_start=True)
         self.assertIn("deb-systemd-invoke start coppad.service", commands)
+
+    def test_deb_upgrade_keeps_admin_directory_and_disabled_unit(self) -> None:
+        # An upgrade must not reset an administrator's choices: the existing
+        # /etc/coppa mode stays as set, and a unit the administrator disabled
+        # is only state-tracked, never re-enabled or started.
+        root, _ = self.sandbox_script("postinst", "configure")
+        directory = root / "etc/coppa"
+        directory.chmod(0o750)
+        _, upgrade = self.sandbox_script("postinst", "configure", "0.16.0", disabled=True)
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o750)
+        self.assertNotIn("install -d", upgrade)
+        self.assertNotIn("deb-systemd-helper enable", upgrade)
+        self.assertIn("deb-systemd-helper update-state coppad.service", upgrade)
+        self.assertNotIn("deb-systemd-invoke", upgrade)
+        self.assertNotIn("Coppa first run", upgrade)
+
+    def test_deb_remove_reloads_and_purge_unmasks(self) -> None:
+        _, removed = self.sandbox_script("postrm", "remove")
+        self.assertIn("systemctl daemon-reload", removed)
+        _, purged = self.sandbox_script("postrm", "purge")
+        self.assertIn("deb-systemd-helper purge coppad.service", purged)
+        self.assertIn("deb-systemd-helper unmask coppad.service", purged)
 
     def test_deb_build_step_pins_the_commit_epoch(self) -> None:
         # Without SOURCE_DATE_EPOCH the Debian build falls back to the wall
