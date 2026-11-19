@@ -1,5 +1,16 @@
 #!/bin/sh
 set -e
+if [ "$1" = abort-upgrade ] || [ "$1" = abort-remove ] || [ "$1" = abort-deconfigure ]; then
+    # dpkg is unwinding a failed operation. Restore a unit stopped by prerm
+    # while leaving an administrator-disabled unit down.
+    if [ -d /run/systemd/system ] && [ -x /usr/bin/deb-systemd-invoke ]; then
+        systemctl daemon-reload || echo 'coppad: warning: systemctl daemon-reload failed' >&2
+        if systemctl is-enabled --quiet coppad.service; then
+            deb-systemd-invoke start coppad.service || echo 'coppad: warning: deb-systemd-invoke start failed' >&2
+        fi
+    fi
+    exit 0
+fi
 if [ "$1" != configure ]; then exit 0; fi
 if ! getent group coppa >/dev/null; then addgroup --system coppa; fi
 if ! id coppa >/dev/null 2>&1; then adduser --system --ingroup coppa --home /var/lib/coppa-appliance --no-create-home coppa; fi
