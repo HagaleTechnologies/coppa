@@ -59,6 +59,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # COP-140: mDNS responder for coppad.local; pure Rust, no system daemon.
 mdns-sd = { version = "0.21", optional = true }
+axum = { version = "0.8", optional = true }
+serde_path_to_error = { version = "0.1", optional = true }
 
 [dev-dependencies]
 # COP-140: the round-trip test browses and resolves with the same crate.
@@ -78,7 +80,7 @@ tokio = { workspace = true, features = ["test-util"] }
 [features]
 default = []
 cpal-backend = ["coppa-audio/cpal-backend"]
-websocket = ["coppa-host/websocket", "dep:serde_json"]
+websocket = ["coppa-host/websocket", "dep:serde_json", "dep:axum", "dep:serde_path_to_error"]
 kiss-tnc = ["coppa-host/kiss-tnc"]
 ardop = ["coppa-host/ardop"]
 serial-ptt = ["coppa-radio/serial-ptt"]

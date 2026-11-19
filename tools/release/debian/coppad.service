@@ -1,0 +1,63 @@
+# systemd unit for coppad, the Coppa modem daemon.
+#
+# Package install and recovery: docs/tutorials/debian-appliance.md
+# The package provisions the coppa account and root-only setup credential.
+
+[Unit]
+Description=Coppa digital modem daemon (coppad)
+Documentation=https://github.com/HagaleTechnologies/coppa/blob/main/docs/tutorials/debian-appliance.md
+Documentation=https://github.com/HagaleTechnologies/coppa/blob/main/docs/OPERATING.md
+After=network.target sound.target
+# Keep retrying for as long as a failure lasts (for example, an unplugged USB
+# sound card), instead of giving up after a burst of failed starts.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/coppad --appliance
+# COP-85: `systemctl reload coppad` re-reads the config file. Settings that
+# need a restart are named in the journal (docs/OPERATING.md).
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10
+# Plain-text log lines for the journal (coppad colours its output otherwise).
+Environment=NO_COLOR=1
+
+# On stop, systemd sends SIGTERM to coppad, which releases PTT and exits.
+# KillMode=process keeps systemd away from the PTT guardian
+# (coppad --ptt-guardian), which runs in this unit's cgroup. If coppad is
+# still running after TimeoutStopSec, systemd SIGKILLs coppad alone, and the
+# guardian then releases PTT itself. With the default KillMode=control-group
+# that SIGKILL would also kill the guardian. With mixed, the guardian would be
+# SIGKILLed the moment coppad exits.
+KillMode=process
+TimeoutStopSec=20
+
+User=coppa
+Group=coppa
+StateDirectory=coppa-appliance
+StateDirectoryMode=0700
+LoadCredential=setup-token:/etc/coppa/setup-token
+# The postinst script adds coppa to audio and dialout, plus gpio if it exists.
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+# Deliberately not set, because each one breaks audio or PTT:
+#   ProtectKernelTunables  makes /sys read-only, so the old sysfs GPIO PTT
+#                          form (gpio:<number>) fails
+#   PrivateDevices         hides /dev/snd, /dev/ttyUSB* and /dev/gpiochip*, so no
+#                          audio, serial or GPIO PTT
+#   ProtectClock, DeviceAllow, DevicePolicy
+#                          below systemd 252, ProtectClock alone denies every
+#                          device except the RTC
+#   DynamicUser            no fixed user to put in the audio/dialout/gpio groups
+
+[Install]
+WantedBy=multi-user.target

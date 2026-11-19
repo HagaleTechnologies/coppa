@@ -20,6 +20,8 @@ version a user pins. See docs/RELEASING.md before changing either.
 from __future__ import annotations
 
 import argparse
+import shutil
+import tempfile
 import gzip
 import hashlib
 import io
@@ -294,6 +296,69 @@ def cmd_package(args: argparse.Namespace) -> None:
     print(path)
 
 
+# ---------------------------------------------------------------- Debian candidate
+
+DEB_ARCH = {
+    "x86_64-unknown-linux-gnu": "amd64",
+    "aarch64-unknown-linux-gnu": "arm64",
+    "armv7-unknown-linux-gnueabihf": "armhf",
+}
+
+
+def cmd_deb(args: argparse.Namespace) -> None:
+    check_version_string(args.version)
+    if args.target not in DEB_ARCH:
+        raise ReleaseError("Debian packages require a Linux release target")
+    root = Path(args.repo_root)
+    binary_dir = Path(args.bin_dir)
+    notices = Path(args.notices)
+    required = [binary_dir / name for name in BINARIES] + [
+        notices, root / "LICENSE-APACHE", root / "LICENSE-MIT",
+        root / "coppad.toml.example",
+    ] + [root / "tools" / "release" / "debian" / name for name in
+         ("coppad.service", "preinst", "postinst", "prerm", "postrm")]
+    for path in required:
+        if not path.is_file():
+            raise ReleaseError(f"required Debian input missing: {path}")
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    arch = DEB_ARCH[args.target]
+    with tempfile.TemporaryDirectory(prefix="coppa-deb-") as tmp:
+        stage = Path(tmp)
+        def copy(src: Path, dest: str, mode: int) -> None:
+            path = stage / dest
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, path)
+            path.chmod(mode)
+        for name in BINARIES:
+            copy(binary_dir / name, f"usr/bin/{name}", 0o755)
+        for name in ("LICENSE-APACHE", "LICENSE-MIT"):
+            copy(root / name, f"usr/share/doc/coppa/{name}", 0o644)
+        copy(notices, "usr/share/doc/coppa/THIRD-PARTY-LICENSES.txt", 0o644)
+        copy(root / "coppad.toml.example", "usr/share/doc/coppa/coppad.toml.example", 0o644)
+        debian = root / "tools" / "release" / "debian"
+        copy(debian / "coppad.service", "lib/systemd/system/coppad.service", 0o644)
+        for name in ("preinst", "postinst", "prerm", "postrm"):
+            copy(debian / name, f"DEBIAN/{name}", 0o755)
+        control = stage / "DEBIAN/control"
+        control.write_text(
+            f"Package: coppa\nVersion: {args.version}\nArchitecture: {arch}\n"
+            "Maintainer: Coppa maintainers <maintainers@coppa.invalid>\n"
+            "Depends: libc6 (>= 2.31), libasound2t64 | libasound2, adduser, "
+            "init-system-helpers, openssl, systemd (>= 247)\n"
+            "Description: Coppa digital modem appliance\n"
+            " Coppa OFDM modem daemon and command line tools.\n", encoding="utf-8")
+        epoch = source_date_epoch()
+        for path in stage.rglob("*"):
+            os.utime(path, (epoch, epoch), follow_symlinks=False)
+        dest = out / f"coppa_{args.version}_{arch}.deb"
+        result = subprocess.run(["dpkg-deb", "--build", "--root-owner-group",
+                                 "-Zgzip", str(stage), str(dest)], capture_output=True, text=True)
+        if result.returncode:
+            raise ReleaseError(result.stderr.strip() or "dpkg-deb failed")
+    print(dest)
+
+
 # ---------------------------------------------------------------- sums
 
 
@@ -359,6 +424,15 @@ def parser() -> argparse.ArgumentParser:
     k.add_argument("--out", required=True, help="directory to write the archive into")
     k.add_argument("--repo-root", default=str(REPO_ROOT), help=argparse.SUPPRESS)
     k.set_defaults(func=cmd_package)
+
+    d = sub.add_parser("deb", help="build a Debian package candidate")
+    d.add_argument("--version", required=True)
+    d.add_argument("--target", required=True)
+    d.add_argument("--bin-dir", required=True)
+    d.add_argument("--notices", required=True)
+    d.add_argument("--out", required=True)
+    d.add_argument("--repo-root", default=str(REPO_ROOT), help=argparse.SUPPRESS)
+    d.set_defaults(func=cmd_deb)
 
     s = sub.add_parser("sums", help="write SHA256SUMS for the archives in DIR")
     s.add_argument("dir")

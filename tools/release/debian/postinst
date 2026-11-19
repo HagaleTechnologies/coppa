@@ -1,0 +1,41 @@
+#!/bin/sh
+set -e
+if [ "$1" != configure ]; then exit 0; fi
+if ! getent group coppa >/dev/null; then addgroup --system coppa; fi
+if ! id coppa >/dev/null 2>&1; then adduser --system --ingroup coppa --home /var/lib/coppa-appliance --no-create-home coppa; fi
+for group in audio dialout gpio; do
+    if getent group "$group" >/dev/null; then adduser coppa "$group"; fi
+done
+install -d -o root -g root -m 0700 /etc/coppa
+new_token=0
+if [ ! -e /etc/coppa/setup-token ]; then
+    umask 077
+    token=$(mktemp /etc/coppa/.setup-token.XXXXXX)
+    openssl rand -hex 16 > "$token"
+    chmod 0600 "$token"
+    if [ ! -e /etc/coppa/setup-token ]; then
+        mv -n "$token" /etc/coppa/setup-token
+        : > /etc/coppa/.package-token
+        chmod 0600 /etc/coppa/.package-token
+        new_token=1
+    fi
+    rm -f "$token"
+fi
+if [ -x /usr/bin/deb-systemd-helper ]; then
+    deb-systemd-helper unmask coppad.service >/dev/null || true
+    if [ -z "$2" ] && [ "$new_token" = 1 ]; then deb-systemd-helper enable coppad.service >/dev/null || true; fi
+    deb-systemd-helper update-state coppad.service >/dev/null || true
+fi
+if [ -d /run/systemd/system ] && [ -x /usr/bin/deb-systemd-invoke ]; then
+    systemctl daemon-reload
+    if [ -z "$2" ] && [ "$new_token" = 1 ]; then
+        deb-systemd-invoke start coppad.service || true
+    elif systemctl is-active --quiet coppad.service && systemctl is-enabled --quiet coppad.service; then
+        deb-systemd-invoke restart coppad.service || true
+    fi
+fi
+if [ -z "$2" ] && [ "$new_token" = 1 ]; then
+    echo 'Coppa first run: open http://127.0.0.1:8401/setup'
+    echo 'Read the access token with sudo cat /etc/coppa/setup-token.'
+fi
+exit 0

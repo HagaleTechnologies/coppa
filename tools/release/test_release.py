@@ -548,3 +548,148 @@ def run_blocks(lines: list[str]) -> list[tuple[int, str]]:
 
 if __name__ == "__main__":
     unittest.main()
+
+class DebianCandidate(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        for name in release.BINARIES:
+            (self.bin / name).write_bytes(b"#!/bin/sh\nexit 0\n")
+        self.notices = self.tmp / "notices.txt"
+        self.notices.write_text("Test notice\n")
+
+    def package(self, target: str):
+        return run("deb", "--version", "0.17.0", "--target", target,
+                   "--bin-dir", str(self.bin), "--notices", str(self.notices),
+                   "--out", str(self.tmp / "out"))
+
+    def test_deb_payload_and_metadata(self) -> None:
+        for target, arch in release.DEB_ARCH.items():
+            with self.subTest(arch=arch):
+                result = self.package(target)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                package = self.tmp / "out" / f"coppa_0.17.0_{arch}.deb"
+                metadata = subprocess.check_output(["dpkg-deb", "-f", str(package)], text=True)
+                self.assertIn(f"Architecture: {arch}", metadata)
+                self.assertIn("libasound2t64 | libasound2", metadata)
+                contents = subprocess.check_output(["dpkg-deb", "-c", str(package)], text=True)
+                for name in ("usr/bin/coppa", "usr/bin/coppad", "lib/systemd/system/coppad.service",
+                             "LICENSE-MIT", "coppad.toml.example"):
+                    self.assertIn(name, contents)
+                self.assertIn("-rwxr-xr-x", contents)
+
+    def sandbox_script(self, name: str, *args: str, disabled: bool = False):
+        root = self.tmp / "sandbox"
+        etc = root / "etc/coppa"
+        state = root / "state"
+        systemd = root / "run/systemd/system"
+        systemd.mkdir(parents=True, exist_ok=True)
+        shims = root / "shims"
+        shims.mkdir(exist_ok=True)
+        log = root / "commands.log"
+        shim = """#!/bin/sh
+printf '%s %s\n' "$(basename "$0")" "$*" >> "$COPPA_TEST_LOG"
+case "$(basename "$0")" in
+  getent) [ "$2" != coppa ] && [ "$2" != gpio ]; exit $? ;;
+  id) exit 1 ;;
+  install) for arg do last=$arg; done; mkdir -p "$last" ;;
+  systemctl) if [ "$1" = is-active ] || [ "$1" = is-enabled ]; then [ "$COPPA_TEST_DISABLED" != 1 ]; exit $?; fi ;;
+esac
+exit 0
+"""
+        for command in ("getent", "id", "addgroup", "adduser", "install", "systemctl",
+                        "deb-systemd-helper", "deb-systemd-invoke"):
+            path = shims / command
+            path.write_text(shim)
+            path.chmod(0o755)
+        before = log.read_text() if log.exists() else ""
+        source = (REPO_ROOT / "tools/release/debian" / name).read_text()
+        source = source.replace("/etc/coppa", str(etc))
+        source = source.replace("/var/lib/coppa-appliance", str(state))
+        source = source.replace("/run/systemd/system", str(systemd))
+        source = source.replace("/usr/bin/deb-systemd-helper", str(shims / "deb-systemd-helper"))
+        source = source.replace("/usr/bin/deb-systemd-invoke", str(shims / "deb-systemd-invoke"))
+        script = root / name
+        script.write_text(source)
+        env = {**os.environ, "PATH": str(shims) + os.pathsep + os.environ["PATH"],
+               "COPPA_TEST_LOG": str(log), "COPPA_TEST_DISABLED": "1" if disabled else "0"}
+        result = subprocess.run(["sh", str(script), *args], env=env, text=True,
+                                capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return root, (log.read_text() if log.exists() else "")[len(before):]
+
+    def test_deb_first_configure(self) -> None:
+        scripts = REPO_ROOT / "tools/release/debian"
+        postinst = (scripts / "postinst").read_text()
+        self.assertIn("openssl rand -hex 16", postinst)
+        self.assertIn("deb-systemd-helper enable", postinst)
+        self.assertIn("deb-systemd-invoke start", postinst)
+        self.assertIn("if [ ! -e /etc/coppa/setup-token ]", postinst)
+        self.assertIn("LoadCredential=setup-token", (scripts / "coppad.service").read_text())
+        root, commands = self.sandbox_script("postinst", "configure")
+        token = root / "etc/coppa/setup-token"
+        self.assertEqual(len(token.read_text().strip()), 32)
+        self.assertEqual(token.stat().st_mode & 0o777, 0o600)
+        self.assertIn("deb-systemd-helper enable", commands)
+        self.assertIn("deb-systemd-invoke start", commands)
+        original = token.read_text()
+        _, retry = self.sandbox_script("postinst", "configure")
+        self.assertEqual(token.read_text(), original)
+        self.assertNotIn("deb-systemd-helper enable", retry)
+
+    def test_deb_upgrade_remove_and_purge(self) -> None:
+        scripts = REPO_ROOT / "tools/release/debian"
+        postinst = (scripts / "postinst").read_text()
+        self.assertIn("systemctl is-active --quiet", postinst)
+        self.assertIn("systemctl is-enabled --quiet", postinst)
+        self.assertIn("deb-systemd-invoke restart", postinst)
+        self.assertIn("[ \"$1\" = purge ]", (scripts / "postrm").read_text())
+        self.assertNotIn("/etc/coppa/coppad.toml", (scripts / "postrm").read_text())
+        root, _ = self.sandbox_script("postinst", "configure")
+        managed = root / "state/coppad.toml"
+        managed.parent.mkdir(exist_ok=True)
+        managed.write_text("station data")
+        admin = root / "etc/coppa/coppad.toml"
+        admin.write_text("admin data")
+        _, stopped = self.sandbox_script("postinst", "configure", "0.16.0", disabled=True)
+        self.assertNotIn("deb-systemd-invoke restart", stopped)
+        _, running = self.sandbox_script("postinst", "configure", "0.16.0")
+        self.assertIn("deb-systemd-invoke restart", running)
+        self.sandbox_script("prerm", "remove")
+        self.sandbox_script("postrm", "remove")
+        self.assertTrue(managed.exists())
+        self.assertTrue((root / "etc/coppa/setup-token").exists())
+        self.sandbox_script("postrm", "purge")
+        self.assertFalse(managed.exists())
+        self.assertFalse((root / "etc/coppa/setup-token").exists())
+        self.assertTrue(admin.exists())
+
+    def test_deb_rehearsal_artifacts_are_separate_from_publish(self) -> None:
+        workflow = WORKFLOW.read_text()
+        self.assertIn("debs-${{ matrix.deb_arch }}", workflow)
+        self.assertIn("name: dist-${{ matrix.target }}", workflow)
+        self.assertIn("Exactly the five archives", workflow)
+
+    def test_deb_preserves_preexisting_token_on_purge(self) -> None:
+        root = self.tmp / "sandbox"
+        directory = root / "etc/coppa"
+        directory.mkdir(parents=True)
+        token = directory / "setup-token"
+        token.write_text("operator-owned-token")
+        self.sandbox_script("postinst", "configure")
+        self.sandbox_script("postrm", "purge")
+        self.assertEqual(token.read_text(), "operator-owned-token")
+
+    def test_deb_rejects_manual_unit_before_install(self) -> None:
+        root = self.tmp / "manual-unit"
+        root.mkdir()
+        unit = root / "coppad.service"
+        unit.symlink_to("/tmp/operator-coppad.service")
+        source = (REPO_ROOT / "tools/release/debian/preinst").read_text()
+        script = self.tmp / "preinst"
+        script.write_text(source.replace("/etc/systemd/system", str(root)))
+        result = subprocess.run(["sh", str(script), "install"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("manual coppad.service", result.stderr)

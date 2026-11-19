@@ -163,3 +163,12 @@ the tagged commit, so the real control over who can publish is who can push a
   the repository owner.
 - **Immutable releases**, so a published release's assets and tag cannot be
   changed afterwards.
+
+## Debian appliance candidates
+
+The Linux release matrix also builds `coppa_<version>_<arch>.deb` for amd64,
+arm64 and armhf. Each candidate stays in its own `debs-<arch>` workflow artifact,
+separate from the five public archives. The package has a first-run service and
+browser wizard; see [the Debian appliance guide](tutorials/debian-appliance.md).
+Publication of the candidates needs a maintainer decision and a systemd install
+rehearsal on a disposable host.

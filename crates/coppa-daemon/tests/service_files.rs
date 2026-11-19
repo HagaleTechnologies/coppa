@@ -528,3 +528,22 @@ fn contrib_readme_installs_the_launchd_agent_by_its_label() {
         "contrib/README.md must point at the plist's log file ({log})"
     );
 }
+
+#[test]
+fn appliance_guide_matches_packaged_unit() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let unit = std::fs::read_to_string(root.join("tools/release/debian/coppad.service")).unwrap();
+    let guide = std::fs::read_to_string(root.join("docs/tutorials/debian-appliance.md")).unwrap();
+    assert!(unit.contains("ExecStart=/usr/bin/coppad --appliance"));
+    assert!(unit.contains("StateDirectory=coppa-appliance"));
+    assert!(unit.contains("LoadCredential=setup-token:/etc/coppa/setup-token"));
+    for text in [
+        "apt install",
+        "ssh -NT",
+        "journalctl -u coppad.service",
+        "/var/lib/coppa-appliance/coppad.toml",
+        "/etc/coppa/setup-token",
+    ] {
+        assert!(guide.contains(text), "missing {text}");
+    }
+}
