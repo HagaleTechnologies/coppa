@@ -543,6 +543,7 @@ fn appliance_guide_matches_packaged_unit() {
         "journalctl -u coppad.service",
         "/var/lib/coppa-appliance/coppad.toml",
         "/etc/coppa/setup-token",
+        "ss -ltnp",
     ] {
         assert!(guide.contains(text), "missing {text}");
     }

@@ -219,6 +219,9 @@ jobs:
           tar -tzvf "dist/$(python3 tools/release/release.py asset-name --version "$VERSION" --target "$TARGET")"
       - name: Build Debian candidate
         run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
           python3 tools/release/release.py deb --version "$VERSION" --target "$TARGET" \
             --bin-dir "target/$TARGET/release" --notices notices/THIRD-PARTY-LICENSES.txt --out debs
           dpkg-deb -f "debs/coppa_${VERSION}_${DEB_ARCH}.deb"

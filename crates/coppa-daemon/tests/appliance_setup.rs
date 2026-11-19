@@ -111,6 +111,30 @@ fn fresh_appliance_serves_setup_without_audio() {
 }
 
 #[test]
+fn sighup_during_setup_does_not_kill_the_daemon() {
+    // The packaged unit's ExecReload sends SIGHUP. Setup mode installs no
+    // runtime reload handler, but the process must survive the signal
+    // (COP-85 parity) instead of dying on the default disposition.
+    let mut fixture = Fixture::new();
+    let signal = Command::new("kill")
+        .arg("-HUP")
+        .arg(fixture.child.id().to_string())
+        .status()
+        .expect("running kill");
+    assert!(signal.success());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        fixture.child.try_wait().unwrap().is_none(),
+        "coppad died after SIGHUP during setup"
+    );
+    let page = fixture.request(&format!(
+        "GET /setup HTTP/1.0\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        fixture.port
+    ));
+    assert!(page.starts_with("HTTP/1.0 200"), "{page}");
+}
+
+#[test]
 fn setup_requests_enforce_access_and_limits() {
     let fixture = Fixture::new();
     let denied = fixture.request(&format!(

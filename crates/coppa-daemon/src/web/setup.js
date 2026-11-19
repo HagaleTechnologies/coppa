@@ -3,6 +3,10 @@
   const $ = id => document.getElementById(id);
   let token = '';
   let inventory = {inputs: [], outputs: []};
+  // The draft frozen at review time. Save submits this, never a re-read of
+  // the live form: a device refresh that lands after the operator reviewed
+  // must not change what Save sends.
+  let reviewed = null;
   const show = name => {
     for (const id of ['unlock', 'station', 'review', 'done']) $(id).hidden = id !== name;
     $('message').textContent = '';
@@ -64,6 +68,8 @@
   $('review-next').onclick = () => {
     const data = draft();
     if (!data.callsign || !data.input_device_id || !data.output_device_id) { message('Enter a valid callsign and select an audio input and output.'); return; }
+    reviewed = data;
+    $('conflict-dashboard').hidden = true;
     const pttDetails = Object.entries(data.ptt).filter(([key]) => key !== 'method').map(([key, value]) => `${key}: ${value}`).join('\n');
     $('summary').textContent = `Callsign: ${data.callsign}\nGrid locator: ${data.grid || 'Not set'}\nAudio input: ${inventory.inputs.find(d => d.id === data.input_device_id)?.name || data.input_device_id}\nAudio output: ${inventory.outputs.find(d => d.id === data.output_device_id)?.name || data.output_device_id}\nPTT method: ${data.ptt.method}\n${pttDetails}\nBeacon interval: ${data.beacon_interval_secs ? `${data.beacon_interval_secs} seconds (automatic transmission enabled)` : 'Off'}`;
     show('review');
@@ -71,13 +77,18 @@
   $('review-back').onclick = () => show('station');
   $('save').onclick = async () => {
     message('Checking audio and saving settings…');
+    $('conflict-dashboard').hidden = true;
     try {
-      const result = await request('/api/config', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(draft())});
+      const result = await request('/api/config', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(reviewed)});
       $('dashboard').href = result.dashboard_url;
       show('done');
     } catch (e) {
+      if (e?.error === 'already_configured') {
+        message('Setup is already complete.');
+        $('conflict-dashboard').hidden = false;
+        return;
+      }
       message(e?.error === 'audio_unavailable' ? 'Could not open the selected audio devices. Check the connection and permissions, then try again.' :
-        e?.error === 'already_configured' ? 'Setup is already complete. Open dashboard.' :
         e?.error === 'invalid_settings' ? 'Check the station, PTT settings and beacon interval.' :
         'Could not save settings. Check the service log and try again.');
     }
