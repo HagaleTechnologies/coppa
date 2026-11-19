@@ -5,7 +5,9 @@ if [ "$1" = purge ]; then
         rm -f /etc/coppa/setup-token /etc/coppa/.package-token
     fi
     rm -f /var/lib/coppa-appliance/coppad.toml /var/lib/coppa-appliance/coppad.tmp.*
-    rmdir /etc/coppa /var/lib/coppa-appliance 2>/dev/null || true
-    if [ -x /usr/bin/deb-systemd-helper ]; then deb-systemd-helper purge coppad.service >/dev/null || true; fi
+    # rmdir only removes empty directories: a non-empty /etc/coppa holds an
+    # admin-owned config and must stay. Say so instead of hiding it.
+    rmdir /etc/coppa /var/lib/coppa-appliance 2>/dev/null || echo 'coppad: note: kept a Coppa directory that is not empty' >&2
+    if [ -x /usr/bin/deb-systemd-helper ]; then deb-systemd-helper purge coppad.service >/dev/null || echo 'coppad: warning: deb-systemd-helper purge failed' >&2; fi
 fi
 exit 0

@@ -59,7 +59,17 @@ async fn main() -> Result<()> {
 
     match cli.mode() {
         #[cfg(target_os = "linux")]
-        Mode::Appliance => appliance::run(cli.log_level).await,
+        Mode::Appliance => {
+            // COP-85 parity: the packaged unit's ExecReload sends SIGHUP, and
+            // setup mode must survive a reload request just like normal
+            // startup, before (and independent of) any runtime reload
+            // handler running later in this process.
+            #[cfg(unix)]
+            let _startup_hangup =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                    .context("failed to register the SIGHUP handler")?;
+            appliance::run(cli.log_level).await
+        }
         Mode::PrintDefaultConfig => print_default_config(),
         Mode::Check(source) => check_config(&source, cli.instance.as_deref()),
         Mode::Tnc => run_tnc(cli.log_level).await,

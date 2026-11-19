@@ -605,10 +605,23 @@ mod server {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .context("registering setup stop signal")?;
         let (drain_tx, drain_rx) = oneshot::channel();
-        let server = axum::serve(listener, router).with_graceful_shutdown(async move {
-            tokio::select! { _ = rx => {}, _ = terminate.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
-            let _ = drain_tx.send(());
-        }).into_future();
+        // Why the drain must carry its reason: a service stop (SIGTERM from
+        // systemd) and a completed save both end the setup listener, but only
+        // a save hands the process over to the modem. Entering the modem
+        // after a stop request would ignore the stop, so the handoff flag is
+        // set only on the save branch.
+        let handoff = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handoff_reason = handoff.clone();
+        let server = axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                tokio::select! {
+                    _ = rx => { handoff_reason.store(true, std::sync::atomic::Ordering::SeqCst); },
+                    _ = terminate.recv() => {},
+                    _ = tokio::signal::ctrl_c() => {},
+                }
+                let _ = drain_tx.send(());
+            })
+            .into_future();
         tokio::pin!(server);
         tokio::select! {
             result = &mut server => result?,
@@ -619,12 +632,36 @@ mod server {
                 }
             }
         }
-        if !path_present(&managed) {
+        if !enters_modem_after_shutdown(
+            handoff.load(std::sync::atomic::Ordering::SeqCst),
+            path_present(&managed),
+        ) {
+            tracing::info!("setup shut down without a save handoff; exiting");
             return Ok(());
         }
         let source = ConfigSource::Explicit(managed);
         let (config, _) = crate::load_config(&source, None)?;
         crate::run_daemon(config, source, None).await
+    }
+
+    /// Whether the process should enter the modem after the setup listener
+    /// drained: only a save-triggered handoff with a committed managed
+    /// config starts the modem. A stop signal (systemd stop, Ctrl-C) exits
+    /// instead, even when a racing save committed during the drain; the
+    /// committed config is picked up on the next service start.
+    fn enters_modem_after_shutdown(save_handoff: bool, managed_present: bool) -> bool {
+        save_handoff && managed_present
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn stop_request_never_enters_the_modem_even_with_a_committed_config() {
+        // A stop signal that races a save committing during the drain must
+        // still exit: the committed config is picked up on the next start.
+        assert!(!enters_modem_after_shutdown(false, true));
+        assert!(!enters_modem_after_shutdown(false, false));
+        assert!(enters_modem_after_shutdown(true, true));
+        assert!(!enters_modem_after_shutdown(true, false));
     }
 }
 

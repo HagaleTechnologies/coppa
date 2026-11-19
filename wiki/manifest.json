@@ -675,7 +675,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:b72602a5a8149ae78fdc3bbd581a91b96d5629bc76d9e45315a2ae6d85366729",
+      "hash": "sha256:9839493b50e1154fa2a064f44442d923047374f3e564e14cc855fa511d7b7509",
       "id": "release-binaries",
       "kind": "gotcha",
       "links": [

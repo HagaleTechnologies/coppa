@@ -580,7 +580,8 @@ class DebianCandidate(unittest.TestCase):
                     self.assertIn(name, contents)
                 self.assertIn("-rwxr-xr-x", contents)
 
-    def sandbox_script(self, name: str, *args: str, disabled: bool = False):
+    def sandbox_script(self, name: str, *args: str, disabled: bool = False,
+                      deny_start: bool = False):
         root = self.tmp / "sandbox"
         etc = root / "etc/coppa"
         state = root / "state"
@@ -596,6 +597,7 @@ case "$(basename "$0")" in
   id) exit 1 ;;
   install) for arg do last=$arg; done; mkdir -p "$last" ;;
   systemctl) if [ "$1" = is-active ] || [ "$1" = is-enabled ]; then [ "$COPPA_TEST_DISABLED" != 1 ]; exit $?; fi ;;
+  deb-systemd-invoke) [ "$COPPA_TEST_DENY_START" = 1 ] && exit 1 ;;
 esac
 exit 0
 """
@@ -614,7 +616,8 @@ exit 0
         script = root / name
         script.write_text(source)
         env = {**os.environ, "PATH": str(shims) + os.pathsep + os.environ["PATH"],
-               "COPPA_TEST_LOG": str(log), "COPPA_TEST_DISABLED": "1" if disabled else "0"}
+               "COPPA_TEST_LOG": str(log), "COPPA_TEST_DISABLED": "1" if disabled else "0",
+               "COPPA_TEST_DENY_START": "1" if deny_start else "0"}
         result = subprocess.run(["sh", str(script), *args], env=env, text=True,
                                 capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -632,12 +635,60 @@ exit 0
         token = root / "etc/coppa/setup-token"
         self.assertEqual(len(token.read_text().strip()), 32)
         self.assertEqual(token.stat().st_mode & 0o777, 0o600)
+        # The admin directory must stay searchable by the service account:
+        # with 0700 the daemon cannot stat the admin config and exits before
+        # serving setup, while the token itself stays root-only at 0600.
+        self.assertIn("install -d -o root -g root -m 0711", commands)
         self.assertIn("deb-systemd-helper enable", commands)
         self.assertIn("deb-systemd-invoke start", commands)
         original = token.read_text()
+        # A retry of a failed first install (still an empty previous version)
+        # must enable and start again, or the unit stays disabled and stopped.
         _, retry = self.sandbox_script("postinst", "configure")
         self.assertEqual(token.read_text(), original)
-        self.assertNotIn("deb-systemd-helper enable", retry)
+        self.assertIn("deb-systemd-helper enable", retry)
+        self.assertIn("deb-systemd-invoke start", retry)
+
+    def test_deb_first_configure_with_retained_token_still_enables(self) -> None:
+        # First configure with an operator-owned token already present: the
+        # token is preserved, and enablement/start must not depend on the
+        # package having created the token itself.
+        directory = self.tmp / "sandbox" / "etc/coppa"
+        directory.mkdir(parents=True)
+        (directory / "setup-token").write_text("operator-owned-token")
+        root, commands = self.sandbox_script("postinst", "configure")
+        self.assertEqual((root / "etc/coppa/setup-token").read_text(), "operator-owned-token")
+        self.assertIn("deb-systemd-helper enable", commands)
+        self.assertIn("deb-systemd-invoke start", commands)
+
+    def test_deb_first_configure_provisions_before_starting(self) -> None:
+        # Account, admin directory and unit enablement happen before the
+        # service is asked to start.
+        _, commands = self.sandbox_script("postinst", "configure")
+        marks = {
+            "account": commands.find("addgroup --system coppa"),
+            "admin directory": commands.find("install -d -o root -g root -m 0711"),
+            "enable": commands.find("deb-systemd-helper enable"),
+            "start": commands.find("deb-systemd-invoke start"),
+        }
+        for name, position in marks.items():
+            self.assertGreaterEqual(position, 0, f"missing {name} call")
+        self.assertLess(marks["account"], marks["admin directory"])
+        self.assertLess(marks["admin directory"], marks["enable"])
+        self.assertLess(marks["enable"], marks["start"])
+
+    def test_deb_service_policy_denial_does_not_fail_configure(self) -> None:
+        # deb-systemd-invoke is policy-aware: a denied start must be logged,
+        # not fail the package configuration.
+        _, commands = self.sandbox_script("postinst", "configure", deny_start=True)
+        self.assertIn("deb-systemd-invoke start coppad.service", commands)
+
+    def test_deb_build_step_pins_the_commit_epoch(self) -> None:
+        # Without SOURCE_DATE_EPOCH the Debian build falls back to the wall
+        # clock and candidate digests vary between otherwise identical builds.
+        workflow = WORKFLOW.read_text()
+        step = workflow.split("Build Debian candidate", 1)[1].split("- name:", 1)[0]
+        self.assertIn("SOURCE_DATE_EPOCH", step)
 
     def test_deb_upgrade_remove_and_purge(self) -> None:
         scripts = REPO_ROOT / "tools/release/debian"
