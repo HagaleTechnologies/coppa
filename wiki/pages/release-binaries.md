@@ -46,3 +46,9 @@ The runbook, recovery steps and how to bump a pinned tool are in
 [docs/RELEASING.md](../../docs/RELEASING.md). The decisions and their evidence
 are in
 [2026-11-09-release-binaries-and-versioning.md](../../docs/DECISIONS/2026-11-09-release-binaries-and-versioning.md).
+
+COP-123 adds separate Debian candidate artifacts to the Linux release matrix.
+The package-owned unit runs `coppad --appliance` and waits for setup before
+opening audio. The operator flow and recovery paths are in
+[the Debian appliance guide](../../docs/tutorials/debian-appliance.md).
+A real systemd install and physical radio remain outside the phase-container tests.

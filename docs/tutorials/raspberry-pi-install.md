@@ -536,3 +536,6 @@ code and systemd print, but have not been reproduced on a Pi.
 Whatever the PTT method, turn on your rig's TX time-out timer, set a little
 longer than `max_tx_duration_s`, as [OPERATING.md](../OPERATING.md) explains.
 It is the only protection that works when nothing else can.
+
+For the candidate Debian package and first-run browser setup, see
+[Install Coppa as a Debian appliance](debian-appliance.md).

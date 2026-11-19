@@ -36,6 +36,10 @@ Explicit config paths must exist. --check does not verify hardware or runtime se
     after_help = AFTER_HELP
 )]
 pub struct Cli {
+    /// Run the package's first-run setup flow (internal service entry point).
+    #[cfg(target_os = "linux")]
+    #[arg(long, hide = true, conflicts_with_all = ["config_path", "config", "check", "print_default_config", "tnc", "instance", "ptt_guardian"])]
+    pub appliance: bool,
     /// Configuration file; legacy alternative to --config
     #[arg(value_name = "CONFIG", conflicts_with = "config")]
     pub config_path: Option<PathBuf>,
@@ -131,6 +135,8 @@ pub enum ConfigSource {
 /// What this invocation does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
+    #[cfg(target_os = "linux")]
+    Appliance,
     /// Print the built-in configuration as TOML and exit.
     PrintDefaultConfig,
     /// Read and deserialize the configuration, report the result and exit.
@@ -159,6 +165,10 @@ impl Cli {
 
     /// Select the mode. Clap has already rejected conflicting combinations.
     pub fn mode(&self) -> Mode {
+        #[cfg(target_os = "linux")]
+        if self.appliance {
+            return Mode::Appliance;
+        }
         if let Some(ptt_method) = &self.ptt_guardian {
             Mode::PttGuardian {
                 ptt_method: ptt_method.clone(),

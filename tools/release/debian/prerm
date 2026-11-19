@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+if [ "$1" = remove ] && [ -d /run/systemd/system ] && [ -x /usr/bin/deb-systemd-invoke ]; then
+    # A policy-denied or failing stop is logged; removal must not be
+    # blocked by it (Debian policy, ch-maintainerscripts).
+    deb-systemd-invoke stop coppad.service || echo 'coppad: warning: deb-systemd-invoke stop failed' >&2
+fi
+exit 0

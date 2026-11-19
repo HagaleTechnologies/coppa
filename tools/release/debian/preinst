@@ -1,0 +1,7 @@
+#!/bin/sh
+set -e
+if [ "$1" = install ] && { [ -e /etc/systemd/system/coppad.service ] || [ -L /etc/systemd/system/coppad.service ]; }; then
+    echo 'A manual coppad.service exists. Stop it, back up its config, and remove the manual unit before installing this package.' >&2
+    exit 1
+fi
+exit 0

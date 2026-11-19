@@ -1,0 +1,59 @@
+#!/bin/sh
+set -e
+if [ "$1" != configure ]; then exit 0; fi
+if ! getent group coppa >/dev/null; then addgroup --system coppa; fi
+if ! id coppa >/dev/null 2>&1; then adduser --system --ingroup coppa --home /var/lib/coppa-appliance --no-create-home coppa; fi
+for group in audio dialout gpio; do
+    if getent group "$group" >/dev/null; then adduser coppa "$group"; fi
+done
+# The daemon runs as coppa and must be able to search /etc/coppa to tell an
+# absent admin config from a present one; without search permission it reads
+# EACCES as a config it cannot inspect and exits before serving setup. The
+# directory stays root-owned and unlistable; only the token file inside is
+# secret and it remains root-only at mode 0600.
+# Create the directory only when it is missing, so an upgrade never resets
+# an administrator's ownership or mode on it.
+if [ ! -d /etc/coppa ]; then install -d -o root -g root -m 0711 /etc/coppa; fi
+if [ ! -e /etc/coppa/setup-token ]; then
+    umask 077
+    token=$(mktemp /etc/coppa/.setup-token.XXXXXX)
+    openssl rand -hex 16 > "$token"
+    chmod 0600 "$token"
+    if [ ! -e /etc/coppa/setup-token ]; then
+        mv -n "$token" /etc/coppa/setup-token
+        : > /etc/coppa/.package-token
+        chmod 0600 /etc/coppa/.package-token
+    fi
+    rm -f "$token"
+fi
+# Enablement and the first-run banner track the dpkg installation state (an
+# empty "$2" means first configure, including a retry of a failed first
+# install), never token creation: a configure with a retained token (an
+# operator-owned token, or a retry after token creation) must still enable
+# and start the unit, or a fresh install can end disabled and stopped.
+if [ -x /usr/bin/deb-systemd-helper ]; then
+    deb-systemd-helper unmask coppad.service >/dev/null || echo 'coppad: warning: deb-systemd-helper unmask failed' >&2
+    # was-enabled is true on a first install and remembers an administrator's
+    # `systemctl disable` across upgrades and reinstalls (the dh_installsystemd
+    # pattern), so only a unit that was never disabled is (re-)enabled.
+    if deb-systemd-helper --quiet was-enabled coppad.service; then
+        deb-systemd-helper enable coppad.service >/dev/null || echo 'coppad: warning: deb-systemd-helper enable failed' >&2
+    else
+        deb-systemd-helper update-state coppad.service >/dev/null || echo 'coppad: warning: deb-systemd-helper update-state failed' >&2
+    fi
+fi
+if [ -d /run/systemd/system ] && [ -x /usr/bin/deb-systemd-invoke ]; then
+    systemctl daemon-reload
+    if [ -z "$2" ]; then
+        # deb-systemd-invoke is policy-aware: a denied start is logged and
+        # must not fail the install (Debian policy, ch-maintainerscripts).
+        deb-systemd-invoke start coppad.service || echo 'coppad: warning: deb-systemd-invoke start failed' >&2
+    elif systemctl is-active --quiet coppad.service && systemctl is-enabled --quiet coppad.service; then
+        deb-systemd-invoke restart coppad.service || echo 'coppad: warning: deb-systemd-invoke restart failed' >&2
+    fi
+fi
+if [ -z "$2" ]; then
+    echo 'Coppa first run: open http://127.0.0.1:8401/setup'
+    echo 'Read the access token with sudo cat /etc/coppa/setup-token.'
+fi
+exit 0
