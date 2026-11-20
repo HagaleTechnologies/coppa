@@ -32,11 +32,23 @@ mod server {
     struct App {
         token: Arc<str>,
         config: PathBuf,
-        host: String,
-        origin: String,
+        authorities: Arc<[(String, String); 2]>,
         saved: Arc<Mutex<Option<oneshot::Sender<()>>>>,
         save_lock: Arc<Mutex<()>>,
         requests: Arc<Semaphore>,
+    }
+
+    /// The fixed loopback names setup answers on, as exact host-and-port
+    /// `Host` values paired with the HTTP origin each implies. Never a
+    /// wildcard: the exact match is the DNS-rebinding defense.
+    fn setup_authorities(port: u16) -> [(String, String); 2] {
+        [("127.0.0.1", port), ("localhost", port)]
+            .map(|(name, port)| (format!("{name}:{port}"), format!("http://{name}:{port}")))
+    }
+
+    fn matched_authority<'a>(app: &'a App, headers: &HeaderMap) -> Option<&'a (String, String)> {
+        let host = headers.get(header::HOST)?.to_str().ok()?;
+        app.authorities.iter().find(|(allowed, _)| allowed == host)
     }
 
     #[derive(Deserialize)]
@@ -137,13 +149,14 @@ mod server {
         method: Method,
         uri: &Uri,
     ) -> Result<(), Box<Response>> {
-        if uri.query().is_some()
-            || headers.get(header::HOST).and_then(|v| v.to_str().ok()) != Some(&app.host)
-        {
+        let Some((_, expected_origin)) = matched_authority(app, headers) else {
+            return Err(Box::new(reject(StatusCode::FORBIDDEN, "forbidden")));
+        };
+        if uri.query().is_some() {
             return Err(Box::new(reject(StatusCode::FORBIDDEN, "forbidden")));
         }
         if let Some(origin) = headers.get(header::ORIGIN) {
-            if origin.to_str().ok() != Some(&app.origin) {
+            if origin.to_str().ok() != Some(expected_origin.as_str()) {
                 return Err(Box::new(reject(StatusCode::FORBIDDEN, "forbidden")));
             }
         } else if method == Method::PUT {
@@ -161,18 +174,14 @@ mod server {
     }
 
     async fn page(State(app): State<App>, headers: HeaderMap, uri: Uri) -> Response {
-        if headers.get(header::HOST).and_then(|v| v.to_str().ok()) != Some(&app.host)
-            || uri.query().is_some()
-        {
+        if matched_authority(&app, &headers).is_none() || uri.query().is_some() {
             return secure(reject(StatusCode::FORBIDDEN, "forbidden"));
         }
         secure(Html(include_str!("web/setup.html")).into_response())
     }
 
     async fn script(State(app): State<App>, headers: HeaderMap, uri: Uri) -> Response {
-        if headers.get(header::HOST).and_then(|v| v.to_str().ok()) != Some(&app.host)
-            || uri.query().is_some()
-        {
+        if matched_authority(&app, &headers).is_none() || uri.query().is_some() {
             return secure(reject(StatusCode::FORBIDDEN, "forbidden"));
         }
         let mut response = include_str!("web/setup.js").into_response();
@@ -587,8 +596,7 @@ mod server {
         let app = App {
             token: Arc::from(token),
             config: managed.clone(),
-            host: format!("127.0.0.1:{}", addr.port()),
-            origin: format!("http://127.0.0.1:{}", addr.port()),
+            authorities: Arc::new(setup_authorities(addr.port())),
             saved: Arc::new(Mutex::new(Some(tx))),
             save_lock: Arc::new(Mutex::new(())),
             requests: Arc::new(Semaphore::new(8)),

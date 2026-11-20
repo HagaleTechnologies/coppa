@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-19T12:30:55Z",
-  "head_commit": "1819159",
+  "generated_at": "2026-11-19T22:52:38Z",
+  "head_commit": "9cddafc",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -490,6 +490,26 @@
       "visibility": "public"
     },
     {
+      "hash": "sha256:daf56c38b5e5e7f45b39f82702424b53be9a232edfc65f32b86c0d16a50680d0",
+      "id": "daemon-test-quiet-windows",
+      "kind": "gotcha",
+      "links": [
+        "daemon-test-ports",
+        "paused-clock-timers"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/daemon-test-quiet-windows.md",
+      "sources": [
+        "crates/coppa-daemon/src/event_loop.rs"
+      ],
+      "status": "current",
+      "title": "What will bite you when a daemon test waits on a quiet window?",
+      "verified_commit": "701a6e4",
+      "verified_date": "2026-11-19",
+      "visibility": "public"
+    },
+    {
       "hash": "sha256:f373db613b781836501d11ab1b07404446b3db098eeb914982bb99c1fef99b9a",
       "id": "full-ci-tests",
       "kind": "gotcha",
@@ -560,7 +580,11 @@
       "visibility": "public"
     },
     {
+<<<<<<< HEAD
       "hash": "sha256:ce537161bf534c69a699eb2785de1bf83ae25d327f9d4f62678a3f8394c919a8",
+=======
+      "hash": "sha256:7d7eca460a826a73dfb83f46a4e2ffa90d2b5f035b07bc7c45e11a5c8460c6a7",
+>>>>>>> 754cf45b2d1c4a71649d89a160857db679ae71e7
       "id": "low-rate-floor",
       "kind": "gotcha",
       "links": [
@@ -573,6 +597,7 @@
       "sources": [
         "BENCHMARKS.md",
         "docs/LIMITATIONS.md",
+        "results/cop-190/connect/metadata.md",
         "crates/coppa-bench/src/floor_candidate.rs",
         "crates/coppa-bench/src/floor_sweep.rs",
         "crates/coppa-protocol/src/modem/floor.rs",

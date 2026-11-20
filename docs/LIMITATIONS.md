@@ -356,14 +356,21 @@ update. **UPDATE (2026-11-16, COP-183): re-measured on main; one controller cand
   protected-mode bound covers two slow HF ACKs, but does not reserve a third
   frame for a peer ID. A lost first ACK during that prepend can cause a retry.
 
-## COP-169 robust low-rate floor (session integration open)
+## COP-169 robust low-rate floor
+
+<a id="cop-169-robust-low-rate-floor-session-integration-open"></a>
 
 - The OFDM ladder still cannot serve the floor's job: below about +3 dB
   (3 kHz reference) on AWGN, `hf_narrow` level 1 loses nearly every frame,
-  and the failures are `SyncFailed`. A session cannot connect at −6 dB or
-  hold through a fade to −6 dB. The COP-169 bars (50% FER crossing at or
-  below −8 dB AWGN and −2 dB Watterson Poor, connect within 60 s at −6 dB
-  in 9 of 10 trials, survive a 20 → −6 → 20 dB Poor ramp) are unmet.
+  and the failures are `SyncFailed`. The COP-169 acceptance bars are the
+  50% FER crossing at or below −8 dB AWGN and −2 dB Watterson Poor (with
+  the sync-share clause), a connect within 60 s at −6 dB in 9 of 10
+  trials, and surviving a 20 → −6 → 20 dB Poor ramp. At −6 dB AWGN, Link
+  and coppad each connected in 10 of 10 trials within 60 seconds with
+  VK3ABC calling W1AW, meeting the 9-of-10 connect bar. Link recorded 0 of
+  10 in the reverse direction. The 20 → −6 → 20 dB Watterson Poor ramp
+  acceptance remains unmet, and the sweep sync-share clause still fails
+  (see the COP-191 results below).
 - What exists now is the production floor's physical layer: air-protocol
   version 2 is allocated (SPEC §0.3.3, ADR-014), the 16-FSK modulation
   lives in `coppa-codec::floor`, the framing plus a separately detected
@@ -405,8 +412,9 @@ update. **UPDATE (2026-11-16, COP-183): re-measured on main; one controller cand
   handshake can outlast the flat 30 s handshake timeout. Link records 0/10 in the
   reversed direction (lexically higher caller). Production development sweeps now
   cover batch and streaming reception on AWGN and Poor. COP-191 records
-  final-seed 200-trial sweeps and adds `--waveform floor`; the Poor ramp,
-  `connect` and `ramp` drivers still need the session controller.
+  final-seed 200-trial sweeps and adds `--waveform floor`; the `connect` and
+  `ramp` sweep drivers remain unimplemented, and the Poor ramp acceptance
+  bar remains unmet.
 - What exists for judgement is the measurement contract the floor will be
   judged by: `coppa_bench::floor_sweep` (nine-point −12…+4 dB grid, locked
   seed bases `0x00C0FFEE`, `0x16900000` and `0x16910000`, conservative
@@ -422,7 +430,11 @@ update. **UPDATE (2026-11-16, COP-183): re-measured on main; one controller cand
   with noise set from a fixed clean power and an SNR schedule (including the
   COP-169 ramp). Its fading is generated at 100 Hz and linearly interpolated,
   and its streaming Hilbert FIR adds a fixed 511-sample (10.6 ms) latency on
-  faded paths. No endpoint (Link or daemon) drives it yet.
+  faded paths. Two paired trial harnesses drive it: `run_link_trial` in
+  `crates/coppa-engine/tests/floor_session.rs` and the daemon's `FloorStation`
+  and `move_block` in `crates/coppa-daemon/src/event_loop.rs`. Each harness
+  uses a separate `PersistentChannel` per direction and passes audio through
+  it on every block.
 - The 16-FSK design now exists twice: COP-190 moved it into the production
   crates, while the measurement-only bench copy (`floor_candidate.rs`)
   retains its historical measurements. Link uses the production floor for
@@ -440,7 +452,10 @@ update. **UPDATE (2026-11-16, COP-183): re-measured on main; one controller cand
 - The `floor_mode sweep` diagnostic accepts `--rx batch|streaming|both` and
   measures the production batch (`CoppaTransceiver::receive`) and streaming
   (`StreamingReceiver`) receive paths over the same grid, seeds and channel
-  realizations; `connect` and `ramp` remain unimplemented (COP-191).
+  realizations; it is a receiver diagnostic, and its `connect` and `ramp`
+  subcommands remain unimplemented (COP-191). Session-level connect evidence
+  comes from the paired Link and coppad trials
+  (`results/cop-190/connect/`), not from this sweep.
 - COP-189's separate continuous experimental receiver
   (`floor_candidate --streaming`) retains at most 480,000 samples, attempts
   one window decode per second and tries at most 16 sync candidates per CFO
@@ -454,7 +469,7 @@ update. **UPDATE (2026-11-16, COP-183): re-measured on main; one controller cand
   FER claim. Batch and chunked regressions recover noiseless frames at CFO
   −150, −75, +75 and +150 Hz without an offset oracle. This fixed grid does
   not track intra-frame drift or guarantee reception between grid points.
-  BPSK comparison, fading tracking, session integration and final
+  BPSK comparison, fading tracking and final
   acceptance measurements remain open.
 - COP-190 allocates the candidate's header version value 2 as production
   air-protocol version 2 (SPEC §0.3.3, ADR-014), freezing the tone
@@ -463,8 +478,9 @@ update. **UPDATE (2026-11-16, COP-183): re-measured on main; one controller cand
   unchanged; COP-210 adds the optional WebSocket `phy_mode` status field and
   push.
 - See [BENCHMARKS](../BENCHMARKS.md#cop-187-experimental-header-repair) for
-  raw development evidence. COP-191 records final-seed sweeps below; no
-  production session result is claimed.
+  raw development evidence. COP-191 records final-seed sweeps below; the
+  sweeps claim no session result, and the paired connect trials above carry
+  the session evidence.
 
 ## COP-178 versioned wire contract
 
@@ -516,7 +532,7 @@ in that window was refused with `another session is active`. A host that
 drops its connection mid-dial should send `ABORT` first; the BPQ lab's
 stall scenario does (`docs/testing/bpq-session.md`).
 
-## COP-169 robust low-rate floor (session integration open)
+## COP-169 floor measurement and remaining acceptance work
 
 - COP-190 builds the production floor framing: air-protocol version 2 is
   allocated (SPEC §0.3.3, ADR-014), the 16-FSK modulation lives in
@@ -526,10 +542,11 @@ stall scenario does (`docs/testing/bpq-session.md`).
   `floor_receive.rs`. CoppaCore constructs a floor codec and continuous receive path.
   COP-195 gives Link a floor-aware session controller and COP-202 runs the
   same controller in coppad's sessions; the −6 dB connect bar (9 of 10
-  within 60 s) is met for both adapters in the recorded direction. Poor ramp
+  within 60 s) is met for both adapters in the recorded direction (link
+  10/10, daemon 10/10, `results/cop-190/connect/`). Poor ramp
   acceptance remains unmet. COP-191 adds the
-  production sweep driver; `connect` and `ramp` remain blocked on the
-  COP-190 production session controller.
+  production sweep driver; its `connect` and `ramp` subcommands remain
+  unimplemented.
 - COP-187 repairs the experimental 16-FSK candidate's independent hard header
   decisions by jointly decoding legal length/CRC combinations. Paired Poor
   development runs reduce frame errors from 24/90 to 20/90, but header failures
@@ -554,8 +571,8 @@ stall scenario does (`docs/testing/bpq-session.md`).
   production acquisition or FER claim. Batch and chunked regressions recover
   noiseless frames at CFO -150, -75, +75 and +150 Hz without an offset oracle.
   This fixed grid does not track intra-frame drift or guarantee reception
-  between grid points. BPSK comparison, fading tracking, production integration
-  and final acceptance measurements remain open.
+  between grid points. BPSK comparison, fading tracking and final acceptance
+  measurements remain open.
 - COP-190 allocates the candidate's header version value 2 as production
   air-protocol version 2 (SPEC §0.3.3, ADR-014), freezing the tone
   alphabet, header layout, FEC envelope, 40-byte capacity, 8.0 s airtime
@@ -566,8 +583,9 @@ stall scenario does (`docs/testing/bpq-session.md`).
   development evidence. COP-191's production final-seed sweeps are in
   [BENCHMARKS](../BENCHMARKS.md#cop-191-production-floor-sweeps): both receivers
   cross at or below -12 dB AWGN and at -10.148936 dB Poor, with zero wrong
-  payloads, but both fail the sync-share clause on both channels. No
-  production session result is claimed.
+  payloads, but both fail the sync-share clause on both channels. These sweeps
+  claim no session result; the paired connect trials in the COP-169 section
+  above carry the session evidence.
 
 - **Full-CI hosted verdict budget (COP-200).** Local optimized groups pass below 25 minutes, but three same-revision hosted workflow verdicts below 30 minutes remain unverified. Other required jobs, runner queue time and cold caches can affect the complete result. See [full-CI measurements](testing/full-ci.md).
 - **Fast-tier duration (COP-203).** ci.yml's platform and feature jobs take 40-63.5 minutes, mostly `cargo test --workspace --lib`. The required `CI` verdict waits for them, so it cannot arrive under 30 minutes. The fan-in waits up to 75 minutes. Cutting that wall time is not done. See [the fast-tier wait](testing/full-ci.md#fast-tier-wait).
@@ -586,3 +604,5 @@ stall scenario does (`docs/testing/bpq-session.md`).
 - **`coppa-bench compare` publishes coppa rows only, with 8 trials in each of its 42 cells.** [docs/benchmarks/comparison.md](benchmarks/comparison.md) holds 8 trials per cell of the `link-l2` row (library `Link`, level 2, floor off) on WGN, MPG and MPP at 30 to 0 dB, for 2 KB and 16 KB transfers. COP-215 recorded the fading 16 KB cells, so the bare `compare` runs no trial on the committed data. With 8 trials a cell's 95% interval is wide wherever trials vary. The numbers come from two library `Link`s in virtual time, not from coppad, and the two stacks were seen to disagree under fading during COP-170 research. The runner writes the payload at the caller's CONNECTED, which avoids the half-open state that waiting for both ends hits under fading (COP-169 section). Each row's SNR reference is the clean frame power at that row's level, so rows at different levels see different absolute noise at one SNR label. The page's numbers were recorded on Linux x86_64 and are bit-reproducible there only. COP-214 adds a Linux ALSA FIFO black-box harness with an integrity probe and VARA-style, ARDOP and KISS adapters. The published self-test uses two unmodified coppad processes; its real-time results can vary with scheduling. The KISS adapter sends a datagram only while fewer than eight, coppad's queue depth, are unaccounted for at the receiver, and presumes the oldest lost after 60 s with nothing received. A KISS modem with a shorter queue, or one that pauses or takes longer than 60 s to send a datagram, can still drop datagrams before they reach the channel. The Watterson cross-check is now recorded in `results/compare/channel-check.csv` (COP-214): Good, Moderate and Poor met the delay, path-power, Doppler and 3 kHz noise tolerances at 48 kHz. The documented codec2 Poor delay is 1 ms, half coppa MPP's 2 ms; PathSim defines no matching preset delay, so its offset is not measured.
 
 - **Debian appliance candidate (COP-123, 2026-11-19).** The release workflow builds three `.deb` candidates and the setup server has process-level tests on Linux with no sound card. This phase did not install a candidate on a systemd host or test a physical radio. Publication is pending the maintainer's release decision. See `docs/tutorials/debian-appliance.md`.
+
+- **COP-219 daemon test quiet-window stall.** ci.yml run 43866152450 on the macOS Platform Check reddened PR #278 when a multi-second runner stall ended `host_data_while_connecting_is_not_transmitted`'s 1500 ms quiet window before the PTT bracket arrived. Its positive wait now uses `await_ptt_bracket` with a 15 s deadline and reports every line seen on failure. A stall beyond that finite deadline can still fail. Other daemon-test `lines_within` windows can still shorten negative observations toward a false pass, and `read_line` waits can still panic after their 2 s timeout.
