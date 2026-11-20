@@ -81,10 +81,10 @@ receiver in `coppa-protocol` (`modem/floor.rs`). The frozen parameters:
   session carries data on the floor: segments are floor-sized only while the
   controller is on the floor or probing, so good-channel frames keep their
   multi-codeword size, and (COP-211) two unanswered data windows return a
-  floor-negotiated session to the floor mid-session, as in Link; a segment
-  already in flight at OFDM
-  size or as an RS(12,6) outer block keeps the OFDM fade hold; see
-  `docs/LIMITATIONS.md`.
+  floor-negotiated session to the floor mid-session, as in Link. COP-222 lets
+  a fitting RS segment use ordinary floor Data and lets two bit-7 peers
+  exchange an oversized original transport PDU as floor fragments. A peer
+  without bit 7 keeps the oversized OFDM fade hold; see `docs/LIMITATIONS.md`.
 - COP-210 amendment: coppad reports the active waveform to hosts. The
   WebSocket `status` reply gains an optional `phy_mode` object (`tx`, `rx`,
   each `null`, `"floor"` or `"ofdm:<level>"`), a reliable `phy_mode` push

@@ -560,7 +560,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:a312996287acc43dde393ac2f340540eeb72b54ed773d8ceb35f7d8651bd4626",
+      "hash": "sha256:ce537161bf534c69a699eb2785de1bf83ae25d327f9d4f62678a3f8394c919a8",
       "id": "low-rate-floor",
       "kind": "gotcha",
       "links": [
@@ -577,6 +577,7 @@
         "crates/coppa-bench/src/floor_sweep.rs",
         "crates/coppa-protocol/src/modem/floor.rs",
         "crates/coppa-daemon/src/event_loop.rs",
+        "crates/coppa-daemon/src/session_fragments.rs",
         "crates/coppa-protocol/src/floor_controller.rs",
         "crates/coppa-host/src/websocket.rs",
         "crates/coppa-daemon/src/web/index.html"

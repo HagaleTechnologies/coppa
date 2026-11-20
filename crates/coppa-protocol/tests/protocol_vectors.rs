@@ -884,6 +884,7 @@ fn capabilities_are_p23_to_p27() {
         app_messages: false,
         windowed_arq: false,
         robust_floor: false,
+        floor_fragments: false,
         mcs_index: 5,
     };
     let b = LinkCapabilities {
@@ -898,6 +899,7 @@ fn capabilities_are_p23_to_p27() {
         app_messages: false,
         windowed_arq: false,
         robust_floor: false,
+        floor_fragments: false,
         mcs_index: 3,
     };
     assert_eq!(
@@ -931,15 +933,19 @@ fn capabilities_are_p23_to_p27() {
         "air protocol v1: split_caps(&bytes_of(\"P27\"))"
     );
 
-    // Reserved flag bit 7 and trailing bytes are ignored on read; fewer
-    // than 7 bytes is an error. Bits 2–3 are outer-code capabilities,
-    // bit 4 is app_messages, bit 5 windowed_arq, and bit 6 robust_floor.
+    // Bit 7 now advertises floor fragments. Trailing bytes are ignored on
+    // read; fewer than 7 bytes is an error. Bits 2–3 are outer-code
+    // capabilities, bit 4 is app_messages, bit 5 windowed_arq, and bit 6
+    // robust_floor.
     let mut lenient = bytes_of("P23");
     lenient[5] |= 0x80;
     lenient.push(0xAA);
     assert_eq!(
         LinkCapabilities::from_bytes(&lenient).unwrap(),
-        coppad_caps(),
+        LinkCapabilities {
+            floor_fragments: true,
+            ..coppad_caps()
+        },
         "air protocol v1: LinkCapabilities::from_bytes(&lenient).unwrap()"
     );
     let mut chat = bytes_of("P23");

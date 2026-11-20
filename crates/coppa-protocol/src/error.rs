@@ -4,6 +4,9 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProtocolError {
+    /// CONNECT_CFM disagrees with the negotiated floor fragment extension.
+    #[error("floor fragments capability mismatch")]
+    FloorFragmentsMismatch,
     /// CONNECT_CFM disagrees with mutual floor support.
     #[error("robust floor capability mismatch")]
     RobustFloorMismatch,

@@ -37,6 +37,82 @@ pub enum SessionState {
     Disconnecting,
 }
 
+#[cfg(test)]
+mod cop222_tests {
+    use super::*;
+
+    #[test]
+    fn cop222_floor_fragments_require_mutual_capabilities() {
+        let capable = LinkCapabilities {
+            robust_floor: true,
+            floor_fragments: true,
+            ..LinkCapabilities::default()
+        };
+        assert_eq!(capable.to_bytes(), [0, 200, 1, 2, 8, 0xc0, 0]);
+        assert!(capable.negotiate(&capable).floor_fragments);
+        let floor_only = LinkCapabilities {
+            floor_fragments: false,
+            ..capable.clone()
+        };
+        assert!(!capable.negotiate(&floor_only).floor_fragments);
+        let no_floor = LinkCapabilities {
+            robust_floor: false,
+            ..capable.clone()
+        };
+        assert!(!capable.negotiate(&no_floor).floor_fragments);
+        let too_small = LinkCapabilities {
+            max_payload_size: 39,
+            ..capable.clone()
+        };
+        assert!(!capable.negotiate(&too_small).floor_fragments);
+    }
+
+    #[test]
+    fn cop222_floor_fragments_confirm_matches_intersection() {
+        let now = Instant::now();
+        let caps = LinkCapabilities {
+            robust_floor: true,
+            floor_fragments: true,
+            ..LinkCapabilities::default()
+        };
+        let mut responder = Session::new(
+            0,
+            Callsign::new("W1AW").unwrap(),
+            Callsign::new("VK3ABC").unwrap(),
+            5,
+            caps.clone(),
+            now,
+        );
+        responder.handle_connect_req(&caps.to_bytes(), now).unwrap();
+        let mut omitted = caps.to_bytes();
+        omitted[5] &= !0x80;
+        assert!(matches!(
+            responder.handle_connect_cfm(&omitted, now),
+            Err(ProtocolError::FloorFragmentsMismatch)
+        ));
+        responder.handle_connect_cfm(&caps.to_bytes(), now).unwrap();
+        let old = LinkCapabilities {
+            floor_fragments: false,
+            ..caps.clone()
+        };
+        let mut old_responder = Session::new(
+            1,
+            Callsign::new("W1AW").unwrap(),
+            Callsign::new("VK3ABC").unwrap(),
+            5,
+            old,
+            now,
+        );
+        old_responder
+            .handle_connect_req(&caps.to_bytes(), now)
+            .unwrap();
+        assert!(matches!(
+            old_responder.handle_connect_cfm(&caps.to_bytes(), now),
+            Err(ProtocolError::FloorFragmentsMismatch)
+        ));
+    }
+}
+
 /// Link capabilities advertised during connection setup.
 ///
 /// Each peer advertises its capabilities in CONNECT_REQ/CONNECT_ACK,
@@ -72,6 +148,8 @@ pub struct LinkCapabilities {
     pub windowed_arq: bool,
     /// Supports the separately detected low-rate floor, flags byte bit 6.
     pub robust_floor: bool,
+    /// Supports stop-and-wait floor fragments, flags byte bit 7.
+    pub floor_fragments: bool,
     /// Modulation/coding scheme index.
     pub mcs_index: u8,
 }
@@ -90,6 +168,7 @@ impl Default for LinkCapabilities {
             app_messages: false,
             windowed_arq: false,
             robust_floor: false,
+            floor_fragments: false,
             mcs_index: 0,
         }
     }
@@ -104,14 +183,17 @@ impl LinkCapabilities {
         out.push(self.fec_rate_num);
         out.push(self.fec_rate_den);
         out.push(self.arq_window);
-        // Flags byte (byte 5): [compression:1][multi_frame_ack:1][outer_code_rx:1][outer_code_req:1][app_messages:1][windowed_arq:1][robust_floor:1][reserved:1].
+        // Flags byte (byte 5): compression, multi_frame_ack, outer_code_rx,
+        // outer_code_req, app_messages, windowed_arq, robust_floor,
+        // floor_fragments, from low to high bit.
         let flags = (self.compression as u8)
             | ((self.multi_frame_ack as u8) << 1)
             | ((self.outer_code_rx as u8) << 2)
             | ((self.outer_code_req as u8) << 3)
             | ((self.app_messages as u8) << 4)
             | ((self.windowed_arq as u8) << 5)
-            | ((self.robust_floor as u8) << 6);
+            | ((self.robust_floor as u8) << 6)
+            | ((self.floor_fragments as u8) << 7);
         out.push(flags);
         out.push(self.mcs_index);
         out
@@ -136,6 +218,7 @@ impl LinkCapabilities {
             app_messages: bytes[5] & 0x10 != 0,
             windowed_arq: bytes[5] & 0x20 != 0,
             robust_floor: bytes[5] & 0x40 != 0,
+            floor_fragments: bytes[5] & 0x80 != 0,
             mcs_index: bytes[6],
         })
     }
@@ -165,6 +248,11 @@ impl LinkCapabilities {
             app_messages: self.app_messages && peer.app_messages,
             windowed_arq: self.windowed_arq && peer.windowed_arq,
             robust_floor: self.robust_floor && peer.robust_floor,
+            floor_fragments: self.robust_floor
+                && peer.robust_floor
+                && self.floor_fragments
+                && peer.floor_fragments
+                && self.max_payload_size.min(peer.max_payload_size) >= 40,
             mcs_index: self.mcs_index.min(peer.mcs_index),
         }
     }
@@ -410,6 +498,11 @@ impl Session {
             }
             if negotiated.robust_floor != expected.robust_floor {
                 return Err(ProtocolError::RobustFloorMismatch);
+            }
+            if negotiated.floor_fragments != expected.floor_fragments
+                || (negotiated.floor_fragments && negotiated.max_payload_size < 40)
+            {
+                return Err(ProtocolError::FloorFragmentsMismatch);
             }
             // COP-168: a mismatch would make one side send bursts with
             // packed PHY `seq_num` bytes and next-RV retransmissions that the
@@ -683,6 +776,7 @@ mod tests {
             app_messages: false,
             windowed_arq: false,
             robust_floor: false,
+            floor_fragments: false,
             mcs_index: 3,
         };
         let bytes = caps.to_bytes();
@@ -721,6 +815,7 @@ mod tests {
             app_messages: false,
             windowed_arq: false,
             robust_floor: false,
+            floor_fragments: false,
             mcs_index: 5,
         };
         let b = LinkCapabilities {
@@ -735,6 +830,7 @@ mod tests {
             app_messages: false,
             windowed_arq: false,
             robust_floor: false,
+            floor_fragments: false,
             mcs_index: 3,
         };
         let negotiated = a.negotiate(&b);

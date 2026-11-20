@@ -48,6 +48,7 @@ coppa-protocol = { path = "../coppa-protocol" }
 coppa-codec = { path = "../coppa-codec" }
 coppa-dsp = { path = "../coppa-dsp" }
 coppa-ml = { path = "../coppa-ml" }
+crc = "3.4"
 anyhow = { workspace = true }
 clap = { workspace = true }
 rand = { workspace = true }
