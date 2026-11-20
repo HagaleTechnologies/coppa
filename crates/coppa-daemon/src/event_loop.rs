@@ -4375,6 +4375,9 @@ impl EventLoop {
         if let Some(link) = self.session_link.as_mut() {
             if let Some(tx) = link.fragment_tx.as_mut().filter(|tx| tx.id.seq == seq) {
                 if keyed > 0 {
+                    if let Some(session) = self.session_mgr.get_mut(link.session_id) {
+                        session.touch(now);
+                    }
                     let retry = tx.keyed || tx.index == 0;
                     tx.failed_exchanges = if tx.keyed {
                         tx.failed_exchanges.saturating_add(1)
@@ -12420,6 +12423,81 @@ mod tests {
             a.session_link.is_none(),
             "the fragment exchange cannot extend a dead link"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cop222_fragment_keyups_keep_session_alive_until_fade_hold_expires() {
+        let (mut a, _, mut audio, _) = connected_pair(0).await;
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: vec![7; 300],
+        })
+        .await;
+        take_leg(&mut audio, "the original data frame");
+        a.handle_ptt_change(false).await;
+        let started = clock_now();
+        let link = a.session_link.as_mut().unwrap();
+        let session_id = link.session_id;
+        let seq = link.tx.send_base();
+        let data = TransportPdu::new_reliable(
+            link.tx_stream,
+            seq,
+            0,
+            link.tx.get_segment_data(seq).unwrap().to_vec(),
+        )
+        .to_bytes();
+        link.fragment_tx = Some(session_fragments::Tx {
+            id: Identity::new(&data, seq).unwrap(),
+            data,
+            index: 0,
+            deadline: started,
+            keyed: false,
+            failed_exchanges: 0,
+        });
+        link.fallback = Some(SessionFallback {
+            level: 1,
+            no_evidence: SESSION_FALLBACK_NO_EVIDENCE,
+            entered_at: started,
+        });
+        let last_peer_evidence = link.last_peer_evidence;
+        a.session_mgr.get_mut(session_id).unwrap().touch(started);
+        a.floor.received(LinkPhyMode::Floor);
+
+        a.check_session_retransmits().await;
+        take_leg(&mut audio, "the initial floor fragment");
+        a.handle_ptt_change(false).await;
+        for _ in 0..2 {
+            let deadline = a
+                .session_link
+                .as_ref()
+                .unwrap()
+                .fragment_tx
+                .as_ref()
+                .unwrap()
+                .deadline;
+            tokio::time::advance(deadline.saturating_duration_since(clock_now())).await;
+            a.check_session_retransmits().await;
+            take_leg(&mut audio, "the unanswered floor fragment retry");
+            a.handle_ptt_change(false).await;
+        }
+
+        let idle_timeout = a.session_mgr.get(session_id).unwrap().session_timeout;
+        tokio::time::advance((started + idle_timeout).saturating_duration_since(clock_now())).await;
+        a.reap_timed_out_sessions().await;
+        assert!(
+            a.session_mgr.get(session_id).is_some(),
+            "keyed fragment retries must keep the session alive past its idle timeout"
+        );
+        let link = a.session_link.as_ref().unwrap();
+        assert_eq!(link.last_peer_evidence, last_peer_evidence);
+        assert_eq!(link.tx.in_flight(), 1);
+
+        tokio::time::advance(
+            (started + SESSION_FALLBACK_NO_EVIDENCE).saturating_duration_since(clock_now()),
+        )
+        .await;
+        a.check_session_retransmits().await;
+        assert!(a.session_link.is_none(), "the fade hold must still expire");
     }
 
     #[tokio::test(start_paused = true)]
