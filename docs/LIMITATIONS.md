@@ -391,13 +391,15 @@ update. **UPDATE (2026-11-16, COP-183): re-measured on main; one controller cand
   floor-sized segments with no outer code while it is on the floor or
   probing, the floor RTO floor, and one level-1 OFDM probe after five
   acknowledged floor segments. Two unanswered data windows move a
-  floor-negotiated session to the floor mid-session (COP-211), but only an
-  in-flight segment whose frame fits one floor frame and carries no outer code
-  is resent there. Still open for the daemon: an OFDM-sized or RS(12,6)
-  outer-coded segment keeps the COP-68 retransmit and fade-hold path,
-  so a session that fades with one in flight ends 180 s after the hold starts
-  without peer evidence (measured after a successful probe for a 273-byte
-  frame and an 8-byte outer-coded segment; COP-222). A session that moves to
+  floor-negotiated session to the floor mid-session (COP-211), and a fitting
+  in-flight RS(12,6) segment is retried as ordinary floor Data (COP-222).
+  Two upgraded peers that negotiated bit 7 can carry an OFDM-sized in-flight
+  segment as floor fragments under its original ARQ sequence. A mixed-version
+  pair retains OFDM retries for an oversized segment, so the old fade-hold
+  failure remains for that pairing. The 252-byte segment needs 15 floor
+  fragments and progress replies, adding substantial airtime. Seeded AWGN
+  tests cover the recovery; Watterson fading and radio measurements remain
+  open. A session that moves to
   the floor mid-session keeps its 30 s keepalive interval; RS(12,6) block ACKs
   stay on OFDM; no lost-CONNECT_CFM replay. Two daemons that dial each other at
   once connect through the library's lexical tie break (COP-210), but a

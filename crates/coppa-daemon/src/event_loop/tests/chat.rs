@@ -242,12 +242,12 @@ async fn chat_is_negotiated_only_when_both_stations_enable_the_websocket_api() {
     on.host.websocket_enabled = true;
     assert_eq!(
         hex(&local_link_caps(&on, true).to_bytes()),
-        "00c80102085600"
+        "00c8010208d600"
     );
     on.session.fade_protection = crate::config::FadeProtection::Off;
     assert_eq!(
         hex(&local_link_caps(&on, true).to_bytes()),
-        "00c80102085200"
+        "00c8010208d200"
     );
 
     let mut p = connected_chat_pair_configured(|_| {}, |c| c.host.websocket_enabled = false).await;

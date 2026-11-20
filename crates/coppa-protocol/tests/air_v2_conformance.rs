@@ -10,6 +10,32 @@ use coppa_protocol::modem::floor::{
 use coppa_protocol::session::LinkCapabilities;
 use coppa_protocol::AIR_PROTOCOL_VERSION;
 
+#[test]
+fn cop222_floor_mac_fragment_vectors() {
+    fn bytes(hex: &str) -> Vec<u8> {
+        hex.split_whitespace()
+            .map(|b| u8::from_str_radix(b, 16).unwrap())
+            .collect()
+    }
+    let vectors = [
+        (MacFrameType::FloorFragment, bytes("1b 5d c0 57 00 00 00 58 b7 81 08 30 00 05 06 00 00 1b 7f 20 f0 6a 01 06 00 00 00 00 00 00 01 02 03 04 05 06 07 08 09 0a")),
+        (MacFrameType::FloorFragmentAck, bytes("1c 58 b7 81 08 30 00 5d c0 57 00 00 00 05 06 01 00 1b 7f 20 f0 6a")),
+        (MacFrameType::FloorFragment, bytes("1b 5d c0 57 00 00 00 58 b7 81 08 30 00 05 06 01 00 1b 7f 20 f0 6a 0b 0c 0d 0e 0f 10 11 12 13")),
+        (MacFrameType::Ack, bytes("11 58 b7 81 08 30 00 5d c0 57 00 00 00 05 02 00 07 00 00 00 00")),
+    ];
+    let floor = FloorFrame::new();
+    for (kind, raw) in vectors {
+        assert!(raw.len() <= MAX_PAYLOAD);
+        let pdu = MacPdu::from_floor_bytes(&raw).unwrap();
+        assert_eq!(pdu.frame_type, kind);
+        assert_eq!(pdu.to_bytes(), raw);
+        if kind != MacFrameType::Ack {
+            assert!(MacPdu::from_bytes(&raw).is_err());
+        }
+        assert_eq!(floor.receive(&floor.encode(&raw).unwrap()).unwrap(), raw);
+    }
+}
+
 /// The CONNECT-family PDUs a floor frame carries on the session path, at
 /// every legal payload length.
 fn connect_pdus() -> Vec<Vec<u8>> {

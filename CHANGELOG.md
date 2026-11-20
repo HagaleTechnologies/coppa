@@ -14,7 +14,18 @@ numbers separately, because they move independently:
 Older releases have no entry here. Their on-air breaks are listed in
 `docs/SPEC.md` §0.1.
 
-## Unreleased: 0.17.0
+## Unreleased: 0.18.0
+
+- COP-222: Auto coppad retries a floor-sized outer-coded segment as ordinary
+  floor Data. Two peers advertising CONNECT bit 7 can recover an oversized
+  in-flight reliable segment through stop-and-wait floor fragments, retaining
+  its sequence and final session ACK. Mixed-version peers keep the OFDM retry
+  for oversized segments. Rust `LinkCapabilities` adds `floor_fragments`, and
+  floor-only `MacFrameType` values 11 and 12 require `MacPdu::from_floor_bytes`.
+  The crate minor version advances to 0.18.0; host and C ABI versions do not
+  change.
+
+## 0.17.0
 
 - coppad reports the session waveform to WebSocket hosts and the dashboard
   (COP-210). `status` gains an optional `phy_mode` object, `{"tx": .., "rx": ..}`,

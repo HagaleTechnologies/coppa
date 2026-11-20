@@ -22,6 +22,7 @@ pub mod level_meter;
 pub mod logging;
 pub mod mdns;
 pub mod ptt_guardian;
+mod session_fragments;
 mod session_outer;
 pub mod signals;
 #[cfg(feature = "websocket")]
