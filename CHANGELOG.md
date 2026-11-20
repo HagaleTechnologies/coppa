@@ -91,8 +91,9 @@ Older releases have no entry here. Their on-air breaks are listed in
   floor policy functions `admits_floor_pdu`, `floor_caps_unusable`,
   `floor_segment_limit`, `floor_rto_floor`, `floor_keepalive_interval` and
   `calling_handshake_timeout` in `coppa_protocol::floor_controller`.
-- Allocate capability flags byte bit 6 without changing legacy bytes or
-  capability length.
+- Allocate CONNECT capability flags bit 6 to `robust_floor` in the existing
+  seven-byte layout. With otherwise default settings, coppad sends flags
+  `0x46` in Auto and `0x06` with a pinned speed level.
 - **Crate version:** 0.16.0. Minor bump over 0.15.0 because
   `coppa_engine::LinkConfig` and `coppa_protocol::session::LinkCapabilities` each gain a
   public field, `robust_floor`, which breaks struct-literal callers that do not end with
