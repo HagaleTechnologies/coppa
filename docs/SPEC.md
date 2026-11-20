@@ -2757,7 +2757,9 @@ Unset, coppad sends 1+3 while its speed level is automatic.
 Capability flags byte 5 bit 6 advertises `robust_floor`. Its default is false
 and negotiation is the intersection. CONNECT_CFM must carry exactly that
 intersection; disagreement is rejected. The seven-byte layout and all
-previous flag allocations remain unchanged. Bit 5 stays reserved for COP-168.
+previous flag allocations remain unchanged. Bit 5 is allocated to
+`windowed_arq` (COP-168). Transmitters MUST send bit 5 as zero until a later
+revision specifies its rules (see §20.1).
 
 The library Link enables discovery by default. Disabling
 `LinkConfig.robust_floor` preserves OFDM-only operation. Discovery starts on

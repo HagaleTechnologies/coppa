@@ -7,6 +7,7 @@ maintainer: agent
 sources:
   - BENCHMARKS.md
   - docs/LIMITATIONS.md
+  - results/cop-190/connect/metadata.md
   - crates/coppa-bench/src/floor_candidate.rs
   - crates/coppa-bench/src/floor_sweep.rs
   - crates/coppa-protocol/src/modem/floor.rs
@@ -33,7 +34,7 @@ waveform to WebSocket hosts and the dashboard as `phy_mode` (COP-210). The
 remaining Poor failures on the frozen bench copy still violate the separate
 acquisition bar, despite a favorable FER crossing. See
 [measurements](../../BENCHMARKS.md#cop-187-experimental-header-repair)
-and [open requirements](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-session-integration-open).
+and [open requirements](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor).
 
 Joint length/CRC decoding uses redundancy that independent hard nibble decisions
 discard. A legal header hypothesis alone cannot justify delivery. Preserve the
@@ -46,7 +47,7 @@ and suppresses delivery of the same frame from successive windows. The
 `floor_candidate --streaming` diagnostic uses it. A caller must supply trailing
 audio through the next one-second decode interval. Work and retention bounds,
 and the remaining production gap, are in
-[LIMITATIONS](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-session-integration-open).
+[LIMITATIONS](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor).
 COP-190 allocates the header's version value 2 as production air-protocol
 version 2 (SPEC §0.3.3, ADR-014); the frozen v1 bytes, host fields and C ABI
 are unchanged.
@@ -63,9 +64,13 @@ streaming receive paths. COP-191 adds `--waveform floor` using the production
 The noisy tail must cover the continuous receiver's next scheduled decode.
 See [production sweep results](../../BENCHMARKS.md#cop-191-production-floor-sweeps)
 for measured verdicts. Both receivers fail the sync-share bar on both channels,
-with zero wrong payloads. `connect` and `ramp` still need COP-190's deferred
-production session controller. A codec receive test does not prove session
-establishment, floor ACKs or OFDM recovery.
+with zero wrong payloads. The `connect` and `ramp` sweep drivers remain
+unimplemented. Link and coppad each connected in 10 of 10 trials at -6 dB
+AWGN with VK3ABC calling W1AW, meeting the connect bar; see the
+[paired connection trials](../../results/cop-190/connect/metadata.md) for the
+counts and trial setup. Watterson Poor ramp acceptance remains open. A codec
+receive test does not prove session establishment, floor ACKs or OFDM
+recovery.
 
 
 CFO search in the experimental batch and continuous receiver uses thirteen
@@ -85,8 +90,8 @@ length drops delayed payload samples and measures truncation as well as filterin
 COP-190 production development sweeps now exercise both floor receive paths
 on identical persistent-channel captures. Favorable crossings still fail the
 sync-share clause. See [the production measurements](../../BENCHMARKS.md#cop-190-production-floor-development-measurements)
-for seeds, accounting and remaining acceptance work. A decoded floor frame
-does not prove a connection.
+for seeds, accounting and remaining acceptance work. A sweep's decoded floor
+frame does not prove a connection.
 
 The library floor controller reserves streaming delivery time in addition to
 airtime. Keying interrupts capture, so Link breaks both OFDM and floor
@@ -129,5 +134,5 @@ inbound one and records it in `crossed_dial`. That session is `Accepting`
 like any inbound handshake, so every CANCELPENDING decision goes through
 `host_pending()`, which excludes it: its host saw `CONNECTING`, never
 `PENDING`. A crossed call bypasses `LISTEN OFF`. See
-[LIMITATIONS](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-session-integration-open)
+[LIMITATIONS](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor)
 for the stagger's cost.
