@@ -18023,12 +18023,6 @@ mod tests {
             lines
         }
 
-<<<<<<< HEAD
-        // COP-216: virtual quiet windows survive slow encoding and runner stalls;
-        // auto-advance reaches the window before the later retry timer, while
-        // real socket wakeups still expose transmissions inside the window.
-        #[tokio::test(start_paused = true)]
-=======
         /// COP-219: wait for the complete positive PTT signal, including runner stalls.
         const PTT_BRACKET_DEADLINE: Duration = Duration::from_secs(15);
 
@@ -18127,8 +18121,9 @@ mod tests {
             }
         }
 
-        #[tokio::test]
->>>>>>> 754cf45b2d1c4a71649d89a160857db679ae71e7
+        // COP-216: the quiet window uses virtual time, while real socket
+        // wakeups still expose transmissions inside the window.
+        #[tokio::test(start_paused = true)]
         async fn host_data_without_a_session_is_not_transmitted() {
             let mut event_loop = EventLoop::new(fast_ptt_config()).unwrap();
             let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
