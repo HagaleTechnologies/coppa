@@ -21,6 +21,7 @@ pub const ENCODED_CALLSIGN_BYTES: usize = 6;
 
 /// MAC frame types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 #[repr(u8)]
 pub enum MacFrameType {
     /// Payload data for a session (type nibble 0).
@@ -47,6 +48,10 @@ pub enum MacFrameType {
     /// RS(12,6) session shard, negotiated by CONNECT flags bits 2 and 3
     /// (COP-119). Nibble 10, since COP-138 took 9 for `Datagram`.
     OuterData = 10,
+    /// Floor-only reliable transport fragment.
+    FloorFragment = 11,
+    /// Floor-only fragment progress response.
+    FloorFragmentAck = 12,
 }
 
 impl MacFrameType {
@@ -247,6 +252,15 @@ impl MacPdu {
 
     /// Deserialize from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        Self::decode(bytes, false)
+    }
+
+    /// Decode a MAC PDU carried by the separately detected floor waveform.
+    pub fn from_floor_bytes(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        Self::decode(bytes, true)
+    }
+
+    fn decode(bytes: &[u8], floor: bool) -> Result<Self, ProtocolError> {
         if bytes.len() < Self::HEADER_SIZE {
             return Err(ProtocolError::MacPduTooShort {
                 actual: bytes.len(),
@@ -255,7 +269,11 @@ impl MacPdu {
         }
 
         let version = (bytes[0] >> 4) & 0x0F;
-        let frame_type = MacFrameType::from_u8(bytes[0] & 0x0F)?;
+        let frame_type = match bytes[0] & 0x0f {
+            11 if floor => MacFrameType::FloorFragment,
+            12 if floor => MacFrameType::FloorFragmentAck,
+            nibble => MacFrameType::from_u8(nibble)?,
+        };
 
         let mut dest_bytes = [0u8; ENCODED_CALLSIGN_BYTES];
         dest_bytes.copy_from_slice(&bytes[1..7]);

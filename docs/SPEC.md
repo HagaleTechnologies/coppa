@@ -195,6 +195,17 @@ normative in `docs/adr/014-cop190-low-rate-floor.md`, implemented as
 `crates/coppa-protocol/tests/floor_receive.rs`. It changes nothing in this
 version-1 contract; every §0.3.5 freeze row still applies to version 1.
 
+Floor-only fragment vectors (complete MAC PDUs, hex; SSID 5, sequence 6,
+27-byte transport PDU, CRC-32/ISO-HDLC `7f20f06a`):
+
+| Direction | Type | Complete MAC PDU |
+|---|---|---|
+| VK3ABC → W1AW | fragment 0 | `1b 5d c0 57 00 00 00 58 b7 81 08 30 00 05 06 00 00 1b 7f 20 f0 6a 01 06 00 00 00 00 00 00 01 02 03 04 05 06 07 08 09 0a` |
+| W1AW → VK3ABC | progress 1 | `1c 58 b7 81 08 30 00 5d c0 57 00 00 00 05 06 01 00 1b 7f 20 f0 6a` |
+| VK3ABC → W1AW | fragment 1 | `1b 5d c0 57 00 00 00 58 b7 81 08 30 00 05 06 01 00 1b 7f 20 f0 6a 0b 0c 0d 0e 0f 10 11 12 13` |
+| W1AW → VK3ABC | final session ACK | `11 58 b7 81 08 30 00 5d c0 57 00 00 00 05 02 00 07 00 00 00 00` |
+
+
 #### 0.3.4 What is frozen, what may change
 
 - **Required core.** Every row below marked *core* is mandatory for every
@@ -1817,11 +1828,15 @@ identifier the session layer matches on (§20.2).
 | 8 | `Relay` | none defined | none |
 | 9 | `Datagram` | KISS data unchanged (§11) | KISS datagram path |
 | 10 | `OuterData` | 4-byte outer header + RS shard (§22.2) | session link, fade protection (§22) |
-| 11–15 | invalid | | parse error |
+| 11 | `FloorFragment` | 8-byte fragment header plus 1–18 bytes (§0.3.3) | coppad floor only |
+| 12 | `FloorFragmentAck` | 8-byte progress header (§0.3.3) | coppad floor only |
+| 13–15 | invalid | | parse error |
+
+The version-1 MAC parser still rejects 11–15. Only `MacPdu::from_floor_bytes` admits 11 and 12 after floor framing has validated the payload CRC.
 
 `MacFrameType` is `mac.rs:24-44`. This enumeration is **not** the PHY
 header's `CoppaFrameType` (§4.2): the two disagree at values 2–4 and the
-MAC adds 7–9. `Relay` is recognized by the parser, but no code builds
+MAC adds 7–12. `Relay` is recognized by the parser, but no code builds
 one and the reference receiver only logs it ("Unhandled MAC frame type",
 `event_loop.rs:6267`). An implementer MUST NOT send `Relay` expecting any
 effect.
@@ -2112,7 +2127,7 @@ complete exchange.
 | 2 | 1 | `fec_rate_num` | 1 | 1 |
 | 3 | 1 | `fec_rate_den` | 2 | 2 |
 | 4 | 1 | `arq_window` | 8 | 8 |
-| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bit 5 `windowed_arq` (COP-168), bit 6 `robust_floor`, bit 7 reserved | `0x00` | `0x46`; `0x56` with the WebSocket API on; `0x42` with `fade_protection = "off"`. Bit 6 is clear while a numbered speed level is pinned |
+| 5 | 1 | flags: bit 0 `compression`, bit 1 `multi_frame_ack`, bits 2–3 outer-code capability (§22.1, COP-119), bit 4 `app_messages` (§23.1, COP-121), bit 5 `windowed_arq` (COP-168), bit 6 `robust_floor`, bit 7 `floor_fragments` (COP-222) | `0x00` | `0xc6`; `0xd6` with the WebSocket API on; `0xc2` with `fade_protection = "off"`. Bits 6 and 7 are clear while a numbered speed level is pinned |
 | 6 | 1 | `mcs_index` | 0 | 0 |
 
 The library default encodes as `00c80102080000` (P24). coppad sets
@@ -2757,7 +2772,10 @@ Unset, coppad sends 1+3 while its speed level is automatic.
 Capability flags byte 5 bit 6 advertises `robust_floor`. Its default is false
 and negotiation is the intersection. CONNECT_CFM must carry exactly that
 intersection; disagreement is rejected. The seven-byte layout and all
-previous flag allocations remain unchanged. Bit 5 stays reserved for COP-168.
+previous flag allocations remain unchanged. Bit 5 carries COP-168's windowed ARQ capability.
+Bit 7 advertises `floor_fragments`; it defaults to false and is selected only
+if both peers advertised bits 6 and 7 and their negotiated MAC capacity is at
+least 40 bytes. CONNECT_CFM must carry exactly that selection.
 
 The library Link enables discovery by default. Disabling
 `LinkConfig.robust_floor` preserves OFDM-only operation. Discovery starts on
@@ -2797,11 +2815,11 @@ and its encoded payload fits one level-1 codeword, with no outer code, and a
 floor key-up's retransmission timeout is at least the floor RTO floor plus the
 station-ID allowance. Two unanswered data windows return a floor-negotiated
 session to the floor, also after a successful probe or when it was established
-on OFDM. A lost probe returns it at once (COP-211). Only a segment whose frame
-fits one floor
-frame and carries no outer code is retransmitted there. An in-flight segment
-cut at OFDM size, or sent as an RS(12,6) outer block, keeps the OFDM
-retransmission and fade-hold path, and RS(12,6) block ACKs stay on OFDM. It
+on OFDM. A lost probe returns it at once (COP-211). A fitting in-flight segment is retried as ordinary floor Data even if its first send used RS(12,6). For a larger segment, two peers that negotiated bit 7 exchange floor fragments of the original transport PDU under its original sequence. A peer without bit 7 keeps the OFDM retry. RS block ACKs stay on OFDM.
+
+The fragment MAC payload starts with sequence (1 byte), index (1 byte), total transport length (u16 BE) and CRC-32/ISO-HDLC of the whole transport PDU (u32 BE). Requests carry up to 18 consecutive bytes. Lengths 27–4103 are valid, yielding at most 228 fragments. The receiver accepts only the expected sequence, exact per-index length and matching metadata. It replies with the next index after a valid prefix, index zero when the prefix is absent or whole-PDU validation fails, and the ordinary session ACK after full reliable-PDU delivery. An already delivered sequence gets the ordinary ACK again. The sender waits for each progress reply, retries the same index on timeout and retires the ARQ slot only on the ordinary session ACK.
+
+It
 keeps the 30 s inbound handshake timeout and does not replay a lost
 CONNECT_CFM.
 

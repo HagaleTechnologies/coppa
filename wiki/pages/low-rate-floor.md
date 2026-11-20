@@ -11,6 +11,7 @@ sources:
   - crates/coppa-bench/src/floor_sweep.rs
   - crates/coppa-protocol/src/modem/floor.rs
   - crates/coppa-daemon/src/event_loop.rs
+  - crates/coppa-daemon/src/session_fragments.rs
   - crates/coppa-protocol/src/floor_controller.rs
   - crates/coppa-host/src/websocket.rs
   - crates/coppa-daemon/src/web/index.html
@@ -131,3 +132,11 @@ like any inbound handshake, so every CANCELPENDING decision goes through
 `PENDING`. A crossed call bypasses `LISTEN OFF`. See
 [LIMITATIONS](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor-session-integration-open)
 for the stagger's cost.
+
+COP-222 keeps an OFDM-sized in-flight ARQ slot intact while coppad exchanges
+floor fragments. The intermediate replies acknowledge fragment progress; only
+the ordinary session ACK retires the slot. The bounded prefix buffer lives in
+`crates/coppa-daemon/src/session_fragments.rs`, and the paired-audio fade
+regressions are `cop222_outer_segment_delivered_on_floor` and
+`cop222_oversized_segment_delivered_on_floor`. The wire rules and mixed-peer
+fallback are in [SPEC §0.3.3 and the floor policy](../../docs/SPEC.md#negotiated-low-rate-floor-session-policy).

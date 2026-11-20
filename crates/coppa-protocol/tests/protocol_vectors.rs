@@ -884,6 +884,7 @@ fn capabilities_are_p23_to_p27() {
         app_messages: false,
         windowed_arq: false,
         robust_floor: false,
+        floor_fragments: false,
         mcs_index: 5,
     };
     let b = LinkCapabilities {
@@ -898,6 +899,7 @@ fn capabilities_are_p23_to_p27() {
         app_messages: false,
         windowed_arq: false,
         robust_floor: false,
+        floor_fragments: false,
         mcs_index: 3,
     };
     assert_eq!(
