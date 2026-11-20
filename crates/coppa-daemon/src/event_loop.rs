@@ -18023,10 +18023,112 @@ mod tests {
             lines
         }
 
+<<<<<<< HEAD
         // COP-216: virtual quiet windows survive slow encoding and runner stalls;
         // auto-advance reaches the window before the later retry timer, while
         // real socket wakeups still expose transmissions inside the window.
         #[tokio::test(start_paused = true)]
+=======
+        /// COP-219: wait for the complete positive PTT signal, including runner stalls.
+        const PTT_BRACKET_DEADLINE: Duration = Duration::from_secs(15);
+
+        async fn await_ptt_bracket<R: tokio::io::AsyncRead + Unpin>(
+            reader: &mut BufReader<R>,
+            deadline: Duration,
+        ) -> Result<Vec<String>, Vec<String>> {
+            let start = tokio::time::Instant::now();
+            let mut lines = Vec::new();
+            loop {
+                let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
+                    return Err(lines);
+                };
+                let mut line = Vec::new();
+                match tokio::time::timeout(remaining, reader.read_until(b'\r', &mut line)).await {
+                    Ok(Ok(0)) | Err(_) => return Err(lines),
+                    Ok(Ok(_)) => {
+                        lines.push(
+                            String::from_utf8(line)
+                                .expect("VARA response lines are UTF-8")
+                                .trim()
+                                .to_string(),
+                        );
+                        let ptt: Vec<&str> = lines
+                            .iter()
+                            .map(String::as_str)
+                            .filter(|s| s.starts_with("PTT"))
+                            .collect();
+                        if ptt == ["PTT ON", "PTT OFF"] {
+                            return Ok(lines);
+                        }
+                    }
+                    Ok(Err(error)) => panic!("reading VARA response failed: {error}"),
+                }
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn await_ptt_bracket_survives_a_gap_longer_than_the_old_window() {
+            let (stream, mut writer) = tokio::io::duplex(128);
+            tokio::spawn(async move {
+                writer.write_all(b"OK\r").await.unwrap();
+                tokio::time::sleep(Duration::from_millis(1600)).await;
+                writer.write_all(b"PTT ON\rPTT OFF\r").await.unwrap();
+                std::future::pending::<()>().await;
+            });
+            let mut reader = BufReader::new(stream);
+            assert_eq!(
+                await_ptt_bracket(&mut reader, PTT_BRACKET_DEADLINE).await,
+                Ok(vec!["OK".into(), "PTT ON".into(), "PTT OFF".into()])
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn await_ptt_bracket_fails_when_the_bracket_never_arrives() {
+            let (stream, mut writer) = tokio::io::duplex(128);
+            tokio::spawn(async move {
+                writer.write_all(b"OK\r").await.unwrap();
+                std::future::pending::<()>().await;
+            });
+            let mut reader = BufReader::new(stream);
+            assert_eq!(
+                await_ptt_bracket(&mut reader, PTT_BRACKET_DEADLINE).await,
+                Err(vec!["OK".into()])
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn await_ptt_bracket_fails_when_the_stream_ends_without_a_bracket() {
+            let (stream, mut writer) = tokio::io::duplex(128);
+            tokio::spawn(async move { writer.write_all(b"PTT ON\r").await.unwrap() });
+            let mut reader = BufReader::new(stream);
+            assert_eq!(
+                await_ptt_bracket(&mut reader, PTT_BRACKET_DEADLINE).await,
+                Err(vec!["PTT ON".into()])
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn await_ptt_bracket_rejects_out_of_order_and_duplicate_ptt() {
+            for (input, expected) in [
+                (&b"PTT OFF\rPTT ON\r"[..], vec!["PTT OFF", "PTT ON"]),
+                (
+                    &b"PTT ON\rPTT ON\rPTT OFF\r"[..],
+                    vec!["PTT ON", "PTT ON", "PTT OFF"],
+                ),
+            ] {
+                let (stream, mut writer) = tokio::io::duplex(128);
+                writer.write_all(input).await.unwrap();
+                drop(writer);
+                let mut reader = BufReader::new(stream);
+                assert_eq!(
+                    await_ptt_bracket(&mut reader, PTT_BRACKET_DEADLINE).await,
+                    Err(expected.into_iter().map(str::to_string).collect())
+                );
+            }
+        }
+
+        #[tokio::test]
+>>>>>>> 754cf45b2d1c4a71649d89a160857db679ae71e7
         async fn host_data_without_a_session_is_not_transmitted() {
             let mut event_loop = EventLoop::new(fast_ptt_config()).unwrap();
             let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
@@ -18073,13 +18175,10 @@ mod tests {
             local
                 .run_until(async move {
                     writer.write_all(b"CONNECT N0CALL W1AW\r").await.unwrap();
-                    let lines = lines_within(&mut reader, Duration::from_millis(1500)).await;
-                    let ptt: Vec<&str> = lines
-                        .iter()
-                        .map(String::as_str)
-                        .filter(|s| s.starts_with("PTT"))
-                        .collect();
-                    assert_eq!(ptt, ["PTT ON", "PTT OFF"], "CONNECT_REQ must transmit");
+                    // COP-219: a quiet gap after OK can be a stalled runner, not missing PTT.
+                    if let Err(seen) = await_ptt_bracket(&mut reader, PTT_BRACKET_DEADLINE).await {
+                        panic!("CONNECT_REQ must transmit: no PTT ON -> PTT OFF bracket within {:?}, saw {seen:?}", PTT_BRACKET_DEADLINE);
+                    }
 
                     data.write_all(b"hello").await.unwrap();
                     let lines = lines_within(&mut reader, Duration::from_millis(1500)).await;

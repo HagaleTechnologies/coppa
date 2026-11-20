@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-19T12:30:55Z",
-  "head_commit": "1819159",
+  "generated_at": "2026-11-19T22:52:38Z",
+  "head_commit": "9cddafc",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -487,6 +487,26 @@
       "title": "What will bite you when a test hands coppad a port?",
       "verified_commit": "06a2987",
       "verified_date": "2026-11-16",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:daf56c38b5e5e7f45b39f82702424b53be9a232edfc65f32b86c0d16a50680d0",
+      "id": "daemon-test-quiet-windows",
+      "kind": "gotcha",
+      "links": [
+        "daemon-test-ports",
+        "paused-clock-timers"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/daemon-test-quiet-windows.md",
+      "sources": [
+        "crates/coppa-daemon/src/event_loop.rs"
+      ],
+      "status": "current",
+      "title": "What will bite you when a daemon test waits on a quiet window?",
+      "verified_commit": "701a6e4",
+      "verified_date": "2026-11-19",
       "visibility": "public"
     },
     {
