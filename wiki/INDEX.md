@@ -27,6 +27,7 @@
 - [Which stream and exit code does coppa use?](pages/cli-output.md) — stdout is data only; broken pipe, Ctrl-C and 130 rules.
 - [What will bite you when testing coppad's mDNS discovery?](pages/mdns-discovery.md) — Loopback answers and glibc's missing .local lookup fool same-host tests.
 - [What will bite you when a test hands coppad a port?](pages/daemon-test-ports.md) — A picked-then-released port can be taken; bind port 0 and read the log.
+- [What will bite you when a daemon test waits on a quiet window?](pages/daemon-test-quiet-windows.md) — Positive waits should collect the signal itself; runner stalls can close a quiet window early.
 - [What will bite you when calling coppa from C or Python?](pages/c-ffi-and-python-link.md) — SONAME, struct_size, stale header, debug speed, profile and C++ traps.
 - [What will bite you when a paused-clock test drives the daemon's timers?](pages/paused-clock-timers.md) — Under start_paused only tokio's clock is virtual; daemon timers must use clock_now().
 - [What will bite you when measuring coppa's TNC against Direwolf?](pages/tnc-direwolf-benchmark.md) — Misnamed track, two Direwolf defaults, 48 kHz input.
