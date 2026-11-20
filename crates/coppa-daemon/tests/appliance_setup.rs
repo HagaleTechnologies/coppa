@@ -135,6 +135,40 @@ fn sighup_during_setup_does_not_kill_the_daemon() {
 }
 
 #[test]
+fn localhost_wizard_loads_and_saves() {
+    let fixture = Fixture::new();
+    let page = fixture.request(&format!(
+        "GET /setup HTTP/1.0\r\nHost: localhost:{}\r\n\r\n",
+        fixture.port
+    ));
+    assert!(page.starts_with("HTTP/1.0 200"), "{page}");
+    assert!(page.contains("Set up Coppa"));
+    let script = fixture.request(&format!(
+        "GET /setup.js HTTP/1.0\r\nHost: localhost:{}\r\n\r\n",
+        fixture.port
+    ));
+    assert!(script.starts_with("HTTP/1.0 200"), "{script}");
+    let config = fixture.request(&format!("GET /api/config HTTP/1.0\r\nHost: localhost:{}\r\nAuthorization: Bearer 0123456789abcdef0123456789abcdef\r\n\r\n", fixture.port));
+    assert!(config.starts_with("HTTP/1.0 200"), "{config}");
+    let devices = fixture.request(&format!("GET /api/devices HTTP/1.0\r\nHost: localhost:{}\r\nAuthorization: Bearer 0123456789abcdef0123456789abcdef\r\n\r\n", fixture.port));
+    assert!(devices.starts_with("HTTP/1.0 200"), "{devices}");
+    let body = r#"{"callsign":"K1ABC","grid":"FN20","input_device_id":"alsa:null","output_device_id":"alsa:null","ptt":{"method":"none"},"beacon_interval_secs":0}"#;
+    let response = fixture.request(&format!(
+        "PUT /api/config HTTP/1.0\r\nHost: localhost:{}\r\nOrigin: http://localhost:{}\r\nAuthorization: Bearer 0123456789abcdef0123456789abcdef\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        fixture.port, fixture.port, body.len(), body
+    ));
+    assert!(response.starts_with("HTTP/1.0 200"), "{response}");
+    let saved = fs::read_to_string(fixture.root.join("state/coppad.toml")).unwrap();
+    assert!(saved.contains("K1ABC"));
+    assert!(saved.contains("alsa:null"));
+    let dashboard = format!(
+        "\"dashboard_url\":\"http://127.0.0.1:{}/\"",
+        fixture.dashboard_port
+    );
+    assert!(response.contains(&dashboard), "{response}");
+}
+
+#[test]
 fn setup_requests_enforce_access_and_limits() {
     let fixture = Fixture::new();
     let denied = fixture.request(&format!(
@@ -142,12 +176,65 @@ fn setup_requests_enforce_access_and_limits() {
         fixture.port
     ));
     assert!(denied.starts_with("HTTP/1.0 401"), "{denied}");
+    let localhost_denied = fixture.request(&format!(
+        "GET /api/config HTTP/1.0\r\nHost: localhost:{}\r\n\r\n",
+        fixture.port
+    ));
+    assert!(
+        localhost_denied.starts_with("HTTP/1.0 401"),
+        "{localhost_denied}"
+    );
     let foreign = fixture.request("GET /api/devices HTTP/1.0\r\nHost: evil.example\r\nAuthorization: Bearer 0123456789abcdef0123456789abcdef\r\n\r\n");
     assert!(foreign.starts_with("HTTP/1.0 403"), "{foreign}");
     let allowed = fixture.request(&format!("GET /api/config HTTP/1.0\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer 0123456789abcdef0123456789abcdef\r\n\r\n", fixture.port));
     assert!(allowed.starts_with("HTTP/1.0 200"), "{allowed}");
+    let localhost_allowed = fixture.request(&format!("GET /api/config HTTP/1.0\r\nHost: localhost:{}\r\nAuthorization: Bearer 0123456789abcdef0123456789abcdef\r\n\r\n", fixture.port));
+    assert!(
+        localhost_allowed.starts_with("HTTP/1.0 200"),
+        "{localhost_allowed}"
+    );
+    let wrong_port = fixture.port.wrapping_add(1);
+    for host in [
+        format!("evil.example:{}", fixture.port),
+        format!("127.0.0.1:{wrong_port}"),
+        format!("localhost:{wrong_port}"),
+    ] {
+        for target in ["/setup", "/setup.js", "/api/config"] {
+            let rejected = fixture.request(&format!(
+                "GET {target} HTTP/1.0\r\nHost: {host}\r\nAuthorization: Bearer 0123456789abcdef0123456789abcdef\r\n\r\n"
+            ));
+            assert!(
+                rejected.starts_with("HTTP/1.0 403"),
+                "{host} {target}: {rejected}"
+            );
+        }
+    }
+    let queried = fixture.request(&format!(
+        "GET /setup?from=tunnel HTTP/1.0\r\nHost: localhost:{}\r\n\r\n",
+        fixture.port
+    ));
+    assert!(queried.starts_with("HTTP/1.0 403"), "{queried}");
     let bad_origin = fixture.request(&format!("PUT /api/config HTTP/1.0\r\nHost: 127.0.0.1:{}\r\nOrigin: http://evil.example\r\nAuthorization: Bearer 0123456789abcdef0123456789abcdef\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}", fixture.port));
     assert!(bad_origin.starts_with("HTTP/1.0 403"), "{bad_origin}");
+    let body = r#"{"callsign":"K1ABC","grid":"","input_device_id":"alsa:null","output_device_id":"alsa:null","ptt":{"method":"none"},"beacon_interval_secs":0}"#;
+    let localhost_wrong_port_origin = format!("http://localhost:{wrong_port}");
+    let numeric_origin = format!("http://127.0.0.1:{}", fixture.port);
+    for origin in [
+        None,
+        Some("http://evil.example"),
+        Some(localhost_wrong_port_origin.as_str()),
+        Some(numeric_origin.as_str()),
+    ] {
+        let origin_header = origin
+            .map(|value| format!("Origin: {value}\r\n"))
+            .unwrap_or_default();
+        let save = fixture.request(&format!(
+            "PUT /api/config HTTP/1.0\r\nHost: localhost:{}\r\n{origin_header}Authorization: Bearer 0123456789abcdef0123456789abcdef\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            fixture.port, body.len(), body
+        ));
+        assert!(save.starts_with("HTTP/1.0 403"), "{origin_header}{save}");
+    }
+    assert!(!fixture.root.join("state/coppad.toml").exists());
     let oversized = "x".repeat(8193);
     let large = fixture.request(&format!("PUT /api/config HTTP/1.0\r\nHost: 127.0.0.1:{}\r\nOrigin: http://127.0.0.1:{}\r\nAuthorization: Bearer 0123456789abcdef0123456789abcdef\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", fixture.port, fixture.port, oversized.len(), oversized));
     assert!(large.starts_with("HTTP/1.0 413"), "{large}");
