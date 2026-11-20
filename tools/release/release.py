@@ -343,7 +343,9 @@ def cmd_deb(args: argparse.Namespace) -> None:
         control = stage / "DEBIAN/control"
         control.write_text(
             f"Package: coppa\nVersion: {args.version}\nArchitecture: {arch}\n"
-            "Maintainer: Coppa maintainers <maintainers@coppa.invalid>\n"
+            "Section: hamradio\nPriority: optional\n"
+            f"Homepage: {REPOSITORY}\n"
+            "Maintainer: Tony Hagale <tony@hagale.net>\n"
             "Depends: libc6 (>= 2.31), libasound2t64 | libasound2, adduser, "
             "init-system-helpers, openssl, systemd (>= 247)\n"
             "Description: Coppa digital modem appliance\n"

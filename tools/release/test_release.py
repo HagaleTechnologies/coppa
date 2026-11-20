@@ -574,6 +574,11 @@ class DebianCandidate(unittest.TestCase):
                 metadata = subprocess.check_output(["dpkg-deb", "-f", str(package)], text=True)
                 self.assertIn(f"Architecture: {arch}", metadata)
                 self.assertIn("libasound2t64 | libasound2", metadata)
+                self.assertIn("Section: hamradio", metadata)
+                self.assertIn("Priority: optional", metadata)
+                self.assertIn(f"Homepage: {release.REPOSITORY}", metadata)
+                self.assertIn("Maintainer: Tony Hagale <tony@hagale.net>", metadata)
+                self.assertNotIn(".invalid", metadata)
                 contents = subprocess.check_output(["dpkg-deb", "-c", str(package)], text=True)
                 for name in ("usr/bin/coppa", "usr/bin/coppad", "lib/systemd/system/coppad.service",
                              "LICENSE-MIT", "coppad.toml.example"):
@@ -623,6 +628,36 @@ exit 0
                                 capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         return root, (log.read_text() if log.exists() else "")[len(before):]
+
+    def test_deb_abort_remove_starts_unit_prerm_stopped(self) -> None:
+        root, stopped = self.sandbox_script("prerm", "remove")
+        self.assertIn("deb-systemd-invoke stop coppad.service", stopped)
+        _, restored = self.sandbox_script("postinst", "abort-remove")
+        self.assertIn("systemctl daemon-reload", restored)
+        self.assertIn("deb-systemd-invoke start coppad.service", restored)
+        for command in ("addgroup", "adduser", "install -d", "deb-systemd-helper"):
+            self.assertNotIn(command, restored)
+        self.assertFalse((root / "etc/coppa/setup-token").exists())
+
+    def test_deb_abort_upgrade_and_abort_deconfigure_start_unit(self) -> None:
+        for args in (("abort-upgrade", "0.17.0"),
+                     ("abort-deconfigure", "in-favour", "coppa", "0.17.0")):
+            with self.subTest(args=args):
+                _, commands = self.sandbox_script("postinst", *args)
+                self.assertIn("systemctl daemon-reload", commands)
+                self.assertIn("deb-systemd-invoke start coppad.service", commands)
+                for command in ("addgroup", "adduser", "install -d", "deb-systemd-helper"):
+                    self.assertNotIn(command, commands)
+
+    def test_deb_abort_respects_disabled_unit(self) -> None:
+        _, commands = self.sandbox_script("postinst", "abort-remove", disabled=True)
+        self.assertIn("systemctl daemon-reload", commands)
+        self.assertNotIn("deb-systemd-invoke", commands)
+        self.assertNotIn("deb-systemd-helper", commands)
+
+    def test_deb_abort_remove_survives_policy_denial(self) -> None:
+        _, commands = self.sandbox_script("postinst", "abort-remove", deny_start=True)
+        self.assertIn("deb-systemd-invoke start coppad.service", commands)
 
     def test_deb_first_configure(self) -> None:
         scripts = REPO_ROOT / "tools/release/debian"
