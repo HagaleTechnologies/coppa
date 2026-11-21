@@ -18816,7 +18816,9 @@ mod tests {
             }
         }
 
-        #[tokio::test]
+        // COP-216: the quiet window uses virtual time, while real socket
+        // wakeups still expose transmissions inside the window.
+        #[tokio::test(start_paused = true)]
         async fn host_data_without_a_session_is_not_transmitted() {
             let mut event_loop = EventLoop::new(fast_ptt_config()).unwrap();
             let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
@@ -18845,7 +18847,10 @@ mod tests {
             assert_eq!(consumer.read(&mut [0.0; 1024]), 0);
         }
 
-        #[tokio::test]
+        // COP-216: virtual quiet windows survive slow encoding and runner stalls;
+        // auto-advance reaches the window before the later retry timer, while
+        // real socket wakeups still expose transmissions inside the window.
+        #[tokio::test(start_paused = true)]
         async fn host_data_while_connecting_is_not_transmitted() {
             let mut config = fast_ptt_config();
             config.engine.callsign = "N0CALL".into();

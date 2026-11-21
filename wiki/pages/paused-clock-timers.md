@@ -51,3 +51,11 @@ done
 
 The quota calculation falls back to two CPUs for an unlimited cgroup.
 On an unthrottled host, set `COPIES` to eight times `nproc` instead.
+
+COP-216 runs `host_data_while_connecting_is_not_transmitted` and
+`host_data_without_a_session_is_not_transmitted` on a paused clock. Neither
+test decodes audio, so synchronous DSP work cannot consume its virtual quiet
+window. The VARA command server disables Nagle, allowing real TCP socket
+wakeups to deliver any actual transmission inside the window. Tokio advances
+to the window's quiet timer before the later connect retry deadline, regardless
+of runner load.
