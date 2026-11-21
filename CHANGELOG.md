@@ -20,7 +20,10 @@ Older releases have no entry here. Their on-air breaks are listed in
   floor Data. Two peers advertising CONNECT bit 7 can recover an oversized
   in-flight reliable segment through stop-and-wait floor fragments, retaining
   its sequence and final session ACK. Mixed-version peers keep the OFDM retry
-  for oversized segments. Rust `LinkCapabilities` adds `floor_fragments`, and
+  for oversized segments. A segment rebuilt from RS(12,6) packets whose ACK
+  was lost is re-ACKed when its fragments arrive; a receiver that pins a speed
+  level keeps hearing a negotiated exchange; a fragment waits for PTT release
+  and its response timer counts PTT delays. Rust `LinkCapabilities` adds `floor_fragments`, and
   floor-only `MacFrameType` values 11 and 12 require `MacPdu::from_floor_bytes`.
   The crate minor version advances to 0.18.0; host and C ABI versions do not
   change.

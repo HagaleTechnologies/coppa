@@ -2489,8 +2489,11 @@ enough chunks remain on air. See [BROADCAST.md](BROADCAST.md) for operation.
 
 CONNECT capabilities remain seven bytes. In flags byte 5, bit 0 is compression,
 bit 1 is multi-frame ACK, bit 2 is `outer_code_rx` and bit 3 is `outer_code_req`.
-Bit 4 is `app_messages` (§23.1, COP-121). Bits 5 through 7 are reserved and
-MUST be transmitted as zero and ignored on receipt. An `off` station advertises neither outer-code bit, `accept` advertises
+Bit 4 is `app_messages` (§23.1, COP-121). Bit 5 is `windowed_arq` (COP-168),
+which transmitters MUST send as zero until a later revision specifies its rules.
+Bit 6 is `robust_floor` and bit 7 is `floor_fragments` (COP-222); both are
+negotiated as the "Negotiated low-rate floor session policy" section specifies.
+An `off` station advertises neither outer-code bit, `accept` advertises
 bit 2 only, and `request` advertises both. The negotiated receive bit MUST be
 `a.rx AND b.rx`; the request bit MUST be `rx AND (a.req OR b.req)`. The mode is
 active only when both negotiated bits are true. CONNECT_CFM MUST carry those
@@ -2819,7 +2822,9 @@ station-ID allowance. Two unanswered data windows return a floor-negotiated
 session to the floor, also after a successful probe or when it was established
 on OFDM. A lost probe returns it at once (COP-211). A fitting in-flight segment is retried as ordinary floor Data even if its first send used RS(12,6). For a larger segment, two peers that negotiated bit 7 exchange floor fragments of the original transport PDU under its original sequence. A peer without bit 7 keeps the OFDM retry. RS block ACKs stay on OFDM.
 
-The fragment MAC payload starts with sequence (1 byte), index (1 byte), total transport length (u16 BE) and CRC-32/ISO-HDLC of the whole transport PDU (u32 BE). Requests carry up to 18 consecutive bytes. Lengths 27–4103 are valid, yielding at most 228 fragments. The receiver accepts only the expected sequence, exact per-index length and matching metadata. It replies with the next index after a valid prefix, index zero when the prefix is absent or whole-PDU validation fails, and the ordinary session ACK after full reliable-PDU delivery. An already delivered sequence gets the ordinary ACK again. The sender waits for each progress reply, retries the same index on timeout and retires the ARQ slot only on the ordinary session ACK.
+The fragment MAC payload starts with sequence (1 byte), index (1 byte), total transport length (u16 BE) and CRC-32/ISO-HDLC of the whole transport PDU (u32 BE). Requests carry up to 18 consecutive bytes. Lengths 27–4103 are valid, yielding at most 228 fragments. The receiver accepts only the expected sequence, exact per-index length and matching metadata. It replies with the next index after a valid prefix, index zero when the prefix is absent or whole-PDU validation fails, and the ordinary session ACK after full reliable-PDU delivery. A fragment of the sequence delivered last gets the ordinary ACK again, whether that sequence arrived as plain Data, a rebuilt RS(12,6) block or fragments; any delivery also discards a partial fragment prefix. A receiver keeps accepting fragments on a session that negotiated bit 7 when its speed level is pinned mid-session. The sender waits for each progress reply, retries the same index on timeout and retires the ARQ slot only on the ordinary session ACK.
+
+Reference daemon fragment timing (informative): coppad keys a fragment only with PTT released, never chained onto a transmission already keyed, and keeps the index while it waits. Its response timer starts at that key-up and covers the floor RTO floor (both eight-second floor frames, two turnarounds and the delivery margin), the peer's station-ID allowance, any ID it prepended, and PTT pre-delay and tail for both key-ups. If the retry budget runs out during the exchange, the fade-hold level for any later OFDM retry is sized from the real plain frame and its codeword count.
 
 It
 keeps the 30 s inbound handshake timeout and does not replay a lost

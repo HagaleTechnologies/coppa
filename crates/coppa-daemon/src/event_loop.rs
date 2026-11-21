@@ -444,6 +444,15 @@ fn stream_tagged(app_messages: bool, segment: TransportPdu) -> Vec<u8> {
 }
 
 impl SessionLink {
+    /// COP-222: bookkeeping after `rx` accepted reliable sequence `seq`
+    /// (`bytes` is its transport PDU), whichever waveform or outer code
+    /// carried it: drop any floor fragment prefix and remember the PDU, so a
+    /// fragment retry of it is answered with the regular ACK.
+    fn note_delivered_segment(&mut self, seq: u8, bytes: Vec<u8>) {
+        self.fragment_rx.reset();
+        self.last_delivered_fragment = Identity::new(&bytes, seq).map(|id| (id, bytes));
+    }
+
     /// COP-121 (D7): the stream the next segment carries. Queued chat goes
     /// ahead of queued host bytes; each segment carries one stream.
     fn next_stream(&self) -> u8 {
@@ -955,6 +964,10 @@ pub struct EventLoop {
     /// the only thing left that can release PTT.
     #[cfg(test)]
     panic_in_completion_task: bool,
+    /// COP-222 test seam: advertise the floor (bit 6) without floor
+    /// fragments (bit 7), as a floor-capable coppad older than 0.18.0 does.
+    #[cfg(test)]
+    omit_floor_fragments: bool,
     /// COP-210 test seam: every reliable `phy_mode` push, in order.
     /// Paused-time tests cannot read a real socket reliably.
     #[cfg(all(test, feature = "websocket"))]
@@ -1358,6 +1371,8 @@ impl EventLoop {
             tx_stall_clock: None,
             #[cfg(test)]
             panic_in_completion_task: false,
+            #[cfg(test)]
+            omit_floor_fragments: false,
             #[cfg(all(test, feature = "websocket"))]
             ws_pushed: std::sync::Mutex::new(Vec::new()),
             audio_in_overflow_count: 0,
@@ -3348,7 +3363,16 @@ impl EventLoop {
                         .and_then(|s| s.negotiated.as_ref())
                         .is_some_and(|c| c.app_messages);
                     let seq = segment.seq_num;
+                    let bytes = segment.to_bytes();
                     let delivered = link.rx.receive(seq, stream_tagged(app_messages, segment));
+                    // COP-222: a rebuilt block shares the plain path's
+                    // delivery bookkeeping, so a floor fragment retry after
+                    // a lost ACK is answered with the regular ACK and a
+                    // stale floor prefix cannot block the next sequence.
+                    // The delayed block ACK above is left as it is.
+                    if !delivered.is_empty() {
+                        link.note_delivered_segment(seq, bytes);
+                    }
                     self.route_session_delivery(delivered);
                     for seq in [packet.seq, packet.seq.wrapping_sub(1)] {
                         for index in 0..12 {
@@ -3789,6 +3813,17 @@ impl EventLoop {
 
     /// COP-202: the floor is enabled while the speed level is automatic. A
     /// numbered speed level pins OFDM (COP-195's approved design).
+    /// The capabilities this station puts in CONNECT_REQ/ACK.
+    fn advertised_link_caps(&self, robust_floor: bool) -> LinkCapabilities {
+        #[allow(unused_mut)]
+        let mut caps = local_link_caps(&self.config, robust_floor);
+        #[cfg(test)]
+        if self.omit_floor_fragments {
+            caps.floor_fragments = false;
+        }
+        caps
+    }
+
     fn floor_enabled(&self) -> bool {
         self.manual_speed_level.is_none()
     }
@@ -4331,7 +4366,35 @@ impl EventLoop {
 
     /// Send the current fragment only after a timed retry or a validated
     /// progress response. A refused PTT attempt retains the index.
+    ///
+    /// A fragment never joins a transmission already keyed: chained audio
+    /// inherits that interval's `max_tx_duration_s` watchdog, which may not
+    /// leave a floor frame of airtime, and its response timer would start
+    /// before the fragment is on the air. It waits for PTT release on the
+    /// 500 ms poll, still owning the slot and its index.
     async fn send_session_fragment(&mut self) {
+        if self
+            .session_link
+            .as_ref()
+            .is_some_and(|l| l.fragment_tx.is_some())
+            && (!self.floor_enabled()
+                || self.floor.mode(self.engine.speed_level()) != LinkPhyMode::Floor)
+        {
+            if let Some(link) = self.session_link.as_mut() {
+                link.fragment_tx = None;
+            }
+            return;
+        }
+        if self.is_transmitting {
+            if let Some(tx) = self
+                .session_link
+                .as_mut()
+                .and_then(|l| l.fragment_tx.as_mut())
+            {
+                tx.deadline = clock_now() + Duration::from_millis(500);
+            }
+            return;
+        }
         let Some((frame, seq)) = self.session_link.as_ref().and_then(|link| {
             let tx = link.fragment_tx.as_ref()?;
             Some((
@@ -4356,22 +4419,21 @@ impl EventLoop {
         let own_id = Duration::from_secs_f64(
             keyed.saturating_sub(samples.len()) as f64 / self.engine.config().sample_rate as f64,
         );
-        let interval =
-            floor_policy::floor_rto_floor(self.turnaround()) + self.station_id_allowance() + own_id;
-        let fallback_level = self
-            .session_link
-            .as_ref()
-            .and_then(|l| l.fragment_tx.as_ref())
-            .map(|tx| {
-                fittest_level_with_codewords(
-                    self.engine
-                        .encoded_payload_len(&vec![0; MacPdu::HEADER_SIZE + tx.data.len()]),
-                    self.engine.speed_level(),
-                    self.session_link
-                        .as_ref()
-                        .map_or(1, |l| l.tx_codewords.max(1)),
-                )
-            });
+        let interval = self.fragment_response_window(own_id);
+        // COP-68: a later OFDM retry of this slot encodes the real plain
+        // frame at the fallback level, so size it from that frame and the
+        // segment's codeword count, as the OFDM retry path does.
+        let fallback_level = self.session_link.as_ref().and_then(|l| {
+            let tx = l.fragment_tx.as_ref()?;
+            let frame =
+                MacPdu::new_data(l.remote.clone(), l.local.clone(), l.ssid, tx.data.clone())
+                    .to_bytes();
+            Some(fittest_level_with_codewords(
+                self.engine.encoded_payload_len(&frame),
+                self.engine.speed_level(),
+                l.tx_codewords.max(1),
+            ))
+        });
         if let Some(link) = self.session_link.as_mut() {
             if let Some(tx) = link.fragment_tx.as_mut().filter(|tx| tx.id.seq == seq) {
                 if keyed > 0 {
@@ -4526,22 +4588,39 @@ impl EventLoop {
             Some(self.rx_turnaround_until.map_or(until, |old| old.max(until)));
     }
 
+    /// Whether `pdu` is a fragment frame from this link's peer on a session
+    /// that negotiated bit 7. Like ordinary floor dispatch, a speed level
+    /// pinned mid-session does not stop reception: the negotiated
+    /// capability, not the current transmit setting, admits the frame.
     fn floor_fragment_peer(&self, pdu: &MacPdu) -> bool {
-        self.floor_enabled()
-            && self.session_link.as_ref().is_some_and(|l| {
-                pdu.src == l.remote
-                    && pdu.dest == l.local
-                    && pdu.ssid == l.ssid
-                    && self.session_mgr.get(l.session_id).is_some_and(|s| {
-                        (s.is_established()
-                            || (s.state == SessionState::Disconnecting
-                                && self
-                                    .pending_disconnect
-                                    .as_ref()
-                                    .is_some_and(|p| p.session_id == s.id)))
-                            && s.negotiated.as_ref().is_some_and(|c| c.floor_fragments)
-                    })
-            })
+        self.session_link.as_ref().is_some_and(|l| {
+            pdu.src == l.remote
+                && pdu.dest == l.local
+                && pdu.ssid == l.ssid
+                && self.session_mgr.get(l.session_id).is_some_and(|s| {
+                    (s.is_established()
+                        || (s.state == SessionState::Disconnecting
+                            && self
+                                .pending_disconnect
+                                .as_ref()
+                                .is_some_and(|p| p.session_id == s.id)))
+                        && s.negotiated.as_ref().is_some_and(|c| c.floor_fragments)
+                })
+        })
+    }
+
+    /// Response window for one fragment exchange, timed from this
+    /// station's key-up: the shared floor RTO floor (both eight-second floor
+    /// frames, two turnarounds and the delivery margin), the peer's
+    /// station-ID allowance and any ID we prepended, as for an ordinary
+    /// floor key-up, plus PTT pre-delay and tail for both key-ups, which the
+    /// normal OFDM budget also counts.
+    fn fragment_response_window(&self, own_id: Duration) -> Duration {
+        let radio = &self.config.radio;
+        floor_policy::floor_rto_floor(self.turnaround())
+            + self.station_id_allowance()
+            + own_id
+            + Duration::from_millis(radio.ptt_pre_delay_ms + radio.ptt_tail_delay_ms) * 2
     }
 
     async fn send_floor_fragment_reply(&mut self, frame: Vec<u8>) {
@@ -5546,7 +5625,7 @@ impl EventLoop {
                 }
                 self.pending_dial = None;
                 let floor = self.floor_enabled();
-                let caps = local_link_caps(&self.config, floor);
+                let caps = self.advertised_link_caps(floor);
                 let now = clock_now();
                 self.reset_floor();
                 let local_call = local.clone();
@@ -8411,7 +8490,7 @@ impl EventLoop {
         }
 
         let remote = pdu.src.clone();
-        let caps = local_link_caps(&self.config, self.floor_enabled());
+        let caps = self.advertised_link_caps(self.floor_enabled());
         let now = clock_now();
         match self
             .session_mgr
@@ -8716,7 +8795,6 @@ impl EventLoop {
         let link = self.session_link.as_mut()?;
         let seq = segment.seq_num;
         let bytes = segment.to_bytes();
-        let fragment_id = Identity::new(&bytes, seq);
         let delivered = link.rx.receive(seq, stream_tagged(app_messages, segment));
         // Once ARQ accepts the segment, release retained shards immediately.
         // Subsequent packets of this burst are duplicates of recv_base - 1.
@@ -8726,8 +8804,7 @@ impl EventLoop {
             link.block_ack_ready = false;
         }
         if !delivered.is_empty() {
-            link.fragment_rx.reset();
-            link.last_delivered_fragment = fragment_id.map(|id| (id, bytes));
+            link.note_delivered_segment(seq, bytes);
         }
         let ack = session_ack_frame(link);
         self.route_session_delivery(delivered);
@@ -12637,6 +12714,350 @@ mod tests {
             );
             assert_eq!(b.session_link.as_ref().unwrap().rx.recv_base(), 1);
         }
+    }
+
+    /// COP-222 AC5: B rebuilds A's segment from RS packets and its block
+    /// ACK is lost. A's floor fragment retry of the same sequence is a
+    /// duplicate B must answer with the regular ACK (not ignore), and that
+    /// ACK, decoded by A on the floor, retires A's original ARQ slot.
+    #[tokio::test(start_paused = true)]
+    async fn cop222_rs_delivery_with_lost_ack_is_reacked_for_fragment_retry() {
+        let (mut a, mut b, mut audio_a, mut audio_b) = connected_pair(0).await;
+        let (tx, mut host_rx) = mpsc::unbounded_channel();
+        b.set_response_tx(tx);
+        let session_id = b.session_link.as_ref().unwrap().session_id;
+        let caps = b
+            .session_mgr
+            .get_mut(session_id)
+            .unwrap()
+            .negotiated
+            .as_mut()
+            .unwrap();
+        caps.outer_code_rx = true;
+        caps.outer_code_req = true;
+        let host = cop222_incompressible(252);
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: host.clone(),
+        })
+        .await;
+        take_leg(&mut audio_a, "A's OFDM original, which B never decodes");
+        a.handle_ptt_change(false).await;
+        let link = a.session_link.as_ref().unwrap();
+        let seq = link.tx.send_base();
+        let segment = link.tx.get_segment_data(seq).unwrap().to_vec();
+        assert_eq!(segment, host, "one OFDM-sized segment");
+        let transport =
+            TransportPdu::new_reliable(link.tx_stream, seq, 0, segment.clone()).to_bytes();
+        assert!(MacPdu::HEADER_SIZE + transport.len() > FLOOR_MAX_PAYLOAD);
+
+        // B rebuilds the block from six of its twelve packets.
+        let (local, remote, ssid) = {
+            let link = b.session_link.as_ref().unwrap();
+            (link.local.clone(), link.remote.clone(), link.ssid)
+        };
+        let packets = coppa_protocol::outer_code::encode_block(seq, &transport, 99).unwrap();
+        for packet in &packets[..6] {
+            b.handle_session_outer_data(
+                MacPdu::new(
+                    MacFrameType::OuterData,
+                    local.clone(),
+                    remote.clone(),
+                    ssid,
+                    packet.to_bytes().unwrap(),
+                ),
+                2,
+            )
+            .await;
+        }
+        assert_eq!(b.session_link.as_ref().unwrap().rx.recv_base(), seq + 1);
+        // The delayed block ACK keys, and is lost.
+        tokio::time::advance(Duration::from_secs(30)).await;
+        b.flush_block_ack().await;
+        take_leg(&mut audio_b, "B's block ACK, which is lost");
+        b.handle_ptt_change(false).await;
+        tokio::time::advance(Duration::from_secs(30)).await;
+
+        // A's slot expires on the floor and starts a fragment exchange.
+        a.floor.received(LinkPhyMode::Floor);
+        let rto = a.session_link.as_ref().unwrap().tx.rto();
+        tokio::time::advance(rto + Duration::from_millis(5)).await;
+        a.check_session_retransmits().await;
+        let fragment = a.session_link.as_ref().unwrap().fragment_tx.as_ref();
+        assert!(
+            fragment.is_some_and(|f| f.id.seq == seq && f.index == 0 && f.keyed),
+            "A keyed fragment 0 of the original sequence"
+        );
+        assert_eq!(a.phy_tx, Some(LinkPhyMode::Floor));
+        b.decode_and_dispatch_audio(&floor_leg(&mut audio_a, "fragment 0"))
+            .await;
+        a.handle_ptt_change(false).await;
+        assert_eq!(b.phy_rx, Some(LinkPhyMode::Floor));
+        let reply = floor_leg(&mut audio_b, "B's regular ACK for the duplicate");
+        b.handle_ptt_change(false).await;
+        assert_eq!(b.phy_tx, Some(LinkPhyMode::Floor));
+        a.decode_and_dispatch_audio(&reply).await;
+        let link = a.session_link.as_ref().unwrap();
+        assert_eq!(a.phy_rx, Some(LinkPhyMode::Floor));
+        assert_eq!(link.tx.in_flight(), 0, "the floor ACK retired the slot");
+        assert_eq!(link.tx.send_base(), seq + 1);
+        assert!(link.fragment_tx.is_none());
+        let mut delivered = Vec::new();
+        while let Ok(response) = host_rx.try_recv() {
+            if let HostResponse::DataOut { data, .. } = response {
+                delivered.extend(data);
+            }
+        }
+        assert_eq!(delivered, host, "delivered once, by the RS block");
+    }
+
+    /// COP-222 AC6: a floor-capable peer without bit 7 (an older coppad)
+    /// negotiates the floor but not fragments. When A's oversized segment
+    /// expires after A returned to the floor, A keys a fresh OFDM retry of
+    /// the same slot instead of starting a fragment exchange.
+    #[tokio::test(start_paused = true)]
+    async fn cop222_floor_peer_without_fragments_keeps_ofdm_retry() {
+        let (mut a, mut b, mut audio_a, mut audio_b) = unconnected_pair(0, |_| {}, |_| {});
+        b.omit_floor_fragments = true;
+        handshake_pair(&mut a, &mut b, &mut audio_a, &mut audio_b).await;
+        for station in [&a, &b] {
+            let caps = station
+                .session_link
+                .as_ref()
+                .and_then(|l| station.session_mgr.get(l.session_id))
+                .and_then(|s| s.negotiated.clone())
+                .unwrap();
+            assert!(caps.robust_floor, "the floor is negotiated");
+            assert!(!caps.floor_fragments, "bit 7 is not");
+        }
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: cop222_incompressible(252),
+        })
+        .await;
+        take_leg(&mut audio_a, "the original OFDM frame");
+        a.handle_ptt_change(false).await;
+        let seq = a.session_link.as_ref().unwrap().tx.send_base();
+        let frame_len = {
+            let link = a.session_link.as_ref().unwrap();
+            session_stream_frame(
+                link,
+                link.tx_stream,
+                seq,
+                link.tx.get_segment_data(seq).unwrap(),
+            )
+            .len()
+        };
+        assert!(frame_len > FLOOR_MAX_PAYLOAD);
+        a.floor.received(LinkPhyMode::Floor);
+        assert_eq!(
+            a.floor.mode(a.engine.speed_level()),
+            LinkPhyMode::Floor,
+            "A is back on the floor"
+        );
+        let attempts = a.session_link.as_ref().unwrap().tx.transmit_count(seq);
+        let rto = a.session_link.as_ref().unwrap().tx.rto();
+        tokio::time::advance(rto + Duration::from_millis(5)).await;
+        a.check_session_retransmits().await;
+        let retry = take_leg(&mut audio_a, "a fresh retry of the oversized slot");
+        let link = a.session_link.as_ref().unwrap();
+        assert!(link.fragment_tx.is_none(), "no fragment exchange");
+        assert!(matches!(a.phy_tx, Some(LinkPhyMode::Ofdm { .. })));
+        assert_eq!(link.tx.send_base(), seq, "the same ARQ slot");
+        assert_eq!(
+            link.tx.transmit_count(seq),
+            attempts.map(|n| n + 1),
+            "counted as one retransmission"
+        );
+        // B decodes the OFDM retry and delivers the segment.
+        unstick_decoder(&mut b);
+        b.decode_and_dispatch_audio(&retry).await;
+        assert_eq!(b.session_link.as_ref().unwrap().rx.recv_base(), seq + 1);
+    }
+
+    /// COP-222: a fragment exchange that exhausts the retry budget enters
+    /// the fade hold at a level sized from the real plain frame and its
+    /// codeword count, so a later OFDM retry of the slot can encode there.
+    #[tokio::test(start_paused = true)]
+    async fn cop222_fragment_fade_hold_sizes_the_real_frame() {
+        let (mut a, _, mut audio, _) = connected_pair(0).await;
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: cop222_incompressible(252),
+        })
+        .await;
+        take_leg(&mut audio, "the original data frame");
+        a.handle_ptt_change(false).await;
+        let link = a.session_link.as_mut().unwrap();
+        let seq = link.tx.send_base();
+        let codewords = link.tx_codewords.max(1);
+        let frame = session_stream_frame(
+            link,
+            link.tx_stream,
+            seq,
+            link.tx.get_segment_data(seq).unwrap(),
+        );
+        let data = frame[MacPdu::HEADER_SIZE..].to_vec();
+        link.tx.set_max_retransmit(0);
+        link.fragment_tx = Some(session_fragments::Tx {
+            id: Identity::new(&data, seq).unwrap(),
+            data,
+            index: 0,
+            deadline: clock_now(),
+            keyed: false,
+            failed_exchanges: 0,
+        });
+        a.floor.received(LinkPhyMode::Floor);
+        a.check_session_retransmits().await;
+        take_leg(&mut audio, "fragment 0");
+        a.handle_ptt_change(false).await;
+        let level = a
+            .session_link
+            .as_ref()
+            .unwrap()
+            .fallback
+            .as_ref()
+            .expect("the exhausted fragment retry entered the fade hold")
+            .level;
+        assert_eq!(
+            level,
+            fittest_level_with_codewords(
+                a.engine.encoded_payload_len(&frame),
+                a.engine.speed_level(),
+                codewords,
+            )
+        );
+        a.engine
+            .encode_bytes_with_level_and_codewords(&frame, level, codewords)
+            .expect("the real frame encodes at the fallback level");
+    }
+
+    /// COP-222: pinning a speed level on the receiver mid-session does not
+    /// stop it hearing the negotiated fragment exchange (ordinary floor
+    /// dispatch keeps existing sessions the same way).
+    #[tokio::test(start_paused = true)]
+    async fn cop222_pinned_receiver_keeps_receiving_fragments() {
+        let (_, mut b, _, mut audio_b) = connected_pair(0).await;
+        b.manual_speed_level = Some(b.engine.speed_level());
+        let link = b.session_link.as_ref().unwrap();
+        let (local, remote, ssid) = (link.local.clone(), link.remote.clone(), link.ssid);
+        let transport = TransportPdu::new_reliable(0, 0, 0, vec![42; 54]).to_bytes();
+        let id = Identity::new(&transport, 0).unwrap();
+        let mut payload = id.header(0);
+        payload.extend_from_slice(&transport[..session_fragments::CHUNK]);
+        let pdu = MacPdu::new(MacFrameType::FloorFragment, local, remote, ssid, payload);
+        assert!(b.floor_fragment_peer(&pdu));
+        b.handle_floor_fragment(pdu).await;
+        assert!(
+            !take_leg(&mut audio_b, "the progress reply").is_empty(),
+            "the pinned receiver answers the fragment"
+        );
+        assert_eq!(b.phy_tx, Some(LinkPhyMode::Floor));
+    }
+
+    /// `take_leg` plus one second of silence: the floor receiver tries one
+    /// window per second of input, so a leg ending with its frame would
+    /// otherwise not be decoded until the next leg arrives.
+    fn floor_leg(consumer: &mut coppa_audio::AudioRingConsumer, what: &str) -> Vec<f32> {
+        let mut leg = take_leg(consumer, what);
+        leg.extend(std::iter::repeat_n(0.0f32, 48_000));
+        leg
+    }
+
+    /// Incompressible bytes, so a write's frame length is its raw length.
+    fn cop222_incompressible(len: usize) -> Vec<u8> {
+        let mut x = 0x2545_f491_u32;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// COP-222: with an outbound transmission already keyed, a due fragment
+    /// waits for PTT release instead of chaining onto that interval, keeps
+    /// its index, and starts its response timer only when it keys. The
+    /// timer then covers both stations' PTT pre-delay and tail.
+    #[tokio::test(start_paused = true)]
+    async fn cop222_fragment_waits_for_ptt_release_and_counts_ptt_delays() {
+        let (mut a, _, mut audio, _) = connected_pair(0).await;
+        a.handle_host_event(HostEvent::DataReceived {
+            client_id: 1,
+            data: cop222_incompressible(252),
+        })
+        .await;
+        take_leg(&mut audio, "the original data frame");
+        a.handle_ptt_change(false).await;
+        a.config.radio.ptt_pre_delay_ms = 400;
+        a.config.radio.ptt_tail_delay_ms = 300;
+        let link = a.session_link.as_mut().unwrap();
+        let seq = link.tx.send_base();
+        let data = TransportPdu::new_reliable(
+            link.tx_stream,
+            seq,
+            0,
+            link.tx.get_segment_data(seq).unwrap().to_vec(),
+        )
+        .to_bytes();
+        link.fragment_tx = Some(session_fragments::Tx {
+            id: Identity::new(&data, seq).unwrap(),
+            data,
+            index: 2,
+            deadline: clock_now(),
+            keyed: false,
+            failed_exchanges: 0,
+        });
+        a.floor.received(LinkPhyMode::Floor);
+        let attempts = a.session_link.as_ref().unwrap().tx.transmit_count(seq);
+
+        // Another transmission holds PTT: nothing chains onto it.
+        a.handle_ptt_change(true).await;
+        a.check_session_retransmits().await;
+        assert!(read_all(&mut audio).is_empty(), "no fragment while keyed");
+        let tx = a
+            .session_link
+            .as_ref()
+            .unwrap()
+            .fragment_tx
+            .as_ref()
+            .unwrap();
+        assert!(!tx.keyed && tx.index == 2, "the index is retained");
+        assert!(tx.deadline > clock_now(), "retried on a later poll");
+        assert_eq!(
+            a.session_link.as_ref().unwrap().tx.transmit_count(seq),
+            attempts,
+            "an unsent fragment is not an attempt"
+        );
+
+        a.handle_ptt_change(false).await;
+        let deadline = a
+            .session_link
+            .as_ref()
+            .unwrap()
+            .fragment_tx
+            .as_ref()
+            .unwrap()
+            .deadline;
+        tokio::time::advance(deadline.saturating_duration_since(clock_now())).await;
+        a.check_session_retransmits().await;
+        take_leg(&mut audio, "fragment 2 after PTT release");
+        let keyed_at = clock_now();
+        let tx = a
+            .session_link
+            .as_ref()
+            .unwrap()
+            .fragment_tx
+            .as_ref()
+            .unwrap();
+        assert!(tx.keyed && tx.index == 2);
+        let without_ptt = floor_policy::floor_rto_floor(a.turnaround()) + a.station_id_allowance();
+        assert!(
+            tx.deadline >= keyed_at + without_ptt + Duration::from_millis(2 * (400 + 300)),
+            "the response window counts PTT pre-delay and tail for both key-ups"
+        );
     }
 
     /// COP-38 (D7) + COP-68: a link whose every frame is lost ends cleanly
@@ -29153,11 +29574,21 @@ mod tests {
             let (mut tx_a, mut tx_b) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
             let (mut connected, mut floor_data, mut clean, mut faded, mut a_keyed) =
                 (false, false, false, false, false);
-            let mut first_ofdm = None;
-            let mut floor_retry = false;
-            let mut floor_ack = false;
+            let mut first_ofdm: Option<DataKeyUp> = None;
             let mut delivered = Vec::new();
             let mut fade_at = None;
+            // The original sessions, captured at connection.
+            let mut sessions: Option<(u8, u8)> = None;
+            // Transitions of the target sequence, observed on the stations'
+            // ARQ state rather than on key-ups (a keepalive also keys while
+            // the slot is pending): B's receive base passing the target,
+            // with the waveform B validated it on, and A's send base passing
+            // it, with the waveform the retiring ACK arrived on.
+            let (mut b_base, mut a_base) = (0u8, 0u8);
+            let mut target_rx: Option<Option<LinkPhyMode>> = None;
+            let mut target_ack: Option<(Duration, Option<LinkPhyMode>)> = None;
+            let mut fragments_keyed = false;
+            let dwell = floor_policy::floor_rto_floor(a.station.turnaround());
             while start.elapsed() < Duration::from_secs(horizon) {
                 step_stations(&mut a, &mut b, &mut clock).await;
                 if connected && a.station.is_transmitting && !a_keyed {
@@ -29165,15 +29596,42 @@ mod tests {
                         if clean && !faded && key.mode == Some(LinkPhyMode::Ofdm { level: 2 }) {
                             first_ofdm = Some(key);
                         }
-                        if faded
-                            && key.mode == Some(LinkPhyMode::Floor)
-                            && first_ofdm.is_some_and(|first| first.seq == key.seq)
-                        {
-                            floor_retry = true;
-                        }
                     }
                 }
                 a_keyed = a.station.is_transmitting;
+                if let (Some(first), true) = (first_ofdm, faded) {
+                    fragments_keyed |= a.station.session_link.as_ref().is_some_and(|l| {
+                        l.fragment_tx
+                            .as_ref()
+                            .is_some_and(|f| f.id.seq == first.seq && f.keyed)
+                    });
+                    let b_now = b
+                        .station
+                        .session_link
+                        .as_ref()
+                        .map_or(0, |l| l.rx.recv_base());
+                    if b_base == first.seq && b_now == first.seq.wrapping_add(1) {
+                        target_rx = Some(b.station.phy_rx);
+                    }
+                    let a_now = a
+                        .station
+                        .session_link
+                        .as_ref()
+                        .map_or(0, |l| l.tx.send_base());
+                    if a_base == first.seq && a_now == first.seq.wrapping_add(1) {
+                        target_ack = Some((start.elapsed(), a.station.phy_rx));
+                    }
+                }
+                b_base = b
+                    .station
+                    .session_link
+                    .as_ref()
+                    .map_or(0, |l| l.rx.recv_base());
+                a_base = a
+                    .station
+                    .session_link
+                    .as_ref()
+                    .map_or(0, |l| l.tx.send_base());
                 floor_data |= connected && a.station.phy_tx == Some(LinkPhyMode::Floor);
                 if !clean && floor_data && a.station.phy_tx == Some(LinkPhyMode::Ofdm { level: 1 })
                 {
@@ -29206,6 +29664,10 @@ mod tests {
                 move_block(&mut a, &mut b, &mut tx_a, &mut tx_b, false);
                 if !connected && both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC") {
                     connected = true;
+                    sessions = Some((
+                        a.station.session_link.as_ref().unwrap().session_id,
+                        b.station.session_link.as_ref().unwrap().session_id,
+                    ));
                     a.station
                         .handle_host_event(HostEvent::DataReceived {
                             client_id: 1,
@@ -29214,18 +29676,13 @@ mod tests {
                         .await;
                 }
                 drain_host_data(&mut b_host, &mut delivered);
-                floor_ack |= floor_retry
-                    && a.station.phy_rx == Some(LinkPhyMode::Floor)
-                    && a.station
-                        .session_link
-                        .as_ref()
-                        .is_some_and(|l| l.tx.in_flight() == 0);
+                // Stay a full floor response window past the retiring ACK.
                 if delivered.len() >= payload.len()
                     && a.station
                         .session_link
                         .as_ref()
                         .is_some_and(|l| l.tx.in_flight() == 0 && !l.has_backlog())
-                    && fade_at.is_some_and(|at| start.elapsed() > at + Duration::from_secs(30))
+                    && target_ack.is_some_and(|(at, _)| start.elapsed() > at + dwell)
                 {
                     break;
                 }
@@ -29237,13 +29694,38 @@ mod tests {
             assert_eq!(first.segment_len, write_len - 48);
             assert_eq!(first.frame_len, if write_len == 300 { 273 } else { 29 });
             assert!(first.outer, "the first send used the negotiated outer code");
-            assert!(
-                floor_retry,
-                "same sequence was retried on the floor: {first:?}"
+            // AC1/AC3: B's receive base passed the target on a validated
+            // floor frame. A frame over one floor PDU can only arrive on the
+            // floor by reassembly, and a fitting one as ordinary Data: A
+            // keyed fragments for the target exactly when it did not fit.
+            assert_eq!(
+                target_rx,
+                Some(Some(LinkPhyMode::Floor)),
+                "B accepted sequence {} on the floor",
+                first.seq
             );
-            assert_eq!(delivered, payload, "host bytes after fade");
+            assert_eq!(
+                fragments_keyed,
+                first.frame_len > FLOOR_MAX_PAYLOAD,
+                "fragments carried the target only when it was oversized"
+            );
+            assert_eq!(delivered, payload, "host bytes after fade, exactly once");
+            // AC2/AC4: the retiring ACK arrived on the floor, and both
+            // original sessions are still established a full floor response
+            // window later.
+            let (ack_at, ack_mode) = target_ack.expect("A's send base passed the target");
+            assert_eq!(ack_mode, Some(LinkPhyMode::Floor), "a floor ACK");
+            assert!(fade_at.is_some_and(|fade| ack_at > fade), "after the fade");
+            assert!(start.elapsed() > ack_at + dwell);
             assert!(both_confirmed(&a.station, &b.station, "W1AW", "VK3ABC"));
-            assert!(floor_ack, "the floor ACK retired the original ARQ slot");
+            assert_eq!(
+                (
+                    a.station.session_link.as_ref().unwrap().session_id,
+                    b.station.session_link.as_ref().unwrap().session_id,
+                ),
+                sessions.unwrap(),
+                "the original sessions"
+            );
             assert_eq!(a.station.session_link.as_ref().unwrap().tx.in_flight(), 0);
         }
 
