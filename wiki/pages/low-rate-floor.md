@@ -12,6 +12,7 @@ sources:
   - crates/coppa-bench/src/floor_sweep.rs
   - crates/coppa-protocol/src/modem/floor.rs
   - crates/coppa-daemon/src/event_loop.rs
+  - crates/coppa-daemon/src/session_fragments.rs
   - crates/coppa-protocol/src/floor_controller.rs
   - crates/coppa-host/src/websocket.rs
   - crates/coppa-daemon/src/web/index.html
@@ -136,3 +137,7 @@ like any inbound handshake, so every CANCELPENDING decision goes through
 `PENDING`. A crossed call bypasses `LISTEN OFF`. See
 [LIMITATIONS](../../docs/LIMITATIONS.md#cop-169-robust-low-rate-floor)
 for the stagger's cost.
+
+COP-222: coppad recovers an oversized in-flight slot with floor fragments
+(`crates/coppa-daemon/src/session_fragments.rs`); only the ordinary session ACK
+retires it. Wire rules: [SPEC floor policy](../../docs/SPEC.md#negotiated-low-rate-floor-session-policy).

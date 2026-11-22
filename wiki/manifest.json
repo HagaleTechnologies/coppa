@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-20T13:56:51Z",
-  "head_commit": "b457866",
+  "generated_at": "2026-11-21T21:34:39Z",
+  "head_commit": "6fc2560",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -580,7 +580,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:7d7eca460a826a73dfb83f46a4e2ffa90d2b5f035b07bc7c45e11a5c8460c6a7",
+      "hash": "sha256:bfb609530931605fcde79c02c358e2aebb79b8ea7e7977ccd51a2844ae014df4",
       "id": "low-rate-floor",
       "kind": "gotcha",
       "links": [
@@ -598,6 +598,7 @@
         "crates/coppa-bench/src/floor_sweep.rs",
         "crates/coppa-protocol/src/modem/floor.rs",
         "crates/coppa-daemon/src/event_loop.rs",
+        "crates/coppa-daemon/src/session_fragments.rs",
         "crates/coppa-protocol/src/floor_controller.rs",
         "crates/coppa-host/src/websocket.rs",
         "crates/coppa-daemon/src/web/index.html"

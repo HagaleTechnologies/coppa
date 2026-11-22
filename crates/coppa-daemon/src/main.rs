@@ -24,6 +24,7 @@ mod event_loop;
 mod level_meter;
 mod logging;
 mod ptt_guardian;
+mod session_fragments;
 mod session_outer;
 mod signals;
 #[cfg(feature = "websocket")]
