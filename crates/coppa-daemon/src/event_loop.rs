@@ -29730,13 +29730,11 @@ mod tests {
         }
 
         #[tokio::test(start_paused = true)]
-        #[ignore = "paired-audio fade: tens of minutes in a debug build; ci-full's daemon-unit group runs it under --profile ci"]
         async fn cop222_outer_segment_delivered_on_floor() {
             cop222_probe_then_fade(56, 700).await;
         }
 
         #[tokio::test(start_paused = true)]
-        #[ignore = "paired-audio fade: tens of minutes in a debug build; ci-full's daemon-unit group runs it under --profile ci"]
         async fn cop222_oversized_segment_delivered_on_floor() {
             cop222_probe_then_fade(300, 900).await;
         }

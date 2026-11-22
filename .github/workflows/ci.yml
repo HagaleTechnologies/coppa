@@ -160,7 +160,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install ALSA dev headers (for cpal)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test --workspace --features cpal-backend,websocket,kiss-tnc,serial-ptt,gpio-ptt,ardop,mdns --lib
+      # COP-222: the two paired-audio fade regressions take tens of minutes in
+      # a debug build on hosted runners and pushed this job past its cap.
+      # ci-full's daemon-unit group runs them, optimized (--profile ci).
+      - run: cargo test --workspace --features cpal-backend,websocket,kiss-tnc,serial-ptt,gpio-ptt,ardop,mdns --lib -- --skip floor_connect::cop222_
       - run: cargo check --workspace --no-default-features
 
   fmt:
@@ -195,7 +198,8 @@ jobs:
       - run: cargo check --workspace
       - name: Check the mDNS responder builds (COP-140)
         run: cargo check -p coppa-daemon --features mdns
-      - run: cargo test --workspace --lib
+      # COP-222: see test-features; ci-full runs the skipped fade regressions.
+      - run: cargo test --workspace --lib -- --skip floor_connect::cop222_
       - name: Test cpal-backend on macOS/Windows
         if: runner.os != 'Linux'
         run: cargo test -p coppa-audio --lib --features cpal-backend

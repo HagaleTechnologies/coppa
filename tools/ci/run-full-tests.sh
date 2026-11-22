@@ -26,10 +26,6 @@ case "$group" in
     ;;
   daemon-unit)
     selection -p coppa-daemon --features "$features" --lib --bins
-    # COP-222's paired-audio fade regressions are #[ignore]d so the debug
-    # fast tier (ci.yml) stays inside its 90-minute job limit; run them here
-    # once, optimized. The filter keeps the other ignored measurements out.
-    timed execute-ignored cargo test --locked --profile ci -p coppa-daemon --features "$features" --lib -- --ignored floor_connect::cop222_
     ;;
   daemon-integration)
     selection -p coppa-daemon --features "$features" --test '*'
