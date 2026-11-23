@@ -164,7 +164,9 @@ The daemon self-test uses two unmodified `coppad` processes. These results
 test the audio cable and host interface; they are separate from the library
 `Link` rows above. Real-time scheduling means fixed seeds do not make these
 trials bit-reproducible. The modem column names the coppad version that
-recorded the rows, which can differ from the library rows' version.
+recorded the rows, which can differ from the library rows' version. coppad
+runs HF_STANDARD, which compresses each frame and sends up to eight codewords
+per frame. The library rows do not compress and send one codeword per frame.
 
 Each trial writes the same seeded bytes as the library trial with the same
 seed. Its row records their CRC-32 as `payload_crc32`, and `compare blackbox`
@@ -176,7 +178,8 @@ mismatch, and bytes beyond the payload, do not count. Net B/min is
 trial is completed only when the received bytes equal the payload exactly.
 With the KISS adapter, each received datagram that equals a payload datagram
 counts once. Before COP-227 the published rows came from coppad 0.16.0 and
-wrote a 256-byte repeating ramp. COP-227 re-recorded all six with the seeded
+wrote a 256-byte repeating ramp; `results/compare/metadata.md` explains why
+the ramp took the same frames. COP-227 re-recorded all six with the seeded
 bytes.
 
 Connect time runs from dial to the caller's CONNECTED. Wall time runs from

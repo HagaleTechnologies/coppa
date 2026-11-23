@@ -17,8 +17,8 @@ sources:
   - crates/coppa-host/src/websocket.rs
   - crates/coppa-daemon/src/web/index.html
 verified:
-  commit: 5244d4e2534428748155b10810d5835685d1c029
-  date: 2026-11-16
+  commit: d2bcc0a5dba97c0a86dede97ac9b232e68ba1b86
+  date: 2026-11-22
 links:
   - coppa-protocol
   - band-conventions

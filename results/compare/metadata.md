@@ -110,7 +110,16 @@ Each row records `payload_crc32`, the CRC-32 of the seeded bytes the trial
 wrote, and `compare blackbox` refuses to resume into a CSV without that
 column or whose row carries another value for its seed and size. Before
 COP-227 the published rows came from coppad 0.16.0 (sha256 `9b8b4957…`) and
-wrote a 256-byte repeating ramp. None of those rows remains.
+wrote a 256-byte repeating ramp. None of those rows remains. The ramp had
+not lowered their on-air work. coppad compresses each frame's chunk on its
+own, and no frame holds more than 1424 encoded bytes (eight codewords at
+level 4 or 7). With HF_STANDARD compression, the 2048-byte ramp encodes to
+3550 bytes and the six seeds' payloads to 3509 to 3583, so up to that size
+the ramp compresses no better than seeded bytes. The ramp only compresses
+better at larger sizes (3572 or 3573 bytes at 4096, against 7024 to 7112 for
+the same seeds), and no frame reaches them. COP-226 ran coppad's chunker on
+the ramp and on seeded bytes at levels 2, 4 and 8, for 2048 and 16384 bytes,
+and the frame count and airtime matched in every case.
 
 To extend these cells, resume with the binary whose sha256 is
 `blackbox_binary_sha256`. A release build's sha256 changes with the checkout
