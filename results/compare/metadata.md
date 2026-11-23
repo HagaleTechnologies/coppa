@@ -111,7 +111,7 @@ wrote, and `compare blackbox` refuses to resume into a CSV without that
 column or whose row carries another value for its seed and size. Before
 COP-227 the published rows came from coppad 0.16.0 (sha256 `9b8b4957…`) and
 wrote a 256-byte repeating ramp. None of those rows remains. The ramp had
-not lowered their on-air work. coppad compresses each frame's chunk on its
+not lowered those removed rows' on-air work. coppad compresses each frame's chunk on its
 own, and no frame holds more than 1424 encoded bytes (eight codewords at
 level 4 or 7). With HF_STANDARD compression, the 2048-byte ramp encodes to
 3550 bytes and the six seeds' payloads to 3509 to 3583, so up to that size
