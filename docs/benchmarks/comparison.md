@@ -168,7 +168,7 @@ recorded the rows, which can differ from the library rows' version. coppad
 runs HF_STANDARD, which compresses each frame and sends up to eight codewords
 per frame. The library rows do not compress and send one codeword per frame.
 
-Each trial writes the same seeded bytes as the library trial with the same
+Each trial generates the same seeded bytes as the library trial with the same
 seed. Its row records their CRC-32 as `payload_crc32`, and `compare blackbox`
 refuses to resume into a CSV whose rows lack it or carry another value.
 `delivered_bytes` counts the payload bytes received in order before the first
@@ -177,7 +177,9 @@ mismatch, and bytes beyond the payload, do not count. Net B/min is
 `delivered_bytes` per minute from the write to the end of the transfer. A
 trial is completed only when the received bytes equal the payload exactly.
 With the KISS adapter, each received datagram that equals a payload datagram
-counts once. Before COP-227 the published rows came from coppad 0.16.0 and
+counts once. A KISS trial with identical payload datagrams is refused before
+sending because a repeat could be mistaken for another datagram's arrival.
+Before COP-227 the published rows came from coppad 0.16.0 and
 wrote a 256-byte repeating ramp; `results/compare/metadata.md` explains why
 the ramp took the same frames. COP-227 re-recorded all six with the seeded
 bytes.

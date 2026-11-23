@@ -630,7 +630,8 @@ fn docs_point_at_the_comparison_page() {
     let changelog = read(&root.join("CHANGELOG.md"));
     assert!(changelog.contains("coppa-bench compare"));
     // COP-227 (AC12): the payload column is documented where the harness is.
-    assert!(readme.contains("payload_crc32"));
+    let readme_words = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(readme_words.contains("CRC-32 of the generated trial payload as `payload_crc32`"));
     assert!(changelog.contains("payload_crc32"));
 
     // COP-214 (AC10): every document says what shipped.

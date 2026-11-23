@@ -14,6 +14,7 @@ use anyhow::{bail, Context, Result};
 use coppa_audio::{AudioSink, AudioSource, CpalSink, CpalSource};
 use coppa_channel::watterson::WattersonPreset;
 use std::{
+    collections::HashSet,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -356,6 +357,17 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
     } = context;
     // Built before the dial, so a no_connect row also records its payload.
     let payload = score::trial_payload(seed, args.size);
+    if let Some(datagram_bytes) = profile
+        .datagram_bytes
+        .filter(|&size| profile.adapter == "kiss" && size > 0)
+    {
+        // The pacer and scorer identify datagrams by their bytes.
+        let mut seen = HashSet::new();
+        anyhow::ensure!(
+            payload.chunks(datagram_bytes).all(|chunk| seen.insert(chunk)),
+            "trial {trial} (seed 0x{seed:x}) has identical KISS payload datagrams; change datagram_bytes"
+        );
+    }
     let cable = Cable::create(&root.join(format!("trial-{trial}")))?;
     let home_a = cable.station_home('A')?;
     let home_b = cable.station_home('B')?;
@@ -533,4 +545,48 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
         profile.name, profile.adapter, version, sha, profile.mode, channel.name(), args.snr, args.size, trial, seed,
         power[0], power[1], cap_s, outcome, connect_s, delivered, exact, transfer_s, rate, drops, wall_s, lead_ms, starved, overflow,
         score::payload_crc32(&payload)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compare::grid::Channel;
+
+    #[test]
+    fn kiss_trial_refuses_indistinguishable_payload_datagrams() {
+        let modem = crate::compare::repo_root().join("tools/compare/coppad-kiss.toml");
+        let mut profile = Profile::load(&modem).unwrap();
+        profile.datagram_bytes = Some(1);
+        let seed = 0x1700_0000;
+        let args = BlackboxArgs {
+            modem,
+            channel: "wgn".into(),
+            snr: 30,
+            size: 2048,
+            trials: 1,
+            seed_base: seed,
+            jobs: 1,
+            ref_power: None,
+            out_dir: None,
+        };
+        // A repeat of chunk zero has the same bytes as chunk 258. The
+        // trial must refuse this payload before it tries to create a cable.
+        let payload = score::trial_payload(seed, args.size);
+        assert_eq!(payload[0], payload[258]);
+        let context = TrialContext {
+            profile: &profile,
+            root: Path::new("/dev/null"), // A cable cannot be created here.
+            channel: Channel::Wgn,
+            args: &args,
+            power: [1.0; 2],
+            lead_ms: 0.0,
+            sha: "",
+            version: "",
+        };
+        let error = run_trial(context, 0, seed).unwrap_err().to_string();
+        assert!(
+            error.contains("identical KISS payload datagrams"),
+            "{error}"
+        );
+    }
 }

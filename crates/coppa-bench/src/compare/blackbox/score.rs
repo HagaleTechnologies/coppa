@@ -9,8 +9,8 @@ pub fn trial_payload(seed: u64, size: usize) -> Vec<u8> {
     super::super::link_stack::payload(seed, size)
 }
 
-/// The CSV's `payload_crc32` value: CRC-32/ISO-HDLC of the bytes a trial
-/// wrote, as `0x` and eight lower-case hex digits.
+/// The CSV's `payload_crc32` value: CRC-32/ISO-HDLC of the generated trial
+/// payload, as `0x` and eight lower-case hex digits.
 #[must_use]
 pub fn payload_crc32(payload: &[u8]) -> String {
     format!(
@@ -33,7 +33,8 @@ pub fn stream_delivered(received: &[u8], payload: &[u8]) -> usize {
 /// `delivered_bytes` for the KISS adapter, and the number of intact
 /// datagrams: each received datagram equal to a not-yet-counted payload
 /// chunk of `datagram_bytes` counts that chunk once. A corrupt, foreign or
-/// repeated datagram adds nothing.
+/// repeated datagram adds nothing when payload chunks have distinct bytes,
+/// as required by the KISS trial before sending.
 #[must_use]
 pub fn datagram_delivered(
     datagrams: &[Vec<u8>],
@@ -139,6 +140,8 @@ mod tests {
 
         let mut lost = all.clone();
         lost.remove(3);
+        assert_eq!(datagram_delivered(&lost, &payload, 256), (1792, 7));
+        lost.insert(3, all[0].clone());
         assert_eq!(datagram_delivered(&lost, &payload, 256), (1792, 7));
 
         let mut flipped = all.clone();
