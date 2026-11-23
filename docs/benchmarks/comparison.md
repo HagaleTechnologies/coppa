@@ -163,10 +163,15 @@ Each cell reads "mean (95% interval) completed/n" in net bytes/min.
 The daemon self-test uses two unmodified `coppad` processes. These results
 test the audio cable and host interface; they are separate from the library
 `Link` rows above. Real-time scheduling means fixed seeds do not make these
-trials bit-reproducible. Connect time runs from dial to the caller's CONNECTED.
-Wall time runs from dial to trial end. Cable lead is measured by the integrity
-probe. Starved and overflow ticks count 20 ms relay intervals during the trial.
-Source: `results/compare/blackbox-coppad.csv`.
+trials bit-reproducible. A trial writes the same seeded bytes as a library
+trial with the same seed. The six trials below predate that and wrote a
+256-byte repeating ramp; `results/compare/metadata.md` explains why the ramp
+took the same frames. coppad runs HF_STANDARD, which compresses each frame
+and sends up to eight codewords per frame. The library rows do not compress
+and send one codeword per frame. Connect time runs from dial to the caller's
+CONNECTED. Wall time runs from dial to trial end. Cable lead is measured by
+the integrity probe. Starved and overflow ticks count 20 ms relay intervals
+during the trial. Source: `results/compare/blackbox-coppad.csv`.
 
 <!-- compare:begin blackbox-selftest -->
 | Modem | Cell | n | completed | net B/min, mean (95% interval) | median connect | median wall | drops | cable lead | starved / overflow ticks |
