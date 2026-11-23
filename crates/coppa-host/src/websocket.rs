@@ -371,8 +371,9 @@ pub enum WsServerMessage {
     /// whenever either changes. Reliable.
     #[serde(rename = "speed_level")]
     SpeedLevel { level: u8, mode: SpeedLevelMode },
-    /// COP-210: the session waveform pair, sent whenever `tx` or `rx`
-    /// changes, and with both `null` when the session ends. Reliable.
+    /// COP-210: the session waveform pair, sent when `tx` or `rx` has
+    /// changed (within one 500 ms tick), and at once with both `null` when
+    /// the session ends. Reliable.
     #[serde(rename = "phy_mode")]
     PhyMode {
         tx: Option<PhyMode>,
