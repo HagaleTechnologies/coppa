@@ -29964,8 +29964,10 @@ mod tests {
         /// (no floor key-up after it), which B reports as its RX; a host
         /// DISCONNECT on A and the received DISCONNECT on B clear both pairs.
         /// With the `websocket` feature, the snapshot serves the same values
-        /// and a reliable `phy_mode` push follows each change and only a
-        /// change. Audio moves through the rings; no session is injected.
+        /// and each `publish_ws_snapshot()` call (the 500 ms tick in
+        /// production) sends a reliable `phy_mode` push when the pair changed,
+        /// and only then. Audio moves through the rings; no session is
+        /// injected.
         #[tokio::test(start_paused = true)]
         async fn floor_daemon_phy_mode_reporting() {
             let (mut a, mut b, mut b_host, reference_power) = delivery_pair(SEED_BASE);

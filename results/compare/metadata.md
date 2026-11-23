@@ -84,15 +84,18 @@ bit-reproducible link rows.
 
 The six rows predate the payload fix: they carried a 256-byte ramp, where
 the harness now writes the link rows' seeded bytes for the same seed. They
-were not re-measured. With coppad's HF_STANDARD compression, the 2048-byte
-ramp encodes to 3550 bytes and the six seeds' payloads to 3509 to 3583. Cut
-into frames of at most 916 encoded bytes (level 2's eight-codeword budget
-less 20 bytes, an approximation of coppad's chunker), each payload takes
-four frames. At 4096 bytes the ramp encodes to 3572 or 3573 bytes against
-7024 to 7112 for the same seeds, so a 16 KB ramp trial would have
-overstated throughput. A resumed run with the same coppad binary would add
-seeded-payload trials to these ramp rows, so re-record all six before
-extending these cells.
+were not re-measured. The ramp did not lower their on-air work. coppad
+compresses each frame's chunk on its own, and no frame holds more than 1424
+encoded bytes (eight codewords at level 4 or 7). With HF_STANDARD
+compression, the 2048-byte ramp encodes to 3550 bytes and the six seeds'
+payloads to 3509 to 3583, so up to that size the ramp compresses no better
+than seeded bytes. The ramp only compresses better at larger sizes (3572 or
+3573 bytes at 4096, against 7024 to 7112 for the same seeds), and no frame
+reaches them. COP-226 ran coppad's chunker on the ramp and on seeded bytes
+at levels 2, 4 and 8, for 2048 and 16384 bytes, and the frame count and
+airtime matched in every case. A resumed run with the same coppad binary
+would add seeded-payload trials to these ramp rows, so re-record all six
+before extending these cells.
 
 The six rows also predate COP-224. Their starved and overflow ticks were
 counted from the payload write, so the roughly 7 s connect of each trial is
