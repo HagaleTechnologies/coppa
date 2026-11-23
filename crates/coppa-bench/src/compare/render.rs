@@ -220,8 +220,8 @@ pub fn data_regions(out_dir: &std::path::Path) -> anyhow::Result<Vec<(&'static s
             );
             for (i, row) in lines.enumerate() {
                 anyhow::ensure!(
-                    row.split(',').count() == 24,
-                    "{}: row {} does not have 24 fields",
+                    row.split(',').count() == BLACKBOX_COLUMNS,
+                    "{}: row {} does not have {BLACKBOX_COLUMNS} fields",
                     blackbox_path.display(),
                     i + 2
                 );
@@ -249,14 +249,17 @@ pub fn data_regions(out_dir: &std::path::Path) -> anyhow::Result<Vec<(&'static s
     ])
 }
 
-use super::blackbox::CSV_HEADER as BLACKBOX_HEADER;
+use super::blackbox::{CSV_COLUMNS as BLACKBOX_COLUMNS, CSV_HEADER as BLACKBOX_HEADER};
 
 fn render_blackbox(csv: &str) -> String {
     let mut cells: std::collections::BTreeMap<(Channel, i32, usize), Vec<Vec<&str>>> =
         std::collections::BTreeMap::new();
     for row in csv.lines().skip(1) {
         let fields: Vec<_> = row.split(',').collect();
-        if fields.len() < 24 || fields[0] != "coppad" || !fields[2].starts_with("VERSION Coppa") {
+        if fields.len() < BLACKBOX_COLUMNS
+            || fields[0] != "coppad"
+            || !fields[2].starts_with("VERSION Coppa")
+        {
             continue;
         }
         if let (Some(channel), Ok(snr), Ok(size)) = (
@@ -464,9 +467,8 @@ mod tests {
 
     #[test]
     fn blackbox_region_has_one_row_per_cell() {
-        let header = "modem,adapter,version_reply,binary_sha256,mode,channel,snr_db,size_bytes,trial,seed,ref_power_a,ref_power_b,cap_s,outcome,connect_s,delivered_bytes,exact,transfer_s,net_bytes_per_min,drops,wall_s,cable_latency_ms,starved_ticks,overflow_ticks\n";
-        let row = "coppad,vara,VERSION Coppa 0.16.0,abc,HF_STANDARD,wgn,30,2048,0,0x17000000,1,1,600,complete,7,2048,true,50,2457,0,58,370,0,0\n";
-        let text = render_blackbox(&format!("{header}{row}{row}"));
+        let row = "coppad,vara,VERSION Coppa 0.16.0,abc,HF_STANDARD,wgn,30,2048,0,0x17000000,1,1,600,complete,7,2048,true,50,2457,0,58,370,0,0,0x6887c6a5\n";
+        let text = render_blackbox(&format!("{BLACKBOX_HEADER}\n{row}{row}"));
         assert_eq!(
             text.lines()
                 .filter(|line| line.starts_with("| coppad "))

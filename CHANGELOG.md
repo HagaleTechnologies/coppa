@@ -16,6 +16,12 @@ Older releases have no entry here. Their on-air breaks are listed in
 
 ## Unreleased: 0.18.0
 
+- COP-227: `coppa-bench compare blackbox` records each trial's payload CRC-32
+  as a last `payload_crc32` column and refuses to resume into a CSV without it
+  or with another payload. Stream trials count `delivered_bytes` only up to
+  the first byte that differs from the payload, and KISS trials count each
+  intact datagram once. The six published coppad self-test rows were
+  re-recorded with coppad 0.18.0 and the seeded payload.
 - COP-222: Auto coppad retries a floor-sized outer-coded segment as ordinary
   floor Data. Two peers advertising CONNECT bit 7 can recover an oversized
   in-flight reliable segment through stop-and-wait floor fragments, retaining
