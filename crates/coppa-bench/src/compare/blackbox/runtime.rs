@@ -4,6 +4,8 @@ use super::{
     guard, integrity,
     profile::Profile,
     relay::io::Relay,
+    resume::{self, CsvIdentity},
+    score,
     station::Station,
     tnc::{self, Host},
     BlackboxArgs,
@@ -23,67 +25,6 @@ use std::{
 };
 
 use super::CSV_HEADER as HEADER;
-
-struct CsvIdentity<'a> {
-    profile: &'a Profile,
-    sha: &'a str,
-    version: &'a str,
-    seed_base: u64,
-    power: [f32; 2],
-    requested: (super::super::grid::Channel, i32, usize),
-}
-
-fn recorded_cells(
-    csv: &str,
-    identity: &CsvIdentity<'_>,
-) -> Result<HashSet<(String, i32, usize, u32)>> {
-    anyhow::ensure!(
-        csv.lines().next() == Some(HEADER),
-        "black-box CSV header mismatch"
-    );
-    let mut seen = HashSet::new();
-    for (line_no, line) in csv.lines().enumerate().skip(1) {
-        let c: Vec<_> = line.split(',').collect();
-        anyhow::ensure!(c.len() == 24, "malformed black-box CSV row {}", line_no + 1);
-        let channel =
-            super::super::grid::Channel::parse(c[5]).context("unknown recorded channel")?;
-        let snr: i32 = c[6].parse()?;
-        let size: usize = c[7].parse()?;
-        let trial: u32 = c[8].parse()?;
-        let cell = super::super::grid::Cell {
-            channel,
-            snr_db: snr,
-            size_bytes: size,
-        };
-        let expected_seed = cell
-            .seed(identity.seed_base, trial as usize)
-            .context("recorded row is off the grid")?;
-        let cap = if size == 2048 { 600 } else { 1800 };
-        let powers = [c[10].parse::<f32>()?, c[11].parse::<f32>()?];
-        let power_matches = (channel, snr, size) != identity.requested
-            || powers.iter().zip(identity.power).all(|(&old, new)| {
-                old > 0.0 && new > 0.0 && (10.0 * (old / new).log10()).abs() <= 0.1
-            });
-        anyhow::ensure!(
-            c[0] == identity.profile.name
-                && c[1] == identity.profile.adapter
-                && c[2] == identity.version
-                && c[3] == identity.sha
-                && c[4] == identity.profile.mode
-                && c[9] == format!("0x{expected_seed:x}")
-                && c[12] == cap.to_string()
-                && power_matches,
-            "recorded trial identity mismatch on CSV row {}; use a fresh --out-dir",
-            line_no + 1
-        );
-        anyhow::ensure!(
-            seen.insert((channel.name().to_string(), snr, size, trial)),
-            "duplicate black-box CSV row {}",
-            line_no + 1
-        );
-    }
-    Ok(seen)
-}
 
 fn scratch() -> Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!(
@@ -193,6 +134,17 @@ pub fn run(args: &BlackboxArgs) -> Result<()> {
     if profile.adapter == "kiss" {
         guard::check(&out_dir, "kiss", None)?;
     }
+    // COP-227: a CSV from before the payload column is refused before any
+    // modem starts; the payload of each row is checked after calibration.
+    let path = out_dir.join(format!("blackbox-{}.csv", profile.name));
+    match fs::read_to_string(&path) {
+        Ok(existing) => {
+            resume::check_header(&existing)
+                .with_context(|| format!("checking {}", path.display()))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
     let root = scratch()?;
     let result = super::gated(
         || probe(&Cable::create(&root.join("probe"))?),
@@ -224,7 +176,7 @@ fn run_trials(
         fs::write(&path, format!("{HEADER}\n"))?;
     }
     let existing = fs::read_to_string(&path)?;
-    let recorded = recorded_cells(
+    let recorded = resume::recorded_cells(
         &existing,
         &CsvIdentity {
             profile,
@@ -392,12 +344,6 @@ struct TrialContext<'a> {
     version: &'a str,
 }
 
-/// The bytes a trial writes (COP-170 decision 8): `StdRng` seeded with
-/// `derive_seed(seed, 0, 2)`, the link rows' payload for the same seed.
-fn trial_payload(seed: u64, size: usize) -> Vec<u8> {
-    super::super::link_stack::payload(seed, size)
-}
-
 fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String> {
     let TrialContext {
         profile,
@@ -409,6 +355,19 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
         sha,
         version,
     } = context;
+    // Built before the dial, so a no_connect row also records its payload.
+    let payload = score::trial_payload(seed, args.size);
+    if let Some(datagram_bytes) = profile
+        .datagram_bytes
+        .filter(|&size| profile.adapter == "kiss" && size > 0)
+    {
+        // The pacer and scorer identify datagrams by their bytes.
+        let mut seen = HashSet::new();
+        anyhow::ensure!(
+            payload.chunks(datagram_bytes).all(|chunk| seen.insert(chunk)),
+            "trial {trial} (seed 0x{seed:x}) has identical KISS payload datagrams; change datagram_bytes"
+        );
+    }
     let cable = Cable::create(&root.join(format!("trial-{trial}")))?;
     let home_a = cable.station_home('A')?;
     let home_b = cable.station_home('B')?;
@@ -447,7 +406,6 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
         _ => unreachable!(),
     }
     if outcome != "no_connect" {
-        let payload = trial_payload(seed, args.size);
         let write_time = Instant::now();
         let mut pacer = (profile.adapter == "kiss").then(|| {
             tnc::kiss::Pacer::new(
@@ -472,9 +430,22 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
         relay.counts.counting.store(true, Ordering::Relaxed);
         let deadline = write_time + Duration::from_secs(cap_s);
         let mut received = Vec::new();
+        // KISS: every decoded datagram, scored after the loop (COP-227). The
+        // loop runs until the intact datagrams cover the payload, so a
+        // corrupt, foreign or repeated datagram cannot end it early.
+        let mut datagram_list: Vec<Vec<u8>> = Vec::new();
+        let mut kiss_intact_bytes = 0usize;
         let mut wire = Vec::new();
         let mut answerer_connected = false;
-        while Instant::now() < deadline && received.len() < payload.len() && !relay.is_dead() {
+        let kiss = profile.adapter == "kiss";
+        while Instant::now() < deadline
+            && (if kiss {
+                kiss_intact_bytes
+            } else {
+                received.len()
+            }) < payload.len()
+            && !relay.is_dead()
+        {
             let mut bytes = [0u8; 4096];
             let n = match host_b.receive_data(&mut bytes) {
                 Ok(n) => n,
@@ -497,7 +468,13 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
                                 pacer.received(&datagram, Instant::now());
                             }
                             received.extend_from_slice(&datagram);
-                            datagrams += 1;
+                            datagram_list.push(datagram);
+                            kiss_intact_bytes = score::datagram_delivered(
+                                &datagram_list,
+                                &payload,
+                                profile.datagram_bytes.unwrap(),
+                            )
+                            .0;
                         }
                     }
                     _ => unreachable!(),
@@ -524,7 +501,18 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
             }
         }
         relay.counts.counting.store(false, Ordering::Relaxed);
-        delivered = received.len().min(payload.len());
+        // COP-227: only bytes that match the payload count.
+        if profile.adapter == "kiss" {
+            let (bytes, intact) = score::datagram_delivered(
+                &datagram_list,
+                &payload,
+                profile.datagram_bytes.unwrap(),
+            );
+            datagrams = intact;
+            delivered = bytes;
+        } else {
+            delivered = score::stream_delivered(&received, &payload);
+        }
         transfer_s = write_time.elapsed().as_secs_f64();
         exact = received == payload;
         if exact {
@@ -553,63 +541,52 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
     eprintln!(
         "compare blackbox: {channel:?} {trial}: {outcome}, {delivered} bytes, wall {wall_s:.1} s"
     );
-    Ok(format!("{},{},{},{},{},{},{},{},{},0x{:x},{:.6},{:.6},{},{},{},{},{},{:.3},{:.3},{},{:.3},{:.0},{},{}\n",
+    Ok(format!("{},{},{},{},{},{},{},{},{},0x{:x},{:.6},{:.6},{},{},{},{},{},{:.3},{:.3},{},{:.3},{:.0},{},{},{}\n",
         profile.name, profile.adapter, version, sha, profile.mode, channel.name(), args.snr, args.size, trial, seed,
-        power[0], power[1], cap_s, outcome, connect_s, delivered, exact, transfer_s, rate, drops, wall_s, lead_ms, starved, overflow))
+        power[0], power[1], cap_s, outcome, connect_s, delivered, exact, transfer_s, rate, drops, wall_s, lead_ms, starved, overflow,
+        score::payload_crc32(&payload)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compare::grid::Channel;
 
     #[test]
-    fn resumed_rows_require_same_seed_binary_version_and_cell_power() {
-        let profile =
-            Profile::load(&super::super::super::repo_root().join("tools/compare/coppad.toml"))
-                .unwrap();
-        let identity = CsvIdentity {
-            profile: &profile,
-            sha: "abc",
-            version: "VERSION Coppa 0.16.0",
-            seed_base: 0x1700_0000,
-            power: [0.02, 0.03],
-            requested: (super::super::super::grid::Channel::Wgn, 30, 2048),
-        };
-        let row = "coppad,vara,VERSION Coppa 0.16.0,abc,HF_STANDARD,wgn,30,2048,0,0x17000000,0.020000,0.030000,600,complete,7,2048,true,50,2457,0,58,355,0,0";
-        let csv = format!("{HEADER}\n{row}\n");
-        assert_eq!(recorded_cells(&csv, &identity).unwrap().len(), 1);
-        assert!(recorded_cells(&csv.replace("0x17000000", "0x17000001"), &identity).is_err());
-        assert!(recorded_cells(&csv.replace(",abc,", ",xyz,"), &identity).is_err());
-        assert!(recorded_cells(
-            &csv.replace("VERSION Coppa 0.16.0", "VERSION Other 1"),
-            &identity
-        )
-        .is_err());
-        assert!(recorded_cells(&csv.replace("0.020000", "0.040000"), &identity).is_err());
-        let other_cell = csv
-            .replace("wgn,30", "mpg,20")
-            .replace("0x17000000", "0x17120000")
-            .replace("0.020000", "0.040000");
-        assert!(recorded_cells(&other_cell, &identity).is_ok());
-    }
-
-    #[test]
-    fn trial_payload_is_the_link_rows_seeded_bytes() {
-        use rand::{RngExt, SeedableRng};
+    fn kiss_trial_refuses_indistinguishable_payload_datagrams() {
+        let modem = crate::compare::repo_root().join("tools/compare/coppad-kiss.toml");
+        let mut profile = Profile::load(&modem).unwrap();
+        profile.datagram_bytes = Some(1);
         let seed = 0x1700_0000;
-        let payload = trial_payload(seed, 16384);
-        // COP-170 decision 8, built here rather than through `link_stack`.
-        let mut rng =
-            rand::rngs::StdRng::seed_from_u64(coppa_channel::persistent::derive_seed(seed, 0, 2));
-        let expected: Vec<u8> = (0..16384).map(|_| rng.random::<u8>()).collect();
-        assert_eq!(payload, expected);
-        // coppad's HF_STANDARD compresses each session chunk of up to 4096
-        // bytes; a compressible payload would overstate a trial's net B/min.
-        let core = coppa_engine::CoppaCore::with_config(coppa_engine::EngineConfig::from_profile(
-            &coppa_engine::profiles::HF_STANDARD,
-        ));
-        for chunk in payload.chunks(4096) {
-            assert!(core.encoded_payload_len(chunk) >= chunk.len());
-        }
+        let args = BlackboxArgs {
+            modem,
+            channel: "wgn".into(),
+            snr: 30,
+            size: 2048,
+            trials: 1,
+            seed_base: seed,
+            jobs: 1,
+            ref_power: None,
+            out_dir: None,
+        };
+        // A repeat of chunk zero has the same bytes as chunk 258. The
+        // trial must refuse this payload before it tries to create a cable.
+        let payload = score::trial_payload(seed, args.size);
+        assert_eq!(payload[0], payload[258]);
+        let context = TrialContext {
+            profile: &profile,
+            root: Path::new("/dev/null"), // A cable cannot be created here.
+            channel: Channel::Wgn,
+            args: &args,
+            power: [1.0; 2],
+            lead_ms: 0.0,
+            sha: "",
+            version: "",
+        };
+        let error = run_trial(context, 0, seed).unwrap_err().to_string();
+        assert!(
+            error.contains("identical KISS payload datagrams"),
+            "{error}"
+        );
     }
 }

@@ -38,7 +38,10 @@ Not on crates.io and not a product crate. From a clone of the repository:
   runs the Linux ALSA cable experiment. Build a release `coppad` with
   `--features cpal-backend,ardop,kiss-tnc` first. The cable accepts f32le,
   48 kHz, mono playback. Live tests also need that release binary. The
-  integrity probe must pass before a trial is recorded.
+  integrity probe must pass before a trial is recorded. Each row records the
+  CRC-32 of the generated trial payload as `payload_crc32`, even if dialing
+  fails before sending. Use a fresh `--out-dir` if the CSV lacks that column
+  or a row's checksum differs from the expected value for its seed and size.
 
 Results are logged in [BENCHMARKS.md](https://github.com/HagaleTechnologies/coppa/blob/main/BENCHMARKS.md).
 Read its [Conventions](../../BENCHMARKS.md) section and the

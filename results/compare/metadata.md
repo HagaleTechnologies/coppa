@@ -62,6 +62,18 @@ their stated tolerances. Run
 `target/release/coppa-bench compare --channel wgn --size 16384` to render
 the page from the CSV without adding a link trial.
 
+## Black-box self-test
+
+```text
+blackbox_version_reply=VERSION Coppa 0.18.0
+blackbox_binary_sha256=9ba2347586ba2193b70b6520c84761b26ceb1cd5a0b0e5735c76ac4ff9d3234e
+blackbox_coppad_git_sha=d2bcc0a5dba9
+blackbox_platform=linux-x86_64
+blackbox_payload=seeded
+blackbox_rows=6
+blackbox_completed=2
+```
+
 The Linux black-box command is
 `target/release/coppa-bench compare blackbox --modem tools/compare/coppad.toml`.
 Build it with `cargo build --release -p coppa-bench --features cpal-backend`
@@ -70,32 +82,49 @@ and build the daemon with
 The command defaults to a single WGN 30 dB 2 KB smoke trial and writes under
 `target/compare-foreign/coppad/` unless `--out-dir` is set.
 
-The published coppad self-test was recorded with release builds on Linux
-x86_64 using the two-CPU container quota. Both runs used `--trials 3` and
-`--jobs 3`. WGN 30 dB, 2048 bytes wrote to `results/compare`; MPG 20 dB,
-2048 bytes wrote to a separate scratch directory so its lines could be checked
-before appending them to `blackbox-coppad.csv`. The 10 s integrity probe
-measured correlation 1.000000, level error +0.00 dB and 355 ms lead; it
-counted no starved or overflow tick. A noiseless 40-byte link exchange in
-both directions measured active TX reference powers of 0.022691 and
-0.020689. All six trial rows completed exactly. Parallel scheduling affected
-the WGN throughput, so these are real-time self-test numbers, not
-bit-reproducible link rows.
+COP-227 re-recorded the six published rows on Linux x86_64 under a six-CPU
+cgroup quota (`/sys/fs/cgroup/cpu.max` read `600000 100000`). The daemon was
+built once with
+`COPPA_GIT_SHA=d2bcc0a5dba9 cargo build --release --locked -p coppa-daemon --bin coppad --features cpal-backend,ardop,kiss-tnc`
+and the harness with
+`cargo build --release --locked -p coppa-bench --features cpal-backend`.
+The two cells then ran at the same time, each in its own fresh out-dir:
+`target/release/coppa-bench compare blackbox --modem tools/compare/coppad.toml --channel wgn --snr 30 --size 2048 --trials 3 --jobs 1 --out-dir target/compare-rerecord/wgn`
+and the same command with `--channel mpg --snr 20` and
+`--out-dir target/compare-rerecord/mpg`. Their rows were joined under one
+header into `blackbox-coppad.csv`. Both integrity probes printed
+`correlation 1.000000, level +0.00 dB, cable lead 355 ms: pass`, and both
+calibrations measured active TX reference powers of 0.023498 and 0.020689.
+WGN 30 dB: trials 0 and 1 completed, 2048 bytes in 58.5 s and 59.8 s;
+trial 2 capped with 525 bytes delivered. MPG 20 dB: trials 0, 1 and 2
+capped with 518, 526 and 1620 bytes delivered. Two of the six trials
+completed (2/3 WGN, 0/3 MPG). Every trial counted 0 starved and 0 overflow
+ticks. For about four minutes of MPG trial 1, after the WGN cell had
+finished, a debug build and clippy ran beside it at `nice -n 19` with
+`-j 2`; that trial capped at 526 bytes, as the same seed did at planning
+with nothing beside it. Each capped trial connected and had delivered 518 to 1620 payload
+bytes when the 600 s cap ended it. They look like the stall described in
+the follow-up ticket COP-237; this is an observation, not a diagnosis.
 
-The six rows predate the payload fix: they carried a 256-byte ramp, where
-the harness now writes the link rows' seeded bytes for the same seed. They
-were not re-measured. The ramp did not lower their on-air work. coppad
-compresses each frame's chunk on its own, and no frame holds more than 1424
-encoded bytes (eight codewords at level 4 or 7). With HF_STANDARD
-compression, the 2048-byte ramp encodes to 3550 bytes and the six seeds'
-payloads to 3509 to 3583, so up to that size the ramp compresses no better
-than seeded bytes. The ramp only compresses better at larger sizes (3572 or
-3573 bytes at 4096, against 7024 to 7112 for the same seeds), and no frame
-reaches them. COP-226 ran coppad's chunker on the ramp and on seeded bytes
-at levels 2, 4 and 8, for 2048 and 16384 bytes, and the frame count and
-airtime matched in every case. A resumed run with the same coppad binary
-would add seeded-payload trials to these ramp rows, so re-record all six
-before extending these cells.
+Each row records `payload_crc32`, the CRC-32 of the seeded bytes the trial
+wrote, and `compare blackbox` refuses to resume into a CSV without that
+column or whose row carries another value for its seed and size. Before
+COP-227 the published rows came from coppad 0.16.0 (sha256 `9b8b4957…`) and
+wrote a 256-byte repeating ramp. None of those rows remains. The ramp had
+not lowered those removed rows' on-air work. coppad compresses each frame's chunk on its
+own, and no frame holds more than 1424 encoded bytes (eight codewords at
+level 4 or 7). With HF_STANDARD compression, the 2048-byte ramp encodes to
+3550 bytes and the six seeds' payloads to 3509 to 3583, so up to that size
+the ramp compresses no better than seeded bytes. The ramp only compresses
+better at larger sizes (3572 or 3573 bytes at 4096, against 7024 to 7112 for
+the same seeds), and no frame reaches them. COP-226 ran coppad's chunker on
+the ramp and on seeded bytes at levels 2, 4 and 8, for 2048 and 16384 bytes,
+and the frame count and airtime matched in every case.
+
+To extend these cells, resume with the binary whose sha256 is
+`blackbox_binary_sha256`. A release build's sha256 changes with the checkout
+path and `COPPA_GIT_SHA`, so a rebuild elsewhere cannot resume these rows;
+re-record all six with it instead.
 
 ## Public sources
 

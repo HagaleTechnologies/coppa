@@ -6,14 +6,18 @@ pub mod guard;
 pub mod integrity;
 pub mod profile;
 pub mod relay;
+pub mod resume;
+pub mod score;
 #[cfg(all(feature = "cpal-backend", target_os = "linux"))]
 mod station;
 pub mod tnc;
 
 use clap::Args;
 
-/// The black-box trial CSV header (COP-170 Design section 5).
-pub const CSV_HEADER: &str = "modem,adapter,version_reply,binary_sha256,mode,channel,snr_db,size_bytes,trial,seed,ref_power_a,ref_power_b,cap_s,outcome,connect_s,delivered_bytes,exact,transfer_s,net_bytes_per_min,drops,wall_s,cable_latency_ms,starved_ticks,overflow_ticks";
+/// The black-box trial CSV header (COP-170 Design section 5; COP-227 appended `payload_crc32`).
+pub const CSV_HEADER: &str = "modem,adapter,version_reply,binary_sha256,mode,channel,snr_db,size_bytes,trial,seed,ref_power_a,ref_power_b,cap_s,outcome,connect_s,delivered_bytes,exact,transfer_s,net_bytes_per_min,drops,wall_s,cable_latency_ms,starved_ticks,overflow_ticks,payload_crc32";
+/// The number of fields in [`CSV_HEADER`] and in every black-box CSV row.
+pub const CSV_COLUMNS: usize = 25;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Args)]
@@ -141,6 +145,12 @@ mod tests {
         )
         .is_err());
         assert!(!ran);
+    }
+
+    #[test]
+    fn csv_header_has_csv_columns_fields() {
+        assert_eq!(CSV_HEADER.split(',').count(), CSV_COLUMNS);
+        assert!(CSV_HEADER.ends_with(",payload_crc32"));
     }
 
     #[test]
