@@ -171,9 +171,11 @@ fn published_page_has_a_value_in_every_cell() {
     }
 }
 
-#[test]
-fn published_data_is_coppa_only() {
-    for entry in fs::read_dir(default_out_dir()).unwrap() {
+/// Decision 10: every CSV in `dir` is a coppa CSV. `channel-check.csv` and
+/// `blackbox-coppad.csv` keep their own checks; any other CSV must be a
+/// `link-*.csv` whose every row the link reader reads as a coppa row.
+fn audit_published_csvs(dir: &Path) {
+    for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "csv") {
             if path
@@ -205,10 +207,12 @@ fn published_data_is_coppa_only() {
                 }
                 continue;
             }
-            assert_eq!(
-                path.file_name().unwrap(),
-                "link-l2.csv",
-                "unknown published CSV"
+            assert!(
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("link-")),
+                "unknown published CSV {}",
+                path.display()
             );
             for t in read_csv(&path).unwrap() {
                 assert!(
@@ -220,6 +224,11 @@ fn published_data_is_coppa_only() {
             }
         }
     }
+}
+
+#[test]
+fn published_data_is_coppa_only() {
+    audit_published_csvs(&default_out_dir());
     let page = read(&default_page());
     for line in page
         .lines()
@@ -239,6 +248,59 @@ fn published_data_is_coppa_only() {
             "non-coppa table row: {line}"
         );
     }
+}
+
+/// A real `link-l4` row, written by `coppa-bench compare --rows link-l4
+/// --channel wgn --snr 30 --size 2048 --trials 1 --jobs 1` at `d2bcc0a`.
+const LINK_L4_ROW: &str = "link-l4,link,4,false,wgn,30,2048,0,0x17000000,0.015971,600,complete,2.10,2048,true,35.90,3422.8,0,38.00";
+
+/// A temp dir removed on drop, so a test that panics on purpose leaves none.
+struct AuditDir(PathBuf);
+
+impl Drop for AuditDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Writes `{HEADER}\n{row}\n` as `name` in a fresh pid-named temp dir and
+/// returns the dir. Each test passes its own `tag`, so tests running in
+/// parallel never share a dir.
+fn published_dir_with(tag: &str, name: &str, row: &str) -> AuditDir {
+    let dir =
+        std::env::temp_dir().join(format!("coppa-compare-audit-{}-{tag}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(name), format!("{HEADER}\n{row}\n")).unwrap();
+    AuditDir(dir)
+}
+
+/// COP-224 AC3: a `link-l4.csv` written by `compare --rows link-l4` passes the
+/// coppa-only audit, as the link-l2 CSV does.
+#[test]
+fn a_link_l4_csv_passes_the_coppa_only_audit() {
+    let dir = published_dir_with("l4", "link-l4.csv", LINK_L4_ROW);
+    assert_eq!(read_csv(&dir.0.join("link-l4.csv")).unwrap().len(), 1);
+    audit_published_csvs(&dir.0);
+}
+
+/// COP-224 AC3: a `link-*.csv` holding a row that is not a coppa link row
+/// still fails the audit.
+#[test]
+#[should_panic(expected = "non-coppa row vara-x")]
+fn a_link_csv_with_a_foreign_row_fails_the_audit() {
+    let row = LINK_L4_ROW.replacen("link-l4,", "vara-x,", 1);
+    let dir = published_dir_with("foreign", "link-x.csv", &row);
+    audit_published_csvs(&dir.0);
+}
+
+/// COP-224 AC3: a CSV whose name is outside `link-*.csv` still fails the
+/// audit, even when its rows are coppa rows.
+#[test]
+#[should_panic(expected = "unknown published CSV")]
+fn a_csv_outside_link_star_fails_the_audit() {
+    let dir = published_dir_with("other", "results.csv", LINK_L4_ROW);
+    audit_published_csvs(&dir.0);
 }
 
 #[test]

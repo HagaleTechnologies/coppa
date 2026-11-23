@@ -27,6 +27,9 @@ Older releases have no entry here. Their on-air breaks are listed in
   floor-only `MacFrameType` values 11 and 12 require `MacPdu::from_floor_bytes`.
   The crate minor version advances to 0.18.0; host and C ABI versions do not
   change.
+- COP-224: `coppa-bench compare blackbox` counts starved and overflow relay
+  ticks from the dial, as the comparison page states, instead of from the
+  payload write.
 
 ## 0.17.0
 

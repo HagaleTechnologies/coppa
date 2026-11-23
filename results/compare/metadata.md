@@ -94,6 +94,11 @@ overstated throughput. A resumed run with the same coppad binary would add
 seeded-payload trials to these ramp rows, so re-record all six before
 extending these cells.
 
+The six rows also predate COP-224. Their starved and overflow ticks were
+counted from the payload write, so the roughly 7 s connect of each trial is
+outside those counts. The harness now counts from the dial, as the page
+states.
+
 ## Public sources
 
 - The channel names (WGN, MPG, MPP) and the SNR grid (30 to 0 dB in 5 dB

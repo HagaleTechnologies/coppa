@@ -74,7 +74,33 @@ fn coppad_ardop_transfer_through_cable() {
 #[test]
 #[ignore = "requires release coppad with kiss-tnc, ALSA file PCM, and real time"]
 fn coppad_kiss_datagrams_through_cable() {
-    let (csv, _) = run("coppad-kiss");
+    let (csv, log) = run("coppad-kiss");
+    // COP-214 Phase 3: the profile's datagram fits every KISS interface
+    // coppad reports. This runs before the CSV asserts, because an oversized
+    // profile still records outcome `datagram`, with exact=false.
+    let kiss = coppa_bench::compare::blackbox::profile::Profile::load(
+        &coppa_bench::compare::repo_root().join("tools/compare/coppad-kiss.toml"),
+    )
+    .unwrap();
+    let datagram_bytes = kiss.datagram_bytes.unwrap();
+    let max: Vec<usize> = log
+        .split("max_datagram_bytes=")
+        .skip(1)
+        .map(|rest| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits
+                .parse()
+                .unwrap_or_else(|e| panic!("max_datagram_bytes={rest:.20}: {e}"))
+        })
+        .collect();
+    assert!(
+        !max.is_empty(),
+        "coppad logged no max_datagram_bytes: {log}"
+    );
+    assert!(
+        max.iter().all(|&m| datagram_bytes <= m),
+        "datagram_bytes {datagram_bytes} exceeds a logged max_datagram_bytes {max:?}"
+    );
     assert!(csv.contains(",datagram,"), "{csv}");
     assert!(csv.contains(",2048,true,"), "{csv}");
 }
