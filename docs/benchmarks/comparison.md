@@ -163,16 +163,32 @@ Each cell reads "mean (95% interval) completed/n" in net bytes/min.
 The daemon self-test uses two unmodified `coppad` processes. These results
 test the audio cable and host interface; they are separate from the library
 `Link` rows above. Real-time scheduling means fixed seeds do not make these
-trials bit-reproducible. Connect time runs from dial to the caller's CONNECTED.
-Wall time runs from dial to trial end. Cable lead is measured by the integrity
-probe. Starved and overflow ticks count 20 ms relay intervals during the trial.
-Source: `results/compare/blackbox-coppad.csv`.
+trials bit-reproducible. The modem column names the coppad version that
+recorded the rows, which can differ from the library rows' version.
+
+Each trial writes the same seeded bytes as the library trial with the same
+seed. Its row records their CRC-32 as `payload_crc32`, and `compare blackbox`
+refuses to resume into a CSV whose rows lack it or carry another value.
+`delivered_bytes` counts the payload bytes received in order before the first
+byte that differs from the payload, up to the payload size. Bytes after a
+mismatch, and bytes beyond the payload, do not count. Net B/min is
+`delivered_bytes` per minute from the write to the end of the transfer. A
+trial is completed only when the received bytes equal the payload exactly.
+With the KISS adapter, each received datagram that equals a payload datagram
+counts once. Before COP-227 the published rows came from coppad 0.16.0 and
+wrote a 256-byte repeating ramp. COP-227 re-recorded all six with the seeded
+bytes.
+
+Connect time runs from dial to the caller's CONNECTED. Wall time runs from
+dial to trial end. Cable lead is measured by the integrity probe. Starved and
+overflow ticks count 20 ms relay intervals during the trial. Source:
+`results/compare/blackbox-coppad.csv`.
 
 <!-- compare:begin blackbox-selftest -->
 | Modem | Cell | n | completed | net B/min, mean (95% interval) | median connect | median wall | drops | cable lead | starved / overflow ticks |
 |---|---|---|---|---|---|---|---|---|---|
-| coppad 0.16.0, VARA-style host, HF_STANDARD | WGN, 30 dB, 2 KB | 3 | 3/3 | 1398 (0-3527) | 7.1 s | 143.2 s | 0 | 355 ms | 0 / 0 |
-| coppad 0.16.0, VARA-style host, HF_STANDARD | MPG, 20 dB, 2 KB | 3 | 3/3 | 227 (183-271) | 7.1 s | 548.3 s | 0 | 355 ms | 0 / 0 |
+| coppad 0.18.0, VARA-style host, HF_STANDARD | WGN, 30 dB, 2 KB | 3 | 2/3 | 1590 (0-4899) | 7.1 s | 59.8 s | 0 | 355 ms | 0 / 0 |
+| coppad 0.18.0, VARA-style host, HF_STANDARD | MPG, 20 dB, 2 KB | 3 | 0/3 | 89 (0-246) | 7.2 s | 607.2 s | 0 | 355 ms | 0 / 0 |
 <!-- compare:end blackbox-selftest -->
 
 ## Channel cross-check
