@@ -334,6 +334,92 @@ fn metadata_names_version_commands_and_sources() {
     }
 }
 
+/// COP-226: the payload-fix note reports the measured frame outcome.
+#[test]
+fn ramp_note_states_the_measured_frame_outcome() {
+    let m = read(&default_out_dir().join("metadata.md"));
+    // Join wrapped lines so a phrase split across a line break still counts.
+    let m = m.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(!m.contains("would have overstated"));
+    for needle in [
+        "no frame holds more than 1424",
+        "matched in every case",
+        "re-record all six",
+    ] {
+        assert!(m.contains(needle), "metadata.md lacks {needle:?}");
+    }
+}
+
+/// COP-226: no coppad frame holds enough raw ramp bytes to compress better
+/// than seeded bytes.
+#[test]
+fn no_coppad_frame_holds_enough_ramp_to_compress() {
+    use coppa_engine::{profiles::HF_STANDARD, CoppaCore, EngineConfig, HF_MAX_SPEED_LEVEL};
+    use coppa_protocol::modem::{
+        speed_levels::max_multi_payload_for_level, transceiver::MAX_CODEWORDS,
+    };
+    let largest = (1..=HF_MAX_SPEED_LEVEL)
+        .filter_map(|l| max_multi_payload_for_level(l, MAX_CODEWORDS))
+        .max()
+        .unwrap();
+    assert_eq!(
+        largest, 1424,
+        "update results/compare/metadata.md if this changes"
+    );
+    let core = CoppaCore::with_config(EngineConfig::from_profile(&HF_STANDARD));
+    // The six recorded trials' seeds. Before PR #281's payload fix, the
+    // harness wrote `(seed + i) & 0xff` for each.
+    let csv = read(&default_out_dir().join("blackbox-coppad.csv"));
+    let mut rows = csv.lines();
+    let column = rows
+        .next()
+        .and_then(|h| h.split(',').position(|name| name == "seed"))
+        .unwrap();
+    let seeds: Vec<u64> = rows
+        .map(|row| {
+            let hex = row.split(',').nth(column).unwrap();
+            u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap()
+        })
+        .collect();
+    assert_eq!(seeds.len(), 6);
+    for seed in seeds {
+        let ramp: Vec<u8> = (0..2048u64)
+            .map(|i| (seed.wrapping_add(i) & 0xff) as u8)
+            .collect();
+        let seeded = coppa_bench::compare::link_stack::payload(seed, 2048);
+        assert!(core.encoded_payload_len(&ramp) > largest);
+        for n in [512, 1024, 2048] {
+            let (r, s) = (
+                core.encoded_payload_len(&ramp[..n]),
+                core.encoded_payload_len(&seeded[..n]),
+            );
+            assert!(
+                r * 100 >= s * 98,
+                "seed {seed:#x}, {n} B: ramp {r}, seeded {s}"
+            );
+        }
+    }
+}
+
+/// COP-226: the black-box section names its payload and the stack differences.
+#[test]
+fn blackbox_section_states_payload_and_compression() {
+    let page = read(&default_page());
+    let blackbox = section(&page, "## Black-box self-test");
+    // Join wrapped lines so a phrase split across a line break still counts.
+    let blackbox = blackbox.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "same seeded bytes",
+        "256-byte repeating ramp",
+        "do not compress",
+    ] {
+        assert!(
+            blackbox.contains(needle),
+            "black-box section lacks {needle:?}"
+        );
+    }
+}
+
 #[test]
 fn page_records_clean_room_provenance() {
     let page = read(&default_page());
