@@ -231,11 +231,11 @@ unavailable", not as a version. The WebSocket `hello` carries the same three fie
   client or ends its connection.
 - An unanswered `CONNECT` ends in `DISCONNECTED` about 30 s after the last connect request is
   keyed. With `RETRIES` unset and an automatic speed level a dial keys four requests, so that is
-  about 60-70 s after the first when the caller's callsign sorts before the target's. A caller
-  whose callsign sorts after the target's waits one more retry interval plus one floor response
-  window (19 s at a 500 ms turnaround) after each request it sends on OFDM, so it hears the
-  target if both dial at once. Its unanswered dial ends about two minutes after the first
-  request.
+  about 60-70 s after the first when the caller's callsign sorts before the target's. With an
+  automatic speed level, a caller whose callsign sorts after the target's waits one more retry
+  interval plus one floor response window (19 s at a 500 ms turnaround) after each request it
+  sends on OFDM, so it hears the target if both dial at once. Its unanswered dial ends about two
+  minutes after the first request.
 - On the listening side, `PENDING` arrives first and `CONNECTED` a second or two after the
   dialler's `CONNECTED`. Do not expect `CONNECTED` first.
 
