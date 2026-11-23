@@ -378,6 +378,9 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
     let mut host_a = Host::connect(&a.command_addr, &a.data_addr)?;
     let mut host_b = Host::connect(&b.command_addr, &b.data_addr)?;
     let start = Instant::now();
+    // COP-214 decision 4: starved and overflow ticks count from the dial,
+    // the window wall_s covers, so first acquisition is inside the counts.
+    relay.counts.counting.store(true, Ordering::Relaxed);
     let mut connect_s = String::new();
     let mut delivered = 0usize;
     let cap_s = if args.size == 2048 { 600 } else { 1800 };
@@ -427,7 +430,6 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
             }
             _ => unreachable!(),
         }
-        relay.counts.counting.store(true, Ordering::Relaxed);
         let deadline = write_time + Duration::from_secs(cap_s);
         let mut received = Vec::new();
         // KISS: every decoded datagram, scored after the loop (COP-227). The
@@ -500,7 +502,6 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
                 break;
             }
         }
-        relay.counts.counting.store(false, Ordering::Relaxed);
         // COP-227: only bytes that match the payload count.
         if profile.adapter == "kiss" {
             let (bytes, intact) = score::datagram_delivered(
@@ -523,6 +524,8 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
             };
         }
     }
+    // Close the window on every path, no_connect included, before reading.
+    relay.counts.counting.store(false, Ordering::Relaxed);
     let wall_s = start.elapsed().as_secs_f64();
     let starved = relay.counts.starved.load(Ordering::Relaxed);
     let overflow = relay.counts.overflow.load(Ordering::Relaxed);

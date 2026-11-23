@@ -600,6 +600,10 @@ stall scenario does (`docs/testing/bpq-session.md`).
   355 ms cable lead. Real-time trials keep fixed channel seeds but scheduling
   can change their results. Other native audio formats are tracked by the
   follow-up ticket filed with COP-214. PathSim's delay offset is not measured.
+  The six published self-test rows counted starved and overflow ticks from
+  the payload write, so each trial's roughly 7 s connect is outside their
+  counts. That includes COP-227's re-record, which ran before COP-224 moved
+  the count to the dial; the rows have not been re-recorded since.
 
 - **COP-227 re-recorded self-test.** COP-227 re-recorded the six black-box
   self-test rows with coppad 0.18.0 and the seeded payload: 2/6 completed

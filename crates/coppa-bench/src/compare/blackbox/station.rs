@@ -89,6 +89,9 @@ impl Station {
                 let data = field(line, &profile.ports.data_key).unwrap_or_else(|| cmd.clone());
                 self.command_addr = cmd;
                 self.data_addr = data;
+                // The live tests read the ready line from stderr, because the
+                // scratch dir holding the modem's log is removed on success.
+                eprintln!("compare blackbox: modem ready: {}", line.trim());
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(50));

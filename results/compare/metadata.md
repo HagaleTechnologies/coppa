@@ -126,6 +126,11 @@ To extend these cells, resume with the binary whose sha256 is
 path and `COPPA_GIT_SHA`, so a rebuild elsewhere cannot resume these rows;
 re-record all six with it instead.
 
+The six rows also predate COP-224. Their starved and overflow ticks were
+counted from the payload write, so the roughly 7 s connect of each trial is
+outside those counts. The harness now counts from the dial, as the page
+states.
+
 ## Public sources
 
 - The channel names (WGN, MPG, MPP) and the SNR grid (30 to 0 dB in 5 dB

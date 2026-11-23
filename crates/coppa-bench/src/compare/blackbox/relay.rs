@@ -328,4 +328,46 @@ mod tests {
             "the noiseless FIFO cable did not return the 960-sample block"
         );
     }
+
+    /// COP-224: a station that falls silent after its first block is starved
+    /// on every tick, but the relay counts those ticks only while `counting`
+    /// is on, so the window `run_trial` opens is the window the CSV reports.
+    #[cfg(all(feature = "cpal-backend", target_os = "linux"))]
+    #[test]
+    fn starved_ticks_count_only_while_counting_is_on() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let dir =
+            std::env::temp_dir().join(format!("coppa-relay-count-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cable = super::super::cable::Cable::create(&dir).unwrap();
+        let relay = super::io::Relay::start(&cable.dir, None, None, [1.0, 1.0], 7).unwrap();
+        let mut playback = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("ab_in"))
+            .unwrap();
+        // One whole block marks station A as seen; nothing follows it.
+        let block: Vec<u8> = vec![0.0f32; BLOCK]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        playback.write_all(&block).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let before = relay.counts.starved.load(Ordering::Relaxed);
+        relay.counts.counting.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut after = 0;
+        while Instant::now() < deadline && after == 0 {
+            std::thread::sleep(Duration::from_millis(20));
+            after = relay.counts.starved.load(Ordering::Relaxed);
+        }
+        relay.stop().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(before, 0, "starved ticks counted while counting was off");
+        assert!(after > 0, "no starved tick counted once counting was on");
+    }
 }

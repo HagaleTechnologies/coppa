@@ -131,7 +131,25 @@ mod tests {
     }
     #[test]
     fn data_frames_carry_a_big_endian_length() {
-        assert_eq!(2048u16.to_be_bytes(), [8, 0]);
+        // 2048 = 0x0800 has two different bytes, so a swapped byte order
+        // cannot pass: big-endian is [8, 0], little-endian [0, 8].
+        let payload: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let cmd = TcpListener::bind("127.0.0.1:0").unwrap();
+        let data = TcpListener::bind("127.0.0.1:0").unwrap();
+        let caddr = cmd.local_addr().unwrap();
+        let daddr = data.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let _c = cmd.accept().unwrap();
+            let (mut d, _) = data.accept().unwrap();
+            let mut wire = vec![0u8; 2050];
+            d.read_exact(&mut wire).unwrap();
+            assert_eq!(wire[..2], [8, 0], "length bytes on the wire");
+            assert_eq!(wire[2..], expected[..]);
+        });
+        let mut host = Host::connect(&caddr.to_string(), &daddr.to_string()).unwrap();
+        send(&mut host, &payload).unwrap();
+        worker.join().unwrap();
     }
     #[test]
     fn tnc_frames_decode_across_reads() {
