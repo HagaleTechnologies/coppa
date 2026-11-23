@@ -38,5 +38,7 @@ The `ci` fan-in waits for ci.yml's fast tier. That wait must stay under the
 `ci` job's `timeout-minutes` and under the merge queue's check-response
 timeout. The queue timeout is set in a ruleset outside this repository, so a
 ruleset change can break the budget without a diff here. A GitHub App token
-minted before a long wait expires after an hour; mint it after the wait. See
+minted before a long wait expires after an hour; mint it after the wait. A
+ready or reopened PR re-runs ci.yml on the same SHA, so the fan-in must choose
+between same-named check-runs from two runs. See
 [the fast-tier wait](../../docs/testing/full-ci.md#fast-tier-wait).
