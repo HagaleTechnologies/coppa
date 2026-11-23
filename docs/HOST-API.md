@@ -72,7 +72,7 @@ Then send a few commands. The `sleep`s give coppad time to answer each one:
 
 ```text
 $ { echo VERSION; sleep 1; echo "MYCALL N1CALL"; sleep 1; echo "LISTEN ON"; sleep 1;
-    echo FOOBAR; sleep 1; echo "CONNECT N1CALL N0CALL"; sleep 75; } \
+    echo FOOBAR; sleep 1; echo "CONNECT N1CALL N0CALL"; sleep 135; } \
     | nc -q 1 127.0.0.1 8300 | tr '\r' '\n'
 VERSION Coppa 0.17.0
 VERSION Coppa 0.17.0
@@ -97,9 +97,13 @@ DISCONNECTED
   know. `OK` answers `CONNECT`.
 - Each `PTT ON` and `PTT OFF` pair brackets one connect request. With `RETRIES` unset and an
   automatic speed level, coppad keys four: two on OFDM, then two on the low-rate floor.
-  `DISCONNECTED` arrives about 30 s after the last one, about 60-70 s after the first, because
-  no station answered. With `RETRIES 0` or a pinned speed level coppad keys one request and
-  `DISCONNECTED` arrives about 30 s later.
+  `DISCONNECTED` arrives about 30 s after the last one, because no station answered.
+  N1CALL sorts after N0CALL, so it waits longer after each OFDM request in case N0CALL is
+  dialling it at the same moment ([Limits and timing](#limits-and-timing)). Here
+  `DISCONNECTED` comes about two minutes after the first request. A caller whose callsign
+  sorts before the target's gets it about 60-70 s after the first. With `RETRIES 0` or a
+  pinned speed level coppad keys one request and `DISCONNECTED` arrives about 30 s later.
+- coppad also sends `IAMALIVE` every 60 s; the output above leaves those lines out.
 - `tr '\r' '\n'` is there because coppad ends every line it sends with a bare `\r`. Without it a
   terminal draws each reply over the last one.
 - `-q 1` is the flag of the OpenBSD netcat that Debian, Ubuntu and Raspberry Pi OS install. The
@@ -140,7 +144,7 @@ on a fixed delay.
 | `MYCALL <call> [<call> ...]` | `OK` for one to five valid callsigns, otherwise `WRONG` | replaces the daemon-wide list; first identifies transmissions, all answer inbound calls; CONNECTED names the dialled call |
 | `RETRIES <n>` or `RETRIES=<n>` | `OK` for 0-20, otherwise `WRONG` | per-client count of additional connect requests on later dials; resets on client disconnect. Unset, a dial makes 3 additional requests while the speed level is automatic, so it can fall back to the low-rate floor; with a pinned speed level it makes none |
 | `BUSY` | `BUSY ON` or `BUSY OFF` | reliable reply with the current channel state |
-| `LISTEN ON` / `LISTEN OFF` | `OK`; `WRONG` for any other argument | answer inbound calls, or stop; coppad starts with listening off |
+| `LISTEN ON` / `LISTEN OFF` | `OK`; `WRONG` for any other argument | answer inbound calls, or stop; coppad starts with listening off. A crossed call is still answered (below) |
 | `CONNECT <me> <target> [via ...]` | `OK`, then `CONNECTED <caller> <callee> <bw>` or `DISCONNECTED` | dials `<target>`; `<me>` and `via` are ignored, the daemon's own callsign is used; one argument gets `WRONG` |
 | `DISCONNECT` | `OK`, then `DISCONNECTED` once queued data is acknowledged | ends the session; with no session, `OK` and nothing else |
 | `ABORT` | `OK`, then `DISCONNECTED` at once | ends the session or a pending dial, drops queued data, sends no DISCONNECT frame; with no session, `OK` and nothing else |
@@ -161,6 +165,12 @@ on a fixed delay.
   `CANCELPENDING` before `DISCONNECTED`.
 - `DISCONNECT` sends what the host already queued, waits for each frame's ACK, and only then
   ends the session ([OPERATING.md](OPERATING.md#ending-a-session-disconnect)).
+- A crossed call (COP-210) is the one connect request coppad answers with `LISTEN OFF`. It
+  happens when coppad is dialling a station and receives a connect request from that same
+  station. If coppad's callsign sorts after the caller's (plain byte order), coppad drops its own
+  dial and answers, because the call is its host's own. That host sees no `PENDING`. It gets
+  `CONNECTED` for its own `CONNECT`, or `DISCONNECTED`, not `CANCELPENDING`, if the handshake
+  fails. The station whose callsign sorts first keeps dialling and ignores the crossed request.
 
 ### Version discovery
 
@@ -221,7 +231,11 @@ unavailable", not as a version. The WebSocket `hello` carries the same three fie
   client or ends its connection.
 - An unanswered `CONNECT` ends in `DISCONNECTED` about 30 s after the last connect request is
   keyed. With `RETRIES` unset and an automatic speed level a dial keys four requests, so that is
-  about 60-70 s after the first.
+  about 60-70 s after the first when the caller's callsign sorts before the target's. With an
+  automatic speed level, a caller whose callsign sorts after the target's waits one more retry
+  interval plus one floor response window (19 s at a 500 ms turnaround) after each request it
+  sends on OFDM, so it hears the target if both dial at once. Its unanswered dial ends about two
+  minutes after the first request.
 - On the listening side, `PENDING` arrives first and `CONNECTED` a second or two after the
   dialler's `CONNECTED`. Do not expect `CONNECTED` first.
 
@@ -294,12 +308,13 @@ start; `BUSY` and `SNR` lines are left out.
 ## Session rules for every interface
 
 - **One session at a time.** While one exists, a dial from any host is refused and other
-  stations' connect requests go unanswered
+  stations' connect requests go unanswered (a crossed call from the station being dialled is
+  answered; see [Commands](#commands))
   ([OPERATING.md](OPERATING.md#connected-sessions-delivery-and-buffer)). An idle session does
   not time out; a host must send `DISCONNECT`.
 - **Listening starts off.** Only VARA `LISTEN ON` or ARDOP `LISTEN TRUE` turns it on. There is
   no config key and no WebSocket request for it. Until a host turns it on, coppad ignores every
-  connect request.
+  connect request except a crossed call ([Commands](#commands)).
 - **VARA and ARDOP share the session.** A dial from one surface is refused while the other
   holds the link ([ARDOP.md](ARDOP.md#busy-semantics-one-transmitter-two-interfaces)).
 - **Delivery.** Connected-session data is acknowledged and resent if lost; the other host gets
@@ -510,6 +525,10 @@ At commit `b9fdb8d` (coppad 0.3.0), on Linux, with no radio, no sound card and n
   is verbatim. The same bytes, sent from Python sockets to a featureless debug coppad started
   with only the two-line config above, gave the same output. Writing `hello` to the data port
   with no session logged the drop.
+- COP-229 (main `d2bcc0a`, coppad 0.18.0 debug build, no audio): the walkthrough's dial, sent
+  from a Python socket client, keyed requests at 0.8, 35.8, 70.4 and 90.9 s after `CONNECT` and
+  got `DISCONNECTED` at 125.9 s. `N0CALL` dialling `N1CALL` keyed at 0.8, 9.3, 17.4 and 37.9 s
+  and got `DISCONNECTED` at 70.9 s.
 - Every command-table row was sent over a raw socket and its reply recorded, including the
   16-client limit and the 4096-byte line limit. The `CQFRAME`, `COMPRESSION FILES`, two-callsign
   `MYCALL` and `BW500`/`BW2750` rows were re-checked against a debug coppad during COP-76.
@@ -599,6 +618,10 @@ RETRIES repeats requests at max twice request airtime plus two turnarounds,
 or five seconds. Repeats stop at 300 s; timeout follows the last request.
 COP-202: in Auto, the third and later requests go on the low-rate floor, each
 at least 19 s plus one station-ID frame apart at a 500 ms turnaround.
+COP-210: in Auto, a caller whose callsign sorts after the target's also waits
+one more retry interval plus one floor response window after each request it
+sends on OFDM, on every dial. The extra wait stops once a request has gone on
+the floor.
 See [BPQ.md](BPQ.md) for scanning gateways and measured limits.
 
 Unknown-command log deduplication remembers at most 64 words per client,

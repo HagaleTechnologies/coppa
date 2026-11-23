@@ -75,8 +75,9 @@ receiver in `coppa-protocol` (`modem/floor.rs`). The frozen parameters:
   does not embed Link or keep a second controller. The floor is enabled while
   the speed level is automatic. An unset VARA `RETRIES` means three repeats in
   Auto. Floor request windows add one level-1 station-ID frame. The daemon
-  keeps its 30 s inbound handshake timeout, replays no lost CONNECT_CFM and
-  does not stagger discovery. Both adapters meet the −6 dB connect bar in the
+  keeps its 30 s inbound handshake timeout and replays no lost CONNECT_CFM.
+  COP-202 shipped without a discovery stagger; that claim is superseded by the
+  COP-210 amendment below. Both adapters meet the −6 dB connect bar in the
   recorded direction (`results/cop-190/connect/`). A floor-negotiated daemon
   session carries data on the floor: segments are floor-sized only while the
   controller is on the floor or probing, so good-channel frames keep their
@@ -88,7 +89,8 @@ receiver in `coppa-protocol` (`modem/floor.rs`). The frozen parameters:
 - COP-210 amendment: coppad reports the active waveform to hosts. The
   WebSocket `status` reply gains an optional `phy_mode` object (`tx`, `rx`,
   each `null`, `"floor"` or `"ofdm:<level>"`), a reliable `phy_mode` push
-  follows each change, and the dashboard's Speed level card shows `floor`.
+  reports each change within one 500 ms tick, and at once when the session
+  ends, and the dashboard's Speed level card shows `floor`.
   RX counts only frames a session handler accepted, as `Link::phy_mode()`
   does, and both values clear when the session ends. Host API stays version
   1; the `coppa-host` type additions take the workspace to 0.17.0. The
