@@ -59,13 +59,13 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # COP-140: mDNS responder for coppad.local; pure Rust, no system daemon.
-mdns-sd = { version = "0.21", optional = true }
+mdns-sd = { version = "0.22", optional = true }
 axum = { version = "0.8", optional = true }
 serde_path_to_error = { version = "0.1", optional = true }
 
 [dev-dependencies]
 # COP-140: the round-trip test browses and resolves with the same crate.
-mdns-sd = "0.21"
+mdns-sd = "0.22"
 futures-util = "0.3"
 tokio-tungstenite = "0.29"
 coppa-channel = { path = "../coppa-channel" }
