@@ -111,7 +111,12 @@ GitHub Actions check-runs. For each name, a pass in any run counts
 (COP-225). A name with no pass takes its newest check-run. So a newer run
 still running keeps the fan-in waiting, and a failure with no pass in any
 run fails it. An earlier pass also beats a later failure of the same name.
-The code is the same, and the later failure stays visible on the PR.
+The PR head is the same in both runs, and the later failure stays visible
+on the PR. A `pull_request` run tests that head merged with main as main
+stood when the run started, so two runs can differ on main's side. The
+merge queue re-tests the PR on its own merge SHA against current main.
+Inside one run, GitHub's default check-run listing shows only the latest
+attempt of a re-run job, so that attempt decides.
 
 The relay step's GitHub App token is minted after the wait, because an
 installation token expires after an hour. ci.yml's `test-features` and
