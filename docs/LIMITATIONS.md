@@ -605,6 +605,20 @@ stall scenario does (`docs/testing/bpq-session.md`).
   counts. That includes COP-227's re-record, which ran before COP-224 moved
   the count to the dial; the rows have not been re-recorded since.
 
+- **COP-244 KISS trials depend on coppad's receive ring.** coppad decodes on
+  its event loop, so receive audio waits in the `[audio] buffer_size` ring
+  while a frame decodes. With the old 16384-sample ring (0.34 s) and 4 busy
+  loops on 2 CPUs, the KISS live trial lost a datagram and ran to the 600 s
+  cap with 1148 of 2048 bytes. KISS never resends a datagram, so the loss is
+  permanent. The harness's starved and overflow ticks stayed 0, because they
+  count relay ticks, not coppad's ring. `tools/compare/coppad-kiss.toml` now
+  gives each coppad 131072 samples (2.7 s), which passed the live test under
+  that load; 12 busy loops on 2 CPUs still lost a datagram (COP-244
+  research). The VARA-style and ARDOP profiles keep 16384 samples, and
+  whether the same overflow contributes to COP-237's capped trials is not
+  measured. The follow-up ticket filed with COP-244 tracks moving the decode
+  off the event loop.
+
 - **COP-227 re-recorded self-test.** COP-227 re-recorded the six black-box
   self-test rows with coppad 0.18.0 and the seeded payload: 2/6 completed
   (2/3 WGN 30 dB, 0/3 MPG 20 dB, 2 KB). The coppad 0.16.0 rows it

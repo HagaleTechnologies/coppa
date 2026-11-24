@@ -36,6 +36,10 @@ Older releases have no entry here. Their on-air breaks are listed in
 - COP-224: `coppa-bench compare blackbox` counts starved and overflow relay
   ticks from the dial, as the comparison page states, instead of from the
   payload write.
+- COP-244: the coppad-kiss black-box profile gives each coppad a
+  131072-sample audio ring, so the KISS live test survives a CPU-contended
+  host (measured at two busy loops per CPU). KISS datagrams are never resent,
+  and the 16384-sample ring dropped one when a decode stalled.
 
 ## 0.17.0
 
