@@ -16,6 +16,12 @@ Older releases have no entry here. Their on-air breaks are listed in
 
 ## Unreleased: 0.18.0
 
+- COP-227: `coppa-bench compare blackbox` records each trial's payload CRC-32
+  as a last `payload_crc32` column and refuses to resume into a CSV without it
+  or with another payload. Stream trials count `delivered_bytes` only up to
+  the first byte that differs from the payload, and KISS trials count each
+  intact datagram once. The six published coppad self-test rows were
+  re-recorded with coppad 0.18.0 and the seeded payload.
 - COP-222: Auto coppad retries a floor-sized outer-coded segment as ordinary
   floor Data. Two peers advertising CONNECT bit 7 can recover an oversized
   in-flight reliable segment through stop-and-wait floor fragments, retaining
@@ -27,6 +33,13 @@ Older releases have no entry here. Their on-air breaks are listed in
   floor-only `MacFrameType` values 11 and 12 require `MacPdu::from_floor_bytes`.
   The crate minor version advances to 0.18.0; host and C ABI versions do not
   change.
+- COP-224: `coppa-bench compare blackbox` counts starved and overflow relay
+  ticks from the dial, as the comparison page states, instead of from the
+  payload write.
+- COP-244: the coppad-kiss black-box profile gives each coppad a
+  131072-sample audio ring, so the KISS live test survives a CPU-contended
+  host. KISS datagrams are never resent, and the 16384-sample ring dropped
+  one when a decode stalled.
 
 ## 0.17.0
 
@@ -36,15 +49,17 @@ Older releases have no entry here. Their on-air breaks are listed in
   session frame keyed. `rx` is the waveform of the last session frame a session
   handler accepted, so frames for other stations, stale ACKs and replayed
   handshakes do not move it. Both clear to `null` when the session ends. A new
-  reliable `phy_mode` push follows each change. The dashboard's Speed level card
-  shows `TX floor · auto` and `RX floor (last decoded frame)` during a floor
-  session. Clients that ignore the field keep working.
+  reliable `phy_mode` push reports a change within one 500 ms tick, and goes out
+  at once with both values `null` when the session ends. The dashboard's Speed
+  level card shows `TX floor · auto` and `RX floor (last decoded frame)` during
+  a floor session. Clients that ignore the field keep working.
 - Two coppads that dial each other at once now make one session each
   (COP-210). As in the library Link, the station whose callsign sorts higher
   drops its own dial and answers the other's request, even with `LISTEN OFF`,
   and its host sees the call complete as its own `CONNECTED` with no
   `PENDING`. A lexically higher Auto caller waits one more retry interval plus
-  one floor response window before each OFDM repeat. New shared helpers
+  one floor response window after each request it sends on OFDM, on every
+  dial. New shared helpers
   `coppa_protocol::floor_controller::answers_simultaneous_call` and
   `calling_retry_stagger` carry the rule for both adapters.
 - **Rust API, breaking for struct literals and exhaustive matches:** new

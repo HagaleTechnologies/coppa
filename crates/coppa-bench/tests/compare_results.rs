@@ -171,9 +171,11 @@ fn published_page_has_a_value_in_every_cell() {
     }
 }
 
-#[test]
-fn published_data_is_coppa_only() {
-    for entry in fs::read_dir(default_out_dir()).unwrap() {
+/// Decision 10: every CSV in `dir` is a coppa CSV. `channel-check.csv` and
+/// `blackbox-coppad.csv` keep their own checks; any other CSV must be a
+/// `link-*.csv` whose every row the link reader reads as a coppa row.
+fn audit_published_csvs(dir: &Path) {
+    for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "csv") {
             if path
@@ -193,7 +195,12 @@ fn published_data_is_coppa_only() {
                 // reply column itself starts with "VERSION Coppa".
                 for row in text.lines().skip(1) {
                     let fields: Vec<_> = row.split(',').collect();
-                    assert_eq!(fields.len(), 24, "{}: malformed row {row}", path.display());
+                    assert_eq!(
+                        fields.len(),
+                        coppa_bench::compare::blackbox::CSV_COLUMNS,
+                        "{}: malformed row {row}",
+                        path.display()
+                    );
                     assert_eq!(fields[0], "coppad", "{}: foreign row {row}", path.display());
                     assert!(
                         fields
@@ -205,10 +212,12 @@ fn published_data_is_coppa_only() {
                 }
                 continue;
             }
-            assert_eq!(
-                path.file_name().unwrap(),
-                "link-l2.csv",
-                "unknown published CSV"
+            assert!(
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("link-")),
+                "unknown published CSV {}",
+                path.display()
             );
             for t in read_csv(&path).unwrap() {
                 assert!(
@@ -220,6 +229,11 @@ fn published_data_is_coppa_only() {
             }
         }
     }
+}
+
+#[test]
+fn published_data_is_coppa_only() {
+    audit_published_csvs(&default_out_dir());
     let page = read(&default_page());
     for line in page
         .lines()
@@ -239,6 +253,59 @@ fn published_data_is_coppa_only() {
             "non-coppa table row: {line}"
         );
     }
+}
+
+/// A real `link-l4` row, written by `coppa-bench compare --rows link-l4
+/// --channel wgn --snr 30 --size 2048 --trials 1 --jobs 1` at `d2bcc0a`.
+const LINK_L4_ROW: &str = "link-l4,link,4,false,wgn,30,2048,0,0x17000000,0.015971,600,complete,2.10,2048,true,35.90,3422.8,0,38.00";
+
+/// A temp dir removed on drop, so a test that panics on purpose leaves none.
+struct AuditDir(PathBuf);
+
+impl Drop for AuditDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Writes `{HEADER}\n{row}\n` as `name` in a fresh pid-named temp dir and
+/// returns the dir. Each test passes its own `tag`, so tests running in
+/// parallel never share a dir.
+fn published_dir_with(tag: &str, name: &str, row: &str) -> AuditDir {
+    let dir =
+        std::env::temp_dir().join(format!("coppa-compare-audit-{}-{tag}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(name), format!("{HEADER}\n{row}\n")).unwrap();
+    AuditDir(dir)
+}
+
+/// COP-224 AC3: a `link-l4.csv` written by `compare --rows link-l4` passes the
+/// coppa-only audit, as the link-l2 CSV does.
+#[test]
+fn a_link_l4_csv_passes_the_coppa_only_audit() {
+    let dir = published_dir_with("l4", "link-l4.csv", LINK_L4_ROW);
+    assert_eq!(read_csv(&dir.0.join("link-l4.csv")).unwrap().len(), 1);
+    audit_published_csvs(&dir.0);
+}
+
+/// COP-224 AC3: a `link-*.csv` holding a row that is not a coppa link row
+/// still fails the audit.
+#[test]
+#[should_panic(expected = "non-coppa row vara-x")]
+fn a_link_csv_with_a_foreign_row_fails_the_audit() {
+    let row = LINK_L4_ROW.replacen("link-l4,", "vara-x,", 1);
+    let dir = published_dir_with("foreign", "link-x.csv", &row);
+    audit_published_csvs(&dir.0);
+}
+
+/// COP-224 AC3: a CSV whose name is outside `link-*.csv` still fails the
+/// audit, even when its rows are coppa rows.
+#[test]
+#[should_panic(expected = "unknown published CSV")]
+fn a_csv_outside_link_star_fails_the_audit() {
+    let dir = published_dir_with("other", "results.csv", LINK_L4_ROW);
+    audit_published_csvs(&dir.0);
 }
 
 #[test]
@@ -284,7 +351,7 @@ fn blackbox_selftest_records_every_field() {
     let path = default_out_dir().join("blackbox-coppad.csv");
     let text = read(&path);
     let mut rows = text.lines();
-    assert_eq!(rows.next(), Some("modem,adapter,version_reply,binary_sha256,mode,channel,snr_db,size_bytes,trial,seed,ref_power_a,ref_power_b,cap_s,outcome,connect_s,delivered_bytes,exact,transfer_s,net_bytes_per_min,drops,wall_s,cable_latency_ms,starved_ticks,overflow_ticks"));
+    assert_eq!(rows.next(), Some("modem,adapter,version_reply,binary_sha256,mode,channel,snr_db,size_bytes,trial,seed,ref_power_a,ref_power_b,cap_s,outcome,connect_s,delivered_bytes,exact,transfer_s,net_bytes_per_min,drops,wall_s,cable_latency_ms,starved_ticks,overflow_ticks,payload_crc32"));
     let lines: Vec<_> = rows.collect();
     assert_eq!(lines.len(), 6);
     for (channel, snr) in [(Channel::Wgn, 30), (Channel::Mpg, 20)] {
@@ -301,7 +368,7 @@ fn blackbox_selftest_records_every_field() {
                     f[5] == channel.name() && f[6] == snr.to_string() && f[8] == trial.to_string()
                 })
                 .unwrap();
-            assert_eq!(fields.len(), 24);
+            assert_eq!(fields.len(), 25);
             assert_eq!(fields[0], "coppad");
             assert!(fields[2].starts_with("VERSION Coppa"));
             assert_eq!(
@@ -312,6 +379,158 @@ fn blackbox_selftest_records_every_field() {
                 .iter()
                 .enumerate()
                 .all(|(i, value)| !value.is_empty() || i == 14 && fields[13] == "no_connect"));
+            // COP-227 (AC9): the published row follows the delivered_bytes rule.
+            let size: usize = fields[7].parse().unwrap();
+            let delivered: usize = fields[15].parse().unwrap();
+            let exact: bool = fields[16].parse().unwrap();
+            let transfer_s: f64 = fields[17].parse().unwrap();
+            let rate: f64 = fields[18].parse().unwrap();
+            assert!(
+                delivered <= size,
+                "delivered_bytes above size_bytes: {fields:?}"
+            );
+            assert_eq!(
+                fields[13] == "complete",
+                exact,
+                "complete must mean exact: {fields:?}"
+            );
+            assert!(
+                !exact || delivered == size,
+                "an exact row delivered less than its payload: {fields:?}"
+            );
+            let expected = if transfer_s > 0.0 {
+                delivered as f64 * 60.0 / transfer_s
+            } else {
+                0.0
+            };
+            assert!(
+                (rate - expected).abs() <= 0.01 + 1e-4 * expected,
+                "net_bytes_per_min {rate} is not delivered_bytes per minute {expected}: {fields:?}"
+            );
+        }
+    }
+}
+
+/// COP-227 (AC1): every published row carries the seeded payload for its own
+/// seed, recorded by one coppad binary that is not the ramp-era one. The CRC
+/// is computed here with the `crc` crate, not through the harness.
+#[test]
+fn blackbox_selftest_rows_carry_the_seeded_payload() {
+    use crc::{Crc, CRC_32_ISO_HDLC};
+    let text = read(&default_out_dir().join("blackbox-coppad.csv"));
+    let mut lines = text.lines();
+    let header: Vec<_> = lines.next().unwrap().split(',').collect();
+    assert_eq!(header.last(), Some(&"payload_crc32"));
+    let column = |name: &str| {
+        header
+            .iter()
+            .position(|h| *h == name)
+            .unwrap_or_else(|| panic!("no {name} column"))
+    };
+    let (sha, seed, size, crc) = (
+        column("binary_sha256"),
+        column("seed"),
+        column("size_bytes"),
+        column("payload_crc32"),
+    );
+    let rows: Vec<Vec<&str>> = lines.map(|l| l.split(',').collect()).collect();
+    assert_eq!(rows.len(), 6);
+    let first_sha = rows[0][sha];
+    assert_ne!(
+        first_sha, "9b8b4957d0c18b1df65c23d26a97b2a855101fff94fb6902757ff0c1d6d1327e",
+        "a ramp-era row is still published"
+    );
+    for row in &rows {
+        assert_eq!(row.len(), header.len(), "{row:?}");
+        assert_eq!(row[sha], first_sha, "rows from two binaries: {row:?}");
+        let seed = u64::from_str_radix(row[seed].strip_prefix("0x").unwrap(), 16).unwrap();
+        let size: usize = row[size].parse().unwrap();
+        let payload = coppa_bench::compare::link_stack::payload(seed, size);
+        let expected = format!(
+            "0x{:08x}",
+            Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(&payload)
+        );
+        assert_eq!(row[crc], expected, "seed 0x{seed:x}: {row:?}");
+    }
+}
+
+/// COP-227 (AC10): the page states what a trial writes and how
+/// `delivered_bytes` is scored.
+#[test]
+fn blackbox_section_states_the_scoring_rule() {
+    let page = read(&default_page());
+    let text = section(&page, "## Black-box self-test")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for needle in [
+        "same seeded bytes",
+        "`payload_crc32`",
+        "before the first byte that differs from the payload",
+        "do not count",
+        "equal the payload exactly",
+        "counts once",
+    ] {
+        assert!(
+            text.contains(needle),
+            "Black-box self-test lacks {needle:?}"
+        );
+    }
+}
+
+/// COP-227 (AC2): `metadata.md` records the re-recorded rows as the CSV has
+/// them, and an incomplete re-record is stated in LIMITATIONS.md.
+#[test]
+fn metadata_matches_the_blackbox_rows() {
+    let metadata = read(&default_out_dir().join("metadata.md"));
+    let value = |key: &str| -> String {
+        let prefix = format!("{key}=");
+        metadata
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(&prefix).map(str::to_string))
+            .unwrap_or_else(|| panic!("metadata.md lacks {prefix}"))
+    };
+    let text = read(&default_out_dir().join("blackbox-coppad.csv"));
+    let rows: Vec<Vec<&str>> = text
+        .lines()
+        .skip(1)
+        .map(|l| l.split(',').collect())
+        .collect();
+    let version = value("blackbox_version_reply");
+    let sha = value("blackbox_binary_sha256");
+    for row in &rows {
+        assert_eq!(row[2], version, "{row:?}");
+        assert_eq!(row[3], sha, "{row:?}");
+    }
+    assert_eq!(value("blackbox_payload"), "seeded");
+    let count = rows.len();
+    let completed = rows.iter().filter(|r| r[13] == "complete").count();
+    assert_eq!(value("blackbox_rows"), count.to_string());
+    assert_eq!(value("blackbox_completed"), completed.to_string());
+    let joined = metadata.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        !joined.contains("predate the payload fix"),
+        "metadata.md still describes the ramp-era rows as published"
+    );
+    if completed < count {
+        assert!(
+            !joined.contains("All six trial rows completed exactly"),
+            "metadata.md says every row completed"
+        );
+        let limitations = read(&repo_root().join("docs/LIMITATIONS.md"));
+        let comparison = section(&limitations, "## COP-170 same-simulator comparison")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for needle in [
+            "COP-227".to_string(),
+            "COP-237".to_string(),
+            format!("{completed}/{count} completed"),
+        ] {
+            assert!(
+                comparison.contains(&needle),
+                "LIMITATIONS.md lacks {needle}"
+            );
         }
     }
 }
@@ -331,6 +550,92 @@ fn metadata_names_version_commands_and_sources() {
         "2020 Winlink",
     ] {
         assert!(m.contains(needle), "metadata.md lacks {needle:?}");
+    }
+}
+
+/// COP-226: the payload-fix note reports the measured frame outcome.
+#[test]
+fn ramp_note_states_the_measured_frame_outcome() {
+    let m = read(&default_out_dir().join("metadata.md"));
+    // Join wrapped lines so a phrase split across a line break still counts.
+    let m = m.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(!m.contains("would have overstated"));
+    for needle in [
+        "no frame holds more than 1424",
+        "matched in every case",
+        "re-record all six",
+    ] {
+        assert!(m.contains(needle), "metadata.md lacks {needle:?}");
+    }
+}
+
+/// COP-226: no coppad frame holds enough raw ramp bytes to compress better
+/// than seeded bytes.
+#[test]
+fn no_coppad_frame_holds_enough_ramp_to_compress() {
+    use coppa_engine::{profiles::HF_STANDARD, CoppaCore, EngineConfig, HF_MAX_SPEED_LEVEL};
+    use coppa_protocol::modem::{
+        speed_levels::max_multi_payload_for_level, transceiver::MAX_CODEWORDS,
+    };
+    let largest = (1..=HF_MAX_SPEED_LEVEL)
+        .filter_map(|l| max_multi_payload_for_level(l, MAX_CODEWORDS))
+        .max()
+        .unwrap();
+    assert_eq!(
+        largest, 1424,
+        "update results/compare/metadata.md if this changes"
+    );
+    let core = CoppaCore::with_config(EngineConfig::from_profile(&HF_STANDARD));
+    // The six recorded trials' seeds. Before PR #281's payload fix, the
+    // harness wrote `(seed + i) & 0xff` for each.
+    let csv = read(&default_out_dir().join("blackbox-coppad.csv"));
+    let mut rows = csv.lines();
+    let column = rows
+        .next()
+        .and_then(|h| h.split(',').position(|name| name == "seed"))
+        .unwrap();
+    let seeds: Vec<u64> = rows
+        .map(|row| {
+            let hex = row.split(',').nth(column).unwrap();
+            u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap()
+        })
+        .collect();
+    assert_eq!(seeds.len(), 6);
+    for seed in seeds {
+        let ramp: Vec<u8> = (0..2048u64)
+            .map(|i| (seed.wrapping_add(i) & 0xff) as u8)
+            .collect();
+        let seeded = coppa_bench::compare::link_stack::payload(seed, 2048);
+        assert!(core.encoded_payload_len(&ramp) > largest);
+        for n in [512, 1024, 2048] {
+            let (r, s) = (
+                core.encoded_payload_len(&ramp[..n]),
+                core.encoded_payload_len(&seeded[..n]),
+            );
+            assert!(
+                r * 100 >= s * 98,
+                "seed {seed:#x}, {n} B: ramp {r}, seeded {s}"
+            );
+        }
+    }
+}
+
+/// COP-226: the black-box section names its payload and the stack differences.
+#[test]
+fn blackbox_section_states_payload_and_compression() {
+    let page = read(&default_page());
+    let blackbox = section(&page, "## Black-box self-test");
+    // Join wrapped lines so a phrase split across a line break still counts.
+    let blackbox = blackbox.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "same seeded bytes",
+        "256-byte repeating ramp",
+        "do not compress",
+    ] {
+        assert!(
+            blackbox.contains(needle),
+            "black-box section lacks {needle:?}"
+        );
     }
 }
 
@@ -386,6 +691,10 @@ fn docs_point_at_the_comparison_page() {
     assert!(limitations.contains("## COP-170 same-simulator comparison"));
     let changelog = read(&root.join("CHANGELOG.md"));
     assert!(changelog.contains("coppa-bench compare"));
+    // COP-227 (AC12): the payload column is documented where the harness is.
+    let readme_words = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(readme_words.contains("CRC-32 of the generated trial payload as `payload_crc32`"));
+    assert!(changelog.contains("payload_crc32"));
 
     // COP-214 (AC10): every document says what shipped.
     for (name, text) in [

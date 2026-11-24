@@ -74,7 +74,77 @@ fn coppad_ardop_transfer_through_cable() {
 #[test]
 #[ignore = "requires release coppad with kiss-tnc, ALSA file PCM, and real time"]
 fn coppad_kiss_datagrams_through_cable() {
-    let (csv, _) = run("coppad-kiss");
+    let (csv, log) = run("coppad-kiss");
+    // COP-214 Phase 3: the profile's datagram fits every KISS interface
+    // coppad reports. This runs before the CSV asserts, because an oversized
+    // profile still records outcome `datagram`, with exact=false.
+    let kiss = coppa_bench::compare::blackbox::profile::Profile::load(
+        &coppa_bench::compare::repo_root().join("tools/compare/coppad-kiss.toml"),
+    )
+    .unwrap();
+    let datagram_bytes = kiss.datagram_bytes.unwrap();
+    let max: Vec<usize> = log
+        .split("max_datagram_bytes=")
+        .skip(1)
+        .map(|rest| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits
+                .parse()
+                .unwrap_or_else(|e| panic!("max_datagram_bytes={rest:.20}: {e}"))
+        })
+        .collect();
+    assert!(
+        !max.is_empty(),
+        "coppad logged no max_datagram_bytes: {log}"
+    );
+    assert!(
+        max.iter().all(|&m| datagram_bytes <= m),
+        "datagram_bytes {datagram_bytes} exceeds a logged max_datagram_bytes {max:?}"
+    );
     assert!(csv.contains(",datagram,"), "{csv}");
-    assert!(csv.contains(",2048,true,"), "{csv}");
+    assert!(
+        csv.contains(",2048,true,"),
+        "KISS trial delivered less than the payload. A KISS datagram is never \
+         resent; one measured cause is coppad's [audio] buffer_size overflowing \
+         during a decode on a CPU-contended host (COP-244, docs/LIMITATIONS.md): {csv}"
+    );
+}
+
+/// COP-227 (AC4): a resume into a CSV from before the `payload_crc32` column
+/// is refused before the probe or any modem starts, and the file is left as
+/// it was. Needs no coppad: the profile names this test's own binary, which
+/// hashes but is never launched.
+#[test]
+fn resume_into_a_pre_payload_csv_is_refused_before_any_modem_starts() {
+    let root = coppa_bench::compare::repo_root();
+    let dir = std::env::temp_dir().join(format!("coppa-cop227-legacy-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let out_dir = dir.join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let source = fs::read_to_string(root.join("tools/compare/coppad.toml")).unwrap();
+    let source = source.replace("target/release/coppad", env!("CARGO_BIN_EXE_coppa-bench"));
+    let profile = dir.join("profile.toml");
+    fs::write(&profile, source).unwrap();
+    let legacy_header = coppa_bench::compare::blackbox::CSV_HEADER
+        .strip_suffix(",payload_crc32")
+        .unwrap();
+    let legacy = format!(
+        "{legacy_header}\ncoppad,vara,VERSION Coppa 0.16.0,9b8b4957d0c18b1df65c23d26a97b2a855101fff94fb6902757ff0c1d6d1327e,HF_STANDARD,wgn,30,2048,0,0x17000000,0.022691,0.020689,600,complete,7.078,2048,true,51.477,2387.090,0,58.555,355,0,0\n"
+    );
+    let csv = out_dir.join("blackbox-coppad.csv");
+    fs::write(&csv, &legacy).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_coppa-bench"))
+        .args(["compare", "blackbox", "--modem"])
+        .arg(&profile)
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("no payload_crc32 column"), "{stderr}");
+    assert!(stderr.contains("use a fresh --out-dir"), "{stderr}");
+    assert!(!stderr.contains("integrity probe"), "{stderr}");
+    assert_eq!(fs::read_to_string(&csv).unwrap(), legacy);
+    fs::remove_dir_all(&dir).unwrap();
 }

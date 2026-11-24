@@ -1019,7 +1019,7 @@
           ]
         },
         {
-          "description": "COP-210: the session waveform pair, sent whenever `tx` or `rx`\nchanges, and with both `null` when the session ends. Reliable.",
+          "description": "COP-210: the session waveform pair, sent when `tx` or `rx` has\nchanged (within one 500 ms tick), and at once with both `null` when\nthe session ends. Reliable.",
           "type": "object",
           "properties": {
             "rx": {

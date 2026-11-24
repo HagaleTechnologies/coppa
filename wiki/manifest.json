@@ -510,7 +510,11 @@
       "visibility": "public"
     },
     {
+<<<<<<< HEAD
       "hash": "sha256:44b41cf071052b6a1e51ff4dd743c66bd0b21236788e29b62d586f467c4cee1e",
+=======
+      "hash": "sha256:cd55e6ba0e9ff1362ca05178cfe309eefda92685ccb54c4a062b8558a4e14552",
+>>>>>>> d56be120cec7a13eefd9b5e3f40b0948f6665937
       "id": "full-ci-tests",
       "kind": "gotcha",
       "links": [
@@ -528,8 +532,8 @@
       ],
       "status": "current",
       "title": "What keeps full CI coverage intact when splitting optimized tests?",
-      "verified_commit": "c4e4ca8",
-      "verified_date": "2026-11-15",
+      "verified_commit": "9498632",
+      "verified_date": "2026-11-24",
       "visibility": "public"
     },
     {
@@ -605,8 +609,8 @@
       ],
       "status": "current",
       "title": "What has the low-rate floor experiment measured?",
-      "verified_commit": "5244d4e2534428748155b10810d5835685d1c029",
-      "verified_date": "2026-11-16",
+      "verified_commit": "d2bcc0a5dba97c0a86dede97ac9b232e68ba1b86",
+      "verified_date": "2026-11-22",
       "visibility": "public"
     },
     {
@@ -650,7 +654,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:841c9f911ad1578ad7afc3f607ecde14e64d02c7f6e732c59b90bbdb2c30003c",
+      "hash": "sha256:ac55e9a491ae6027d27dfac4144563d21d15a1631df66483e997affe7d3dae54",
       "id": "paused-clock-timers",
       "kind": "gotcha",
       "links": [
@@ -666,8 +670,8 @@
       ],
       "status": "current",
       "title": "What will bite you when a paused-clock test drives the daemon's timers?",
-      "verified_commit": "2526b50",
-      "verified_date": "2026-11-04",
+      "verified_commit": "9498632",
+      "verified_date": "2026-11-24",
       "visibility": "public"
     },
     {

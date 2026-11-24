@@ -1,4 +1,8 @@
 # KISS datagram interface to the same unmodified coppad binary.
+# KISS datagrams are never resent, so each station's receive ring must
+# outlast coppad's inline decode on a busy host: 16384 samples (0.34 s)
+# lost a datagram with 4 busy loops on 2 CPUs, 131072 (2.7 s) did not
+# (COP-244, docs/LIMITATIONS.md).
 name = "coppad-kiss"
 adapter = "kiss"
 binary = "target/release/coppad"
@@ -18,7 +22,7 @@ path = "{dir}/coppad.toml"
 contents = """
 [audio]
 sample_rate = 48000
-buffer_size = 16384
+buffer_size = 131072
 input_device = "{device}"
 output_device = "{device}"
 

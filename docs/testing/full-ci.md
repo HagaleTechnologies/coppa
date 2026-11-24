@@ -3,8 +3,10 @@
 COP-200 separates the full suite into four independently scheduled jobs.
 The `ci` Cargo profile inherits `test`, uses optimization level 2 and line
 tables, and explicitly retains debug assertions and overflow checks.
-Incremental compilation is disabled. Local `cargo test --workspace` and the
-release profile retain their prior settings.
+Incremental compilation is disabled. The release profile keeps its settings.
+Since COP-239, local `cargo test` builds third-party crates and the DSP-path
+crates at optimization level 2, with debug assertions and overflow checks
+still on; see [the daemon lib duration record](daemon-lib-durations.md).
 
 Run a group with:
 
@@ -70,9 +72,9 @@ The detailed record below distinguishes these conditions. The workspace warm
 repeat reused its corresponding target directory.
 
 The dropped-file-chunk test uses `start_paused = true`. Its 29.5/30-second
-Tokio sleeps advance virtual time. The unpaused event-loop RTO helper
-instead sleeps on the real thread. Optimizing DSP computation does not
-remove those real waits.
+Tokio sleeps advance virtual time. Since COP-239, default-feature
+event-loop tests also let session RTOs pass on the paused clock. Only the
+websocket chat retransmit test still sleeps one RTO on the real thread.
 
 ## Fast-tier wait
 
