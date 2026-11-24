@@ -102,7 +102,12 @@ fn coppad_kiss_datagrams_through_cable() {
         "datagram_bytes {datagram_bytes} exceeds a logged max_datagram_bytes {max:?}"
     );
     assert!(csv.contains(",datagram,"), "{csv}");
-    assert!(csv.contains(",2048,true,"), "{csv}");
+    assert!(
+        csv.contains(",2048,true,"),
+        "KISS trial delivered less than the payload. A KISS datagram is never \
+         resent; one measured cause is coppad's [audio] buffer_size overflowing \
+         during a decode on a CPU-contended host (COP-244, docs/LIMITATIONS.md): {csv}"
+    );
 }
 
 /// COP-227 (AC4): a resume into a CSV from before the `payload_crc32` column

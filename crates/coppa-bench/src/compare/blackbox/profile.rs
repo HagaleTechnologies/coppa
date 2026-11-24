@@ -135,6 +135,19 @@ mod tests {
         }
     }
 
+    /// COP-244: KISS datagrams are never resent, so each coppad's receive ring
+    /// must outlast a decode on a busy host. 16384 samples (0.34 s) lost a
+    /// datagram with 4 busy loops on 2 CPUs; 131072 (2.7 s) did not.
+    #[test]
+    fn kiss_profile_ring_outlasts_a_contended_decode() {
+        let profile =
+            Profile::load(&super::super::super::repo_root().join("tools/compare/coppad-kiss.toml"))
+                .unwrap();
+        let station: toml::Table = toml::from_str(&profile.files[0].contents).unwrap();
+        let ring = station["audio"]["buffer_size"].as_integer().unwrap();
+        assert!(ring >= 131_072, "coppad-kiss ring {ring} samples");
+    }
+
     #[test]
     fn missing_key_is_named() {
         let error = toml::from_str::<Profile>("name = 'x'")
