@@ -475,11 +475,66 @@ fn fast_tier_with(
     )
     .out
 }
+/// The six fast-tier check names the fan-in waits for, in ci-full.yml's order.
+const FAST_TIER: [&str; 6] = [
+    "Check",
+    "Test with Features (fast, lib-only)",
+    "Format",
+    "Platform Check (ubuntu-latest)",
+    "Platform Check (macos-latest)",
+    WINDOWS,
+];
 /// Runs the fan-in step with its wait cut to `wait_s` seconds. Windows reports `before` for
 /// the first `pending_polls` calls and `after` from then on; the other five checks pass.
 fn fast_tier_run(
     before: Windows,
     after: Windows,
+    pending_polls: usize,
+    wait_s: &str,
+    bad: &str,
+    fail: &str,
+) -> FanIn {
+    let runs = |windows: Windows| {
+        FAST_TIER
+            .iter()
+            .filter_map(|n| {
+                let conclusion = match (*n == WINDOWS, windows) {
+                    (true, Windows::Absent) => return None,
+                    (true, Windows::Running) => None,
+                    (true, Windows::Failed) => Some("failure"),
+                    _ => Some("success"),
+                };
+                Some(row(n, "github-actions", "2026-11-13T19:07:14Z", conclusion))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    fan_in(
+        &runs(before),
+        &runs(after),
+        pending_polls,
+        wait_s,
+        bad,
+        fail,
+    )
+}
+/// One fake check-run row. `app` is the slug of the GitHub App that owns it. A `None`
+/// conclusion means the check-run is still `in_progress`.
+fn row(name: &str, app: &str, started: &str, conclusion: Option<&str>) -> String {
+    let (status, conclusion, completed) = match conclusion {
+        None => ("in_progress", "null".to_owned(), "null".to_owned()),
+        Some(c) => ("completed", format!("\"{c}\""), format!("\"{started}\"")),
+    };
+    format!(
+        r#"{{"name":"{name}","app":{{"slug":"{app}"}},"started_at":"{started}","completed_at":{completed},"status":"{status}","conclusion":{conclusion}}}"#
+    )
+}
+/// Runs the fan-in step with its wait cut to `wait_s` seconds against a fake `gh`. The first
+/// `pending_polls` calls return the comma-joined check-run rows in `pending`, and later calls
+/// return `done`. `bad` and `fail` list the call numbers that return an error body or fail.
+fn fan_in(
+    pending: &str,
+    done: &str,
     pending_polls: usize,
     wait_s: &str,
     bad: &str,
@@ -498,41 +553,12 @@ fn fast_tier_run(
         )
         .replace("sleep 30", "sleep 0.05");
     let s = Scratch::new();
-    let names = [
-        "Check",
-        "Test with Features (fast, lib-only)",
-        "Format",
-        "Platform Check (ubuntu-latest)",
-        "Platform Check (macos-latest)",
-        WINDOWS,
-    ];
-    let runs = |windows: Windows| {
-        names
-            .iter()
-            .filter_map(|n| {
-                let (status, conclusion) = match (*n == WINDOWS, windows) {
-                    (true, Windows::Absent) => return None,
-                    (true, Windows::Running) => ("in_progress", "null"),
-                    (true, Windows::Failed) => ("completed", "\"failure\""),
-                    _ => ("completed", "\"success\""),
-                };
-                Some(format!(
-                    r#"{{"name":"{n}","started_at":"2026-11-13T19:07:14Z","status":"{status}","conclusion":{conclusion}}}"#
-                ))
-            })
-            .collect::<Vec<_>>()
-            .join(",")
-    };
     fs::write(
         s.0.join("pending"),
-        format!(r#"{{"check_runs":[{}]}}"#, runs(before)),
+        format!(r#"{{"check_runs":[{pending}]}}"#),
     )
     .unwrap();
-    fs::write(
-        s.0.join("done"),
-        format!(r#"{{"check_runs":[{}]}}"#, runs(after)),
-    )
-    .unwrap();
+    fs::write(s.0.join("done"), format!(r#"{{"check_runs":[{done}]}}"#)).unwrap();
     s.executable(
         "gh",
         &format!(
@@ -746,4 +772,85 @@ fn fanin_retries_a_bad_check_run_response() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("lookup on d1ee7d15 failed; retrying"));
+}
+#[test]
+fn fanin_accepts_a_pass_from_an_earlier_fast_tier_run_on_the_same_sha() {
+    // COP-225: marking a PR ready for review (or reopening it) starts a second ci.yml run on
+    // the same SHA, and GitHub lists each run's check-runs separately. Run 1 is the first
+    // ci.yml run on PR #281's head; run 2 is the one its ready event started.
+    const RUN1: &str = "2026-11-17T08:57:35Z";
+    const RUN2: &str = "2026-11-17T10:01:20Z";
+    const ACTIONS: &str = "github-actions";
+    // The five checks other than Windows pass in run 1 and have no run-2 check-run.
+    let with_windows = |windows: [String; 2]| {
+        FAST_TIER
+            .iter()
+            .filter(|n| **n != WINDOWS)
+            .map(|n| row(n, ACTIONS, RUN1, Some("success")))
+            .chain(windows)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    // AC1, the incident: run 1 passed all six checks and run 2 has all six still running.
+    // The pass counts on the first poll; the old newest-wins rule timed out here.
+    let rows = FAST_TIER
+        .iter()
+        .map(|n| row(n, ACTIONS, RUN1, Some("success")))
+        .chain(FAST_TIER.iter().map(|n| row(n, ACTIONS, RUN2, None)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let run = fan_in(&rows, &rows, 0, "2", "", "");
+    let stdout = String::from_utf8_lossy(&run.out.stdout);
+    assert!(run.out.status.success(), "{stdout}");
+    assert!(run.github_output.contains("outcome=success"), "{stdout}");
+    assert_eq!(run.polls, 1, "{stdout}");
+
+    // AC2: an earlier pass beats a later failure of the same name on the same SHA.
+    let rows = with_windows([
+        row(WINDOWS, ACTIONS, RUN1, Some("success")),
+        row(WINDOWS, ACTIONS, RUN2, Some("failure")),
+    ]);
+    let run = fan_in(&rows, &rows, 0, "7200", "", "");
+    let stdout = String::from_utf8_lossy(&run.out.stdout);
+    assert!(run.out.status.success(), "{stdout}");
+    assert!(run.github_output.contains("outcome=success"), "{stdout}");
+
+    // AC3: with no pass in any run, the newest check-run decides. Run 1 failed Windows and
+    // run 2 is still running it, so the fan-in waits and then names only Windows.
+    let rows = with_windows([
+        row(WINDOWS, ACTIONS, RUN1, Some("failure")),
+        row(WINDOWS, ACTIONS, RUN2, None),
+    ]);
+    let run = fan_in(&rows, &rows, 0, "2", "", "");
+    let stdout = String::from_utf8_lossy(&run.out.stdout);
+    assert!(!run.out.status.success(), "{stdout}");
+    assert!(run.github_output.contains("outcome=failure"), "{stdout}");
+    assert!(run.polls > 1, "{} polls: {stdout}", run.polls);
+    assert_eq!(
+        run.errors(),
+        [format!(
+            "::error::Fast-tier check(s) still running on d1ee7d15 after 75 minutes (timed out waiting, not failed): [\"{WINDOWS}\"]"
+        )],
+        "{stdout}"
+    );
+
+    // AC4: another app's check-run under a fast-tier name does not count, so its success
+    // cannot hide a GitHub Actions failure.
+    let rows = with_windows([
+        row(WINDOWS, ACTIONS, RUN1, Some("failure")),
+        row(WINDOWS, "some-other-app", RUN2, Some("success")),
+    ]);
+    let run = fan_in(&rows, &rows, 0, "7200", "", "");
+    let stdout = String::from_utf8_lossy(&run.out.stdout);
+    assert!(!run.out.status.success(), "{stdout}");
+    assert!(run.github_output.contains("outcome=failure"), "{stdout}");
+    assert_eq!(run.polls, 1, "{stdout}");
+    assert_eq!(
+        run.errors(),
+        [format!(
+            "::error::One or more fast-tier checks did not succeed on d1ee7d15: [{{\"name\":\"{WINDOWS}\",\"conclusion\":\"failure\"}}]"
+        )],
+        "{stdout}"
+    );
 }

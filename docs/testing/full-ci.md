@@ -106,6 +106,20 @@ on one line. A check that completes with any conclusion other than
 does not stop early for it: if another check is still running or missing
 at the deadline, the annotation names that check instead.
 
+One SHA can carry more than one ci.yml run. Marking a draft PR ready for
+review, or reopening a PR, starts another run on an unchanged head, and
+GitHub lists each run's check-runs separately. The fan-in reads only
+GitHub Actions check-runs. For each name, a pass in any run counts
+(COP-225). A name with no pass takes its newest check-run. So a newer run
+still running keeps the fan-in waiting, and a failure with no pass in any
+run fails it. An earlier pass also beats a later failure of the same name.
+The PR head is the same in both runs, and the later failure stays visible
+on the PR. A `pull_request` run tests that head merged with main as main
+stood when the run started, so two runs can differ on main's side. The
+merge queue re-tests the PR on its own merge SHA against current main.
+Inside one run, GitHub's default check-run listing shows only the latest
+attempt of a re-run job, so that attempt decides.
+
 The relay step's GitHub App token is minted after the wait, because an
 installation token expires after an hour. ci.yml's `test-features` and
 `platform` jobs keep their own 90-minute cap (COP-207), which frees a hung

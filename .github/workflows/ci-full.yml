@@ -602,10 +602,15 @@ jobs:
           # COP-207: a long wait polls many times, so one bad response (an API error, or a page
           # without check_runs) must cost a retry, not the whole required check. Returns nonzero
           # on any failure and the caller keeps the previous snapshot.
+          # COP-225: a ready or reopened PR starts another ci.yml run on the same SHA, and GitHub
+          # lists each run's check-runs separately. Per name, a pass from any run wins. With no
+          # pass, the newest check-run decides, so a running check still waits and a failure
+          # still fails. Only GitHub Actions check-runs count, so another app cannot pass a
+          # fast-tier check.
           fetch_fast_tier() {
             local raw
             raw=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs") || return 1
-            jq -se --argjson names "$fast_tier_names" 'if all(.[]; (.check_runs | type) == "array") then [.[].check_runs[] | select(.name as $n | $names | index($n))] | group_by(.name) | map(max_by(.started_at)) else error("no check_runs in response") end' <<<"$raw"
+            jq -se --argjson names "$fast_tier_names" 'if all(.[]; (.check_runs | type) == "array") then [.[].check_runs[] | select(.app.slug == "github-actions" and (.name as $n | $names | index($n)))] | group_by(.name) | map((map(select(.status == "completed" and .conclusion == "success")) | max_by(.completed_at)) // max_by(.started_at)) else error("no check_runs in response") end' <<<"$raw"
           }
           # Codex P1, round 3 (this PR's own review): ci.yml and ci-full.yml are two SEPARATE
           # workflow files triggered by the SAME event (push/merge_group) with NO ordering
