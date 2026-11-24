@@ -104,6 +104,32 @@ lto = "fat"
 codegen-units = 1
 strip = "debuginfo"
 
+# COP-239: `cargo test` builds third-party crates and the DSP-path workspace
+# crates at opt-level 2. Only opt-level changes: debug assertions and overflow
+# checks keep the test profile's defaults (on). coppa-daemon and the other
+# crates stay unoptimized, so editing their tests recompiles quickly.
+# See docs/testing/daemon-lib-durations.md.
+[profile.test.package."*"]
+opt-level = 2
+
+[profile.test.package.coppa-dsp]
+opt-level = 2
+
+[profile.test.package.coppa-codec]
+opt-level = 2
+
+[profile.test.package.coppa-protocol]
+opt-level = 2
+
+[profile.test.package.coppa-channel]
+opt-level = 2
+
+[profile.test.package.coppa-ml]
+opt-level = 2
+
+[profile.test.package.coppa-engine]
+opt-level = 2
+
 # Optimize DSP-heavy CI simulations without weakening runtime checks.
 [profile.ci]
 inherits = "test"

@@ -11868,8 +11868,22 @@ mod tests {
         station.handle_mac_pdu(pdu).await;
     }
 
-    /// Sleep past the session RTO in unpaused tests, where real sleep moves
-    /// tokio's clock. Paused tests use tokio::time::advance instead.
+    /// COP-239: move tokio's paused clock past the session RTO. Every caller
+    /// runs `start_paused`, so the RTO elapses in virtual time and costs no
+    /// wall time; `tokio::time::advance` panics on an unpaused runtime.
+    async fn advance_past_session_rto(station: &EventLoop) {
+        let rto = station
+            .session_link
+            .as_ref()
+            .map_or(Duration::ZERO, |l| l.tx.rto());
+        tokio::time::advance(rto + Duration::from_millis(5)).await;
+    }
+
+    /// Sleep past the session RTO on the real thread. Its one caller is the
+    /// websocket chat retransmit test (`tests/chat/more.rs`), which drives
+    /// real sockets and stays unpaused (COP-239). Default-feature tests use
+    /// `advance_past_session_rto`.
+    #[cfg(feature = "websocket")]
     fn sleep_past_session_rto(station: &EventLoop) {
         let rto = station
             .session_link
@@ -11897,7 +11911,7 @@ mod tests {
                 return;
             }
             station.handle_ptt_change(false).await;
-            sleep_past_session_rto(station);
+            advance_past_session_rto(station).await;
             station.check_session_retransmits().await;
             read_all(consumer);
         }
@@ -12269,7 +12283,7 @@ mod tests {
     /// in transit is detected by `ArqTx` (no ACK within the RTO),
     /// retransmitted by `check_session_retransmits`, and delivered to the
     /// peer's host exactly once; the peer's ACK then clears it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn lost_session_data_frame_is_retransmitted_and_delivered_once() {
         let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
         let (data_tx, mut data_rx) = mpsc::unbounded_channel();
@@ -12283,7 +12297,7 @@ mod tests {
         .await;
         take_leg(&mut a_consumer, "the data frame that is lost");
         a.handle_ptt_change(false).await;
-        sleep_past_session_rto(&a);
+        advance_past_session_rto(&a).await;
         a.check_session_retransmits().await;
         unstick_decoder(&mut b);
         b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "the retransmission"))
@@ -12302,7 +12316,7 @@ mod tests {
 
     /// COP-38: a lost ACK makes the sender retransmit; the receiver drops the
     /// duplicate (no second `DataOut`) and re-ACKs, which clears the sender.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn lost_session_ack_is_recovered_without_a_duplicate_delivery() {
         let (mut a, mut b, mut a_consumer, mut b_consumer) = connected_pair(0).await;
         let (data_tx, mut data_rx) = mpsc::unbounded_channel();
@@ -12319,7 +12333,7 @@ mod tests {
         take_leg(&mut b_consumer, "b's ACK, which is lost");
         b.handle_ptt_change(false).await;
         a.handle_ptt_change(false).await;
-        sleep_past_session_rto(&a);
+        advance_past_session_rto(&a).await;
         a.check_session_retransmits().await;
         unstick_decoder(&mut b);
         b.decode_and_dispatch_audio(&take_leg(&mut a_consumer, "the retransmission"))
@@ -12456,7 +12470,7 @@ mod tests {
         assert!(mixed_a.session_link.as_ref().unwrap().tx.in_flight() > 0);
         let _ = read_all(&mut audio_a);
         mixed_a.handle_ptt_change(false).await;
-        sleep_past_session_rto(&mixed_a);
+        advance_past_session_rto(&mixed_a).await;
         mixed_a.check_session_retransmits().await;
         assert!(mixed_a.session_link.as_ref().unwrap().fragment_tx.is_none());
         assert!(matches!(mixed_a.phy_tx, Some(LinkPhyMode::Ofdm { .. })));
@@ -13068,7 +13082,7 @@ mod tests {
     /// bound to ~100 ms the way `fast_session_rto` shrinks the RTO, so the
     /// teardown is bounded by the no-evidence bound instead of one RTO
     /// after exhaustion.)
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn exhausted_session_link_sends_disconnect_and_reports_disconnected() {
         let (mut a, mut b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         let mut status_rx = vara_lines(&mut a);
@@ -13090,7 +13104,7 @@ mod tests {
                 last_leg = leg;
             }
             a.handle_ptt_change(false).await;
-            sleep_past_session_rto(&a);
+            advance_past_session_rto(&a).await;
             a.check_session_retransmits().await;
             // COP-68: once the fade hold is entered, shrink its no-evidence
             // bound (no peer evidence has arrived, so the bound is measured
@@ -13134,7 +13148,7 @@ mod tests {
     /// decodable, re-grants the budget per evidence event (transmit_count
     /// climbs past `DEFAULT_MAX_RETRANSMIT`), and still fails cleanly after
     /// the no-evidence bound once the peer goes quiet.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn session_link_holds_while_peer_still_decodable_and_fails_after_quiet() {
         let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         let mut status_rx = vara_lines(&mut a);
@@ -13151,7 +13165,7 @@ mod tests {
         // the peer stays decodable. Each KEEPALIVE from the remote is
         // evidence: the budget is re-granted and retries resume.
         for _ in 0..3 {
-            sleep_past_session_rto(&a); // past the old death point
+            advance_past_session_rto(&a).await; // past the old death point
             keepalive_from_peer(&mut a).await;
             a.check_session_retransmits().await;
             read_all(&mut a_consumer);
@@ -13183,7 +13197,7 @@ mod tests {
                 break;
             }
             a.handle_ptt_change(false).await;
-            sleep_past_session_rto(&a);
+            advance_past_session_rto(&a).await;
             a.check_session_retransmits().await;
             read_all(&mut a_consumer);
         }
@@ -13204,7 +13218,7 @@ mod tests {
     /// robust level (level 1 for a frame that fits its 56-byte budget), the
     /// frame bytes stay byte-identical, and a recovering ACK clears the
     /// hold and restores the standard budget.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn fade_hold_retransmits_at_fittest_level_and_recovers() {
         let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
@@ -13225,7 +13239,7 @@ mod tests {
         // The next retransmission goes out at the fallback level: capture
         // the audio leg and decode it on an independent raw decoder.
         a.handle_ptt_change(false).await;
-        sleep_past_session_rto(&a);
+        advance_past_session_rto(&a).await;
         a.check_session_retransmits().await;
         let leg = read_all(&mut a_consumer);
         assert!(!leg.is_empty(), "the held segment must keep retransmitting");
@@ -13261,7 +13275,7 @@ mod tests {
 
     /// COP-211: two expired data windows return a floor-negotiated session
     /// to the floor even after its level-1 probe succeeded.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn post_probe_window_expiry_returns_to_the_floor() {
         let (mut a, _b, mut a_consumer, _b_consumer) = connected_pair(0).await;
         assert!(
@@ -13286,7 +13300,7 @@ mod tests {
         let mut modes = Vec::new();
         for _ in 0..2 {
             a.handle_ptt_change(false).await;
-            sleep_past_session_rto(&a);
+            advance_past_session_rto(&a).await;
             a.check_session_retransmits().await;
             read_all(&mut a_consumer);
             modes.push(a.phy_tx);
@@ -13304,7 +13318,7 @@ mod tests {
     /// budget has no lower level to drop to -- the honest "nothing lower
     /// fits" branch: the link still holds (no teardown at the old death
     /// point) and retransmits at the current level.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn oversized_segment_holds_at_current_level() {
         let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
@@ -13328,7 +13342,7 @@ mod tests {
         // The link holds past the old death point (one RTO after
         // exhaustion) and retransmits at the current level.
         a.handle_ptt_change(false).await;
-        sleep_past_session_rto(&a);
+        advance_past_session_rto(&a).await;
         a.check_session_retransmits().await;
         assert!(
             a.session_link.is_some(),
@@ -13357,7 +13371,7 @@ mod tests {
     /// decodable, payload destroyed) counts as peer evidence -- the hold
     /// does not expire at the stale bound when one arrives, and still ends
     /// bounded after the refreshed bound with no further evidence.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn header_only_decode_counts_as_evidence() {
         let (mut a, b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
@@ -13396,7 +13410,7 @@ mod tests {
         };
         corrupt_after_header(&mut frame);
         a.handle_ptt_change(false).await;
-        let before_feed = Instant::now();
+        let before_feed = clock_now();
         unstick_decoder(&mut a);
         a.decode_and_dispatch_audio(&with_lead_and_trail(&frame))
             .await;
@@ -13410,7 +13424,7 @@ mod tests {
         // pre-refresh bound is long expired.
         a.check_session_retransmits().await;
         assert!(
-            Instant::now() >= stale_bound,
+            clock_now() >= stale_bound,
             "test setup: the pre-refresh no-evidence bound must already be expired"
         );
         assert!(
@@ -13425,7 +13439,7 @@ mod tests {
                 break;
             }
             a.handle_ptt_change(false).await;
-            sleep_past_session_rto(&a);
+            advance_past_session_rto(&a).await;
             a.check_session_retransmits().await;
             read_all(&mut a_consumer);
         }
@@ -13442,7 +13456,7 @@ mod tests {
     /// 180 s bound expired before the first fallback retransmission was
     /// even due (~195 s), so the hold never actually held and no
     /// robust-level frame ever went out.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn fade_hold_no_evidence_bound_starts_at_hold_entry() {
         let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
@@ -13461,7 +13475,7 @@ mod tests {
         // already in the past, an entry-anchored one is not.
         let since_evidence = {
             let link = a.session_link.as_ref().unwrap();
-            Instant::now().duration_since(link.last_peer_evidence)
+            clock_now().duration_since(link.last_peer_evidence)
         };
         assert!(
             since_evidence > Duration::from_millis(300),
@@ -13491,7 +13505,7 @@ mod tests {
                 break;
             }
             a.handle_ptt_change(false).await;
-            sleep_past_session_rto(&a);
+            advance_past_session_rto(&a).await;
             a.check_session_retransmits().await;
             read_all(&mut a_consumer);
         }
@@ -13507,7 +13521,7 @@ mod tests {
     /// logging calculation must saturate too -- an unsaturated `count + 1`
     /// panicked in debug/overflow-checked builds and wrapped the `attempt`
     /// field to 0 in release.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn fade_hold_attempt_calculation_saturates_past_u8_max() {
         let (mut a, _b, mut a_consumer, _b_consumer) = connected_ofdm_pair(0).await;
         fast_session_rto(&mut a);
@@ -13524,12 +13538,12 @@ mod tests {
             link.tx.set_max_retransmit(u8::MAX);
             while link.tx.transmit_count(seq) != Some(u8::MAX) {
                 link.tx
-                    .mark_retransmitted(seq, Instant::now())
+                    .mark_retransmitted(seq, clock_now())
                     .expect("the in-flight segment stays pending");
             }
         }
         a.handle_ptt_change(false).await;
-        sleep_past_session_rto(&a);
+        advance_past_session_rto(&a).await;
         // Before the fix this pass panicked computing `attempt = 255 + 1`;
         // after it the retransmission goes out and the hold continues.
         a.check_session_retransmits().await;
@@ -20439,13 +20453,13 @@ mod tests {
         /// level dropped under a chunk sized for the old one) still spends
         /// the retry budget, so the link fails rather than retrying forever
         /// in silence.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn a_retransmission_that_no_longer_encodes_still_spends_the_budget() {
             let mut event_loop = EventLoop::new(session_config()).unwrap();
             let (producer, mut consumer) = coppa_audio::audio_ring(4_000_000);
             event_loop.set_audio_out(producer);
             // COP-111: the first frame's station ID would raise its timeout
-            // by the ID's airtime, and `sleep_past_session_rto` sleeps it.
+            // by the ID's airtime, and `advance_past_session_rto` advances past it.
             mark_identified(&mut event_loop);
             let id = seed_established(&mut event_loop);
             event_loop.ensure_session_link(id);
@@ -20475,7 +20489,7 @@ mod tests {
                 if event_loop.session_link.is_none() {
                     break;
                 }
-                sleep_past_session_rto(&event_loop);
+                advance_past_session_rto(&event_loop).await;
                 event_loop.check_session_retransmits().await;
                 if let Some(link) = event_loop.session_link.as_ref() {
                     counts.push(link.tx.transmit_count(seq).unwrap());
@@ -21470,7 +21484,7 @@ mod tests {
         /// COP-69: a lost 8-codeword frame retransmits as an 8-codeword
         /// frame -- same seq, byte-identical chunk and payload -- so ARQ
         /// semantics survive the multi-codeword extension.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn session_retransmit_reencodes_same_codeword_count() {
             let (mut event_loop, mut consumer) = cop69_station();
             fast_session_rto(&mut event_loop);
@@ -21485,7 +21499,7 @@ mod tests {
             assert_eq!(first_header.codewords, 8);
 
             event_loop.handle_ptt_change(false).await;
-            sleep_past_session_rto(&event_loop);
+            advance_past_session_rto(&event_loop).await;
             event_loop.check_session_retransmits().await;
             let again = read_all(&mut consumer);
             assert!(!again.is_empty(), "the lost frame must be retransmitted");
@@ -21504,7 +21518,7 @@ mod tests {
         /// level (the twin admits it), the retransmission there encodes
         /// successfully at the same codeword count, and the 1-codeword
         /// `fittest_level` would have had no level to offer.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn fade_hold_fallback_accepts_multi_codeword_segment() {
             let (mut event_loop, mut consumer) = cop69_station();
             fast_session_rto(&mut event_loop);
@@ -21521,7 +21535,7 @@ mod tests {
             let mut fallback_level = None;
             for _ in 0..16 {
                 event_loop.handle_ptt_change(false).await;
-                sleep_past_session_rto(&event_loop);
+                advance_past_session_rto(&event_loop).await;
                 event_loop.check_session_retransmits().await;
                 read_all(&mut consumer);
                 if let Some(level) = event_loop
@@ -21537,7 +21551,7 @@ mod tests {
             let fallback_level =
                 fallback_level.expect("the fade hold must be entered within 16 passes");
             event_loop.handle_ptt_change(false).await;
-            sleep_past_session_rto(&event_loop);
+            advance_past_session_rto(&event_loop).await;
             event_loop.check_session_retransmits().await;
             let held = read_all(&mut consumer);
             let link = event_loop.session_link.as_ref().unwrap();
@@ -24931,7 +24945,7 @@ mod tests {
         /// session retransmit pass keys nothing and spends neither backoff
         /// nor budget (the first-send path holds without loss, so the
         /// retransmit path must too); once evidence is back, it retransmits.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn wideband_gate_holds_session_retransmits_without_spending_the_budget() {
             let rig = fake_rigctld("144500000");
             let mut event_loop = EventLoop::new(rigctld_config(&rig)).unwrap();
@@ -24946,7 +24960,7 @@ mod tests {
             let rto = link.tx.rto();
 
             *rig.answer.lock().unwrap() = "14074000".into();
-            sleep_past_session_rto(&event_loop);
+            advance_past_session_rto(&event_loop).await;
             event_loop.check_session_retransmits().await;
             assert_eq!(event_loop.tx_generation, 1, "nothing keys while refused");
             let link = event_loop.session_link.as_ref().unwrap();

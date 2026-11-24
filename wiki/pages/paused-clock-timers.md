@@ -9,8 +9,8 @@ sources:
   - crates/coppa-daemon/src/audio_output.rs
   - crates/coppa-daemon/clippy.toml
 verified:
-  commit: 2526b50
-  date: 2026-11-04
+  commit: 9498632
+  date: 2026-11-24
 links:
   - overview
 ---
@@ -27,6 +27,13 @@ would count virtual time twice.
 
 In paused tests, move timers with `tokio::time::advance`, never
 `std::thread::sleep`. On an unpaused runtime the clocks agree.
+
+COP-239 moved the default-feature tests that let a session RTO pass with a
+real sleep onto `start_paused` and `advance_past_session_rto`. A converted
+test must read `clock_now()` wherever it compares against or seeds a daemon
+time: a std `Instant::now()` follows real time and drifts from the paused
+clock. `header_only_decode_counts_as_evidence` failed for exactly this
+reason in planning, until its two reads changed.
 
 To expose a load-dependent failure, build once, copy the binary so a later
 build cannot replace it, and oversubscribe the cgroup CPU quota eightfold.
