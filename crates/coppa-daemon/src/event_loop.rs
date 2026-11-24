@@ -18622,12 +18622,14 @@ mod tests {
         /// outcome (`DISCONNECTED` on failure, PTT lines once the CONNECT_REQ
         /// goes on air) — never `WRONG`, which would hang Pat's dial. Also
         /// covers `DISCONNECT`'s `OK` on this port.
-        #[tokio::test]
+        // COP-238: the 2 s reply waits use virtual time, so a runner stall
+        // cannot expire them; a silent daemon still times out at once.
+        #[tokio::test(start_paused = true)]
         async fn connect_gets_ok_before_its_outcome() {
             let config = session_config();
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, mut write_half) =
-                connect_bridged_vara_client(&mut event_loop, 19450, 19451).await;
+            let (mut reader, mut write_half, _data_addr) =
+                connect_bridged_vara_client_ephemeral(&mut event_loop).await;
 
             let local = tokio::task::LocalSet::new();
             local.spawn_local(async move {
