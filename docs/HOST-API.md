@@ -100,9 +100,10 @@ DISCONNECTED
   `DISCONNECTED` arrives about 30 s after the last one, because no station answered.
   N1CALL sorts after N0CALL, so it waits longer after each OFDM request in case N0CALL is
   dialling it at the same moment ([Limits and timing](#limits-and-timing)). Here
-  `DISCONNECTED` comes about two minutes after the first request. A caller whose callsign
-  sorts before the target's gets it about 60-70 s after the first. With `RETRIES 0` or a
-  pinned speed level coppad keys one request and `DISCONNECTED` arrives about 30 s later.
+  `DISCONNECTED` comes about two minutes (120-125 s) after the first request. A caller whose
+  callsign sorts before the target's gets it about 70 s after the first. With `RETRIES 0`, or a
+  pinned speed level and `RETRIES` unset, coppad keys one request and `DISCONNECTED` arrives
+  about 30 s later.
 - coppad also sends `IAMALIVE` every 60 s; the output above leaves those lines out.
 - `tr '\r' '\n'` is there because coppad ends every line it sends with a bare `\r`. Without it a
   terminal draws each reply over the last one.
@@ -163,6 +164,8 @@ on a fixed delay.
   is refused this way even while a session exists, and that session stays up.
 - When the session is a pending inbound attempt (after `PENDING`), `DISCONNECT` and `ABORT` push
   `CANCELPENDING` before `DISCONNECTED`.
+- `LISTEN OFF` ends a pending inbound attempt with `CANCELPENDING` and leaves an established
+  session or an outbound dial alone (COP-172).
 - `DISCONNECT` sends what the host already queued, waits for each frame's ACK, and only then
   ends the session ([OPERATING.md](OPERATING.md#ending-a-session-disconnect)).
 - A crossed call (COP-210) is the one connect request coppad answers with `LISTEN OFF`. It
@@ -229,13 +232,26 @@ unavailable", not as a version. The WebSocket `hello` carries the same three fie
   for that client (the next change sends a fresh value). At 1024 it closes the connection
   ([OPERATING.md](OPERATING.md#host-clients-that-stop-reading)). Every other line reaches a
   client or ends its connection.
-- An unanswered `CONNECT` ends in `DISCONNECTED` about 30 s after the last connect request is
-  keyed. With `RETRIES` unset and an automatic speed level a dial keys four requests, so that is
-  about 60-70 s after the first when the caller's callsign sorts before the target's. With an
-  automatic speed level, a caller whose callsign sorts after the target's waits one more retry
-  interval plus one floor response window (19 s at a 500 ms turnaround) after each request it
-  sends on OFDM, so it hears the target if both dial at once. Its unanswered dial ends about two
-  minutes after the first request.
+- An unanswered `CONNECT` ends in `DISCONNECTED` 30-35 s after the last connect request is
+  keyed. The timeout is 30 s and coppad checks for it every 5 s. With `RETRIES` unset and an
+  automatic speed level a dial keys four requests. It ends about 70 s after the first request
+  when the caller's callsign sorts before the target's. A caller whose callsign sorts after the
+  target's staggers its repeats (below), so its dial ends about two minutes (120-125 s) after the
+  first request. Both figures come from the [walkthrough](#try-it-with-nc)'s dial, run in both
+  directions and timed against a debug coppad with no audio
+  ([How this was verified](#how-this-was-verified)).
+- `RETRIES` spaces repeats at least the larger of twice the request airtime plus two
+  turnarounds, or 5 s (COP-172). With an automatic speed level the spacing also covers the
+  station-ID frames, and an unstaggered dial's two OFDM requests go about 8 s apart. In Auto the
+  third and later requests go on the low-rate floor, each at least 19 s plus one station-ID frame
+  apart at a 500 ms turnaround (COP-202). Repeats stop 300 s after the first request.
+- With an automatic speed level, a caller whose callsign sorts after the target's waits one more
+  retry interval plus one floor response window (19 s at a 500 ms turnaround) after each request
+  it sends on OFDM, on every dial (COP-210). It then hears the target if both dial at once. The
+  extra wait stops once a request has gone on the floor. A pinned speed level never staggers.
+- coppad logs an unknown command word once per client, for up to 64 different words, and then
+  stops logging new ones. Every unknown command still gets `WRONG`.
+- [BPQ.md](BPQ.md) covers scanning gateways and their measured limits.
 - On the listening side, `PENDING` arrives first and `CONNECTED` a second or two after the
   dialler's `CONNECTED`. Do not expect `CONNECTED` first.
 
@@ -529,6 +545,14 @@ At commit `b9fdb8d` (coppad 0.3.0), on Linux, with no radio, no sound card and n
   from a Python socket client, keyed requests at 0.8, 35.8, 70.4 and 90.9 s after `CONNECT` and
   got `DISCONNECTED` at 125.9 s. `N0CALL` dialling `N1CALL` keyed at 0.8, 9.3, 17.4 and 37.9 s
   and got `DISCONNECTED` at 70.9 s.
+- COP-235 (main `9498632`, coppad 0.18.0 debug build, no audio): the walkthrough's dial again,
+  sent from a Python socket client to four daemons at once. `N1CALL` dialling `N0CALL` keyed at
+  2.0, 37.4, 72.0 and 92.5 s after `CONNECT` and got `DISCONNECTED` at 125.0 s, the same with
+  `LISTEN OFF` as with `LISTEN ON`. `N0CALL` dialling `N1CALL` keyed at 2.2, 11.0, 19.2 and
+  40.0 s and got `DISCONNECTED` at 74.9 s. Across this run, the other runs at `9498632` and
+  the COP-229 run, the staggered dial ended 120.6-125.1 s after its first request and the
+  unstaggered one 68.1-72.7 s. The end moves by up to 5 s between runs because coppad checks
+  for timed-out sessions every 5 s.
 - Every command-table row was sent over a raw socket and its reply recorded, including the
   16-client limit and the 4096-byte line limit. The `CQFRAME`, `COMPRESSION FILES`, two-callsign
   `MYCALL` and `BW500`/`BW2750` rows were re-checked against a debug coppad during COP-76.
@@ -612,17 +636,3 @@ out after five seconds; a client whose writes stay stalled is disconnected. Broa
 records with a log; it never grows a queue. Partial requests survive interleaved RX.
 Winlink Express packet and Outpost BBS connected sessions are unsupported. Real
 UI-View interoperability and monitor formatting remain unverified with those clients.
-
-COP-172: `LISTEN OFF` cancels an inbound PENDING attempt with CANCELPENDING.
-RETRIES repeats requests at max twice request airtime plus two turnarounds,
-or five seconds. Repeats stop at 300 s; timeout follows the last request.
-COP-202: in Auto, the third and later requests go on the low-rate floor, each
-at least 19 s plus one station-ID frame apart at a 500 ms turnaround.
-COP-210: in Auto, a caller whose callsign sorts after the target's also waits
-one more retry interval plus one floor response window after each request it
-sends on OFDM, on every dial. The extra wait stops once a request has gone on
-the floor.
-See [BPQ.md](BPQ.md) for scanning gateways and measured limits.
-
-Unknown-command log deduplication remembers at most 64 words per client,
-then suppresses further unknown-word logs. Every command still gets WRONG.

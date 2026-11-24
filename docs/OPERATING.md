@@ -1463,8 +1463,8 @@ confirmation was rejected. `CANCELPENDING` is not followed by `DISCONNECTED`,
 except when the host itself sends `DISCONNECT` during the attempt: it then
 gets `CANCELPENDING` and then `DISCONNECTED`. A repeat `CONNECT_REQ` from the
 same caller while its attempt is pending is answered again, without a second
-`PENDING`. A `CONNECT_REQ` coppad ignores (not listening, addressed to another
-callsign, or unreadable) produces no line.
+`PENDING`. A `CONNECT_REQ` coppad ignores (not listening and not a crossed
+call, addressed to another callsign, or unreadable) produces no line.
 
 ## Host clients that stop reading
 
