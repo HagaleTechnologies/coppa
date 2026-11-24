@@ -101,8 +101,9 @@ DISCONNECTED
   N1CALL sorts after N0CALL, so it waits longer after each OFDM request in case N0CALL is
   dialling it at the same moment ([Limits and timing](#limits-and-timing)). Here
   `DISCONNECTED` comes about two minutes (120-125 s) after the first request. A caller whose
-  callsign sorts before the target's gets it about 70 s after the first. With `RETRIES 0` or a
-  pinned speed level coppad keys one request and `DISCONNECTED` arrives about 30 s later.
+  callsign sorts before the target's gets it about 70 s after the first. With `RETRIES 0`, or a
+  pinned speed level and `RETRIES` unset, coppad keys one request and `DISCONNECTED` arrives
+  about 30 s later.
 - coppad also sends `IAMALIVE` every 60 s; the output above leaves those lines out.
 - `tr '\r' '\n'` is there because coppad ends every line it sends with a bare `\r`. Without it a
   terminal draws each reply over the last one.
@@ -236,8 +237,9 @@ unavailable", not as a version. The WebSocket `hello` carries the same three fie
   automatic speed level a dial keys four requests. It ends about 70 s after the first request
   when the caller's callsign sorts before the target's. A caller whose callsign sorts after the
   target's staggers its repeats (below), so its dial ends about two minutes (120-125 s) after the
-  first request. Both figures come from the [walkthrough](#try-it-with-nc)'s dial, timed against
-  a debug coppad with no audio ([How this was verified](#how-this-was-verified)).
+  first request. Both figures come from the [walkthrough](#try-it-with-nc)'s dial, run in both
+  directions and timed against a debug coppad with no audio
+  ([How this was verified](#how-this-was-verified)).
 - `RETRIES` spaces repeats at least the larger of twice the request airtime plus two
   turnarounds, or 5 s (COP-172). With an automatic speed level the spacing also covers the
   station-ID frames, and an unstaggered dial's two OFDM requests go about 8 s apart. In Auto the
