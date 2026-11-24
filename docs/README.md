@@ -55,6 +55,7 @@ When you add a file under `docs/`, add a line here.
 ## Verification records
 
 - [testing/full-ci.md](testing/full-ci.md): the test groups the full CI run splits into.
+- [testing/daemon-lib-durations.md](testing/daemon-lib-durations.md): the slowest coppa-daemon lib tests and their wall times (COP-239).
 - [testing/c-abi-check.md](testing/c-abi-check.md): the C ABI compatibility check (COP-178).
 - [testing/cable-loop-turnaround.md](testing/cable-loop-turnaround.md): the cable-loop turnaround acceptance record (H-090 stage d).
 - [testing/pat-session.md](testing/pat-session.md): a Pat Winlink session over coppa (COP-46).

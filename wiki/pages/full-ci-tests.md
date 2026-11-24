@@ -10,8 +10,8 @@ sources:
   - .github/workflows/ci-full.yml
   - crates/coppa-host/src/vara/command.rs
 verified:
-  commit: c4e4ca8
-  date: 2026-11-15
+  commit: 9498632
+  date: 2026-11-24
 links:
   - paused-clock-timers
   - cpal-feature-gate
@@ -19,6 +19,8 @@ links:
 Full CI uses a test-derived optimized profile that retains debug assertions and
 overflow checks. See [the commands and measurements](../../docs/testing/full-ci.md)
 before changing group boundaries or claiming a hosted performance result.
+Since COP-239 the local `test` profile also builds dependencies and the
+DSP-path crates at opt-level 2; `coppa-daemon` stays unoptimized.
 
 The no-audio group is separate coverage. Enabling CPAL compiles out some daemon
 process tests. Cargo rejects the daemon-only mdns feature when that package is
@@ -26,8 +28,9 @@ excluded from the workspace group.
 
 The dropped-file-chunk test runs with a paused Tokio clock. Its 29.5/30-second
 sleeps advance virtual time; they do not demonstrate minutes of wall-clock
-waiting. Unpaused event-loop RTO helpers do sleep on the real thread. Preserve
-that distinction when profiling simulations.
+waiting. Since COP-239, default-feature event-loop RTO waits also run on the
+paused clock; only the websocket chat retransmit test still sleeps on the real
+thread. Preserve that distinction when profiling simulations.
 
 A paused Tokio deadline can outrun the real TCP delayed-ACK timer. Full-CI
 measurement exposed this in BPQ startup replies; the VARA command server

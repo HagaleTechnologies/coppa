@@ -107,6 +107,37 @@ fn main() {
         .unwrap()
         .success());
 }
+/// COP-239: `cargo test` optimizes dependencies and the DSP-path crates.
+/// Only opt-level changes, so debug assertions and overflow checks stay on.
+#[test]
+fn test_profile_optimizes_dependencies_and_keeps_checks() {
+    let manifest = fs::read_to_string("Cargo.toml").unwrap();
+    let section = |header: &str| {
+        manifest
+            .split(header)
+            .nth(1)
+            .map(|rest| rest.split("\n[").next().unwrap().to_owned())
+    };
+    for package in [
+        "\"*\"",
+        "coppa-dsp",
+        "coppa-codec",
+        "coppa-protocol",
+        "coppa-channel",
+        "coppa-ml",
+        "coppa-engine",
+    ] {
+        let header = format!("[profile.test.package.{package}]");
+        let body = section(&header).unwrap_or_else(|| panic!("{header} missing"));
+        assert!(body.contains("opt-level = 2"), "{header}");
+    }
+    assert!(section("[profile.test.package.coppa-daemon]").is_none());
+    for block in manifest.split("\n[profile.test").skip(1) {
+        let block = block.split("\n[").next().unwrap();
+        assert!(!block.contains("debug-assertions"), "{block}");
+        assert!(!block.contains("overflow-checks"), "{block}");
+    }
+}
 #[test]
 fn runner_propagates_failure() {
     for group in GROUPS {
