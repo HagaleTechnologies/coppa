@@ -126,20 +126,93 @@ pub struct StreamFrame {
 pub struct CoppaCore {
     transceiver: CoppaTransceiver,
     config: EngineConfig,
-    /// Streaming receive path used by [`Self::push_samples`] (daemon/FFI). Owns its
-    /// own internal `CoppaTransceiver` (built for the same profile as
-    /// `transceiver` above) — see the Task 7 report for why `StreamingReceiver`'s
-    /// locked constructor builds its own rather than sharing `transceiver`, and why
-    /// that one-time extra per-level cache construction at startup is an
-    /// acceptable, bounded cost (not a hot-path duplication).
-    streaming: StreamingReceiver,
+    /// Movable OFDM and floor receive state. Its streaming receiver owns a
+    /// transceiver built for the same profile as the transmit path above.
+    receive: Option<ReceiveHalf>,
+    receive_generation: u64,
+    /// COP-168: the configured IR-HARQ combining policy, held engine-side so
+    /// it survives [`Self::reconfigure`] even while the receive half is taken
+    /// out (COP-246). Every half this core installs is stamped from it.
+    harq_policy: HarqPolicy,
     /// Separately detected low-rate floor receive path (air-protocol
     /// version 2, COP-190/ADR-014), constructed alongside the OFDM paths.
     /// Link feeds this detector alongside OFDM and selects the codec through
     /// negotiated floor policy. Direct callers may also use it explicitly.
     floor: FloorFrame,
-    /// Continuous floor detector over [`Self::push_floor_samples`].
+}
+
+/// Movable streaming OFDM and floor receive state. The daemon runs both
+/// decoders on a blocking worker while its event loop drains audio input.
+pub struct ReceiveHalf {
+    streaming: StreamingReceiver,
     floor_stream: FloorStream,
+    squelch_threshold_db: f32,
+    compression_enabled: bool,
+    generation: u64,
+}
+
+impl std::fmt::Debug for ReceiveHalf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReceiveHalf")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReceiveHalf {
+    /// Decode completed OFDM frames from an audio chunk.
+    pub fn push_samples(&mut self, samples: &[f32]) -> Vec<StreamFrame> {
+        if squelched(samples, self.squelch_threshold_db) {
+            return Vec::new();
+        }
+        self.streaming
+            .push_samples(samples)
+            .into_iter()
+            .map(|f| StreamFrame {
+                payload: decompress_if_needed(f.payload, self.compression_enabled),
+                snr_db: f.snr_db,
+                cfo_hz: f.cfo_hz,
+                frame_start: f.frame_start,
+                speed_level: f.header.speed_level,
+                recommended_level: f.recommended_level,
+                delay_spread_ms: f.delay_spread_ms,
+            })
+            .collect()
+    }
+
+    /// Decode completed floor PDUs from an audio chunk.
+    pub fn push_floor_samples(&mut self, chunk: &[f32]) -> Vec<Vec<u8>> {
+        self.floor_stream.push(chunk)
+    }
+}
+
+fn squelched(samples: &[f32], threshold_db: f32) -> bool {
+    if threshold_db == f32::NEG_INFINITY {
+        return false;
+    }
+    let rms = if samples.is_empty() {
+        0.0f32
+    } else {
+        (samples.iter().map(|&s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    };
+    let rms_db = if rms > 1e-10 {
+        20.0 * rms.log10()
+    } else {
+        -120.0
+    };
+    rms_db < threshold_db
+}
+
+fn decompress_if_needed(
+    payload: Vec<u8>,
+    compression_enabled: bool,
+) -> Result<Vec<u8>, EngineError> {
+    if compression_enabled && payload.first() == Some(&COMPRESSION_MARKER) {
+        let huffman_bytes = lz4_decompress(&payload[1..])?;
+        Ok(HuffmanCodec::new().decode(&huffman_bytes))
+    } else {
+        Ok(payload)
+    }
 }
 
 impl std::fmt::Debug for CoppaCore {
@@ -184,12 +257,20 @@ impl CoppaCore {
         let streaming = StreamingReceiver::new(ofdm_profile, WIRE_FORMAT_VERSION);
         let floor = FloorFrame::new();
         let floor_stream = FloorStream::default();
+        let receive = Some(ReceiveHalf {
+            streaming,
+            floor_stream,
+            squelch_threshold_db: config.squelch_threshold_db,
+            compression_enabled: config.compression_enabled,
+            generation: 0,
+        });
         Self {
             transceiver,
             config,
-            streaming,
+            receive,
+            receive_generation: 0,
+            harq_policy: HarqPolicy::default(),
             floor,
-            floor_stream,
         }
     }
 
@@ -207,7 +288,9 @@ impl CoppaCore {
     /// is separate from [`Self::push_samples`]: an OFDM frame never
     /// delivers here and a floor frame never delivers there.
     pub fn push_floor_samples(&mut self, chunk: &[f32]) -> Vec<Vec<u8>> {
-        self.floor_stream.push(chunk)
+        self.receive
+            .as_mut()
+            .map_or_else(Vec::new, |rx| rx.push_floor_samples(chunk))
     }
 
     /// Whether `speed_level` on an engine bound to `band` resolves to the VHF
@@ -498,23 +581,33 @@ impl CoppaCore {
     }
 
     /// COP-168: set the streaming receiver's IR-HARQ combining policy. It
-    /// survives [`Self::reconfigure`] and every rebuild that goes through it.
+    /// survives [`Self::reconfigure`] and every rebuild that goes through it,
+    /// including a rebuild that runs while the receive half is taken out:
+    /// the policy is held on the engine and stamped onto every half it
+    /// installs, so a taken half returning later cannot revert it.
     pub fn set_harq_policy(&mut self, policy: HarqPolicy) {
-        self.streaming.set_harq_policy(policy);
+        self.harq_policy = policy;
+        if let Some(rx) = self.receive.as_mut() {
+            rx.streaming.set_harq_policy(policy);
+        }
     }
 
     /// COP-168: pass-through of [`StreamingReceiver::take_failed_headers`],
     /// the headers of frames whose header decoded and payload failed since
     /// the last call. A rebuild drops the backlog.
     pub fn take_failed_headers(&mut self) -> Vec<CoppaHeader> {
-        self.streaming.take_failed_headers()
+        self.receive
+            .as_mut()
+            .map_or_else(Vec::new, |rx| rx.streaming.take_failed_headers())
     }
 
     /// COP-168: pass-through of
     /// [`StreamingReceiver::harq_combined_successes`], counted since this
     /// engine's streaming receiver was last built.
     pub fn harq_combined_successes(&self) -> u64 {
-        self.streaming.harq_combined_successes()
+        self.receive
+            .as_ref()
+            .map_or(0, |rx| rx.streaming.harq_combined_successes())
     }
 
     /// Encode one uncompressed session packet with a distinct PHY HARQ key.
@@ -563,7 +656,9 @@ impl CoppaCore {
 
     /// Drop the streaming receiver's stored soft information for a PHY key.
     pub fn harq_evict(&mut self, seq_num: u8) {
-        self.streaming.harq_evict(seq_num);
+        if let Some(rx) = self.receive.as_mut() {
+            rx.streaming.harq_evict(seq_num);
+        }
     }
 
     /// Encode arbitrary binary data to audio samples at an explicit `level`
@@ -705,58 +800,17 @@ impl CoppaCore {
     /// conversion — see `StreamFrame::payload`'s doc for why this differs from
     /// `decode`'s batch-path contract).
     pub fn push_samples(&mut self, samples: &[f32]) -> Vec<StreamFrame> {
-        if self.is_squelched(samples) {
-            return Vec::new();
-        }
-        let frames = self.streaming.push_samples(samples);
-        frames
-            .into_iter()
-            .map(|f| StreamFrame {
-                payload: self.decompress_if_needed(f.payload),
-                snr_db: f.snr_db,
-                cfo_hz: f.cfo_hz,
-                frame_start: f.frame_start,
-                speed_level: f.header.speed_level,
-                recommended_level: f.recommended_level,
-                delay_spread_ms: f.delay_spread_ms,
-            })
-            .collect()
+        self.receive
+            .as_mut()
+            .map_or_else(Vec::new, |rx| rx.push_samples(samples))
     }
 
-    /// RMS-power squelch check, shared by `decode_bytes` and `push_samples`.
-    /// Disabled entirely when `squelch_threshold_db == f32::NEG_INFINITY` (the
-    /// default in every profile shipped today, and the default `EngineConfig`).
     fn is_squelched(&self, samples: &[f32]) -> bool {
-        if self.config.squelch_threshold_db == f32::NEG_INFINITY {
-            return false;
-        }
-        let rms = if samples.is_empty() {
-            0.0f32
-        } else {
-            (samples.iter().map(|&s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
-        };
-        let rms_db = if rms > 1e-10 {
-            20.0 * rms.log10()
-        } else {
-            -120.0
-        };
-        rms_db < self.config.squelch_threshold_db
+        squelched(samples, self.config.squelch_threshold_db)
     }
 
-    /// Undo this engine's optional Huffman+LZ4 compression if the marker byte is
-    /// present, shared by `decode_bytes` and `push_samples`.
     fn decompress_if_needed(&self, payload: Vec<u8>) -> Result<Vec<u8>, EngineError> {
-        if self.config.compression_enabled
-            && !payload.is_empty()
-            && payload[0] == COMPRESSION_MARKER
-        {
-            let lz4_data = &payload[1..];
-            let huffman_bytes = lz4_decompress(lz4_data)?;
-            let huffman = HuffmanCodec::new();
-            Ok(huffman.decode(&huffman_bytes))
-        } else {
-            Ok(payload)
-        }
+        decompress_if_needed(payload, self.config.compression_enabled)
     }
 
     /// Detect a likely compressed frame received with compression disabled.
@@ -785,7 +839,9 @@ impl CoppaCore {
     /// as a before/after delta around each `push_samples` call to treat a
     /// header-only decode as peer evidence for the session fade-hold.
     pub fn header_only_decodes(&self) -> u32 {
-        self.streaming.header_only_decodes()
+        self.receive
+            .as_ref()
+            .map_or(0, |rx| rx.streaming.header_only_decodes())
     }
 
     /// Get a reference to the current configuration.
@@ -796,14 +852,46 @@ impl CoppaCore {
     /// Rebuild the engine with a new configuration.
     ///
     /// COP-168: the streaming receiver's [`HarqPolicy`] carries over to the
-    /// rebuilt receiver; its soft buffers and counters do not.
+    /// rebuilt receiver; its soft buffers and counters do not. The carry is
+    /// from the engine-held policy, so it also holds when the receive half
+    /// is taken out while this runs. The floor detector keeps its history
+    /// when the receive half is present.
     pub fn reconfigure(&mut self, config: EngineConfig) {
-        let policy = self.streaming.harq_policy();
-        let new = Self::build(config);
+        let policy = self.harq_policy;
+        let mut new = Self::build(config);
         self.transceiver = new.transceiver;
         self.config = new.config;
-        self.streaming = new.streaming;
-        self.streaming.set_harq_policy(policy);
+        self.receive_generation = self.receive_generation.wrapping_add(1);
+        if let Some(rx) = new.receive.as_mut() {
+            rx.generation = self.receive_generation;
+            rx.streaming.set_harq_policy(policy);
+            if let Some(previous) = self.receive.as_mut() {
+                std::mem::swap(&mut rx.floor_stream, &mut previous.floor_stream);
+            }
+        }
+        self.receive = new.receive;
+    }
+
+    /// Move the receive state to a worker while retaining the transmit engine.
+    /// Until [`Self::put_receive`] restores it, the engine-side
+    /// `push_samples`/`push_floor_samples` return nothing, receive counters
+    /// read zero and `harq_evict` is a no-op; configuration calls such as
+    /// [`Self::set_harq_policy`] keep recording engine-side and apply on
+    /// restore. A reconfigure installs a new receive half and makes the
+    /// taken one stale.
+    pub fn take_receive(&mut self) -> Option<ReceiveHalf> {
+        self.receive.take()
+    }
+
+    /// Restore a half taken by [`Self::take_receive`]. If reconfiguration
+    /// installed a new half meanwhile, drop the stale one. The engine-held
+    /// [`HarqPolicy`] is re-applied, so a policy set while the half was out
+    /// takes effect on restore.
+    pub fn put_receive(&mut self, mut half: ReceiveHalf) {
+        if half.generation == self.receive_generation && self.receive.is_none() {
+            half.streaming.set_harq_policy(self.harq_policy);
+            self.receive = Some(half);
+        }
     }
 
     /// Change this engine's configured speed level in place (Phase 4 Task 6,
@@ -943,13 +1031,113 @@ impl Default for CoppaCore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn take_receive_round_trip_carries_receiver_state() {
+        let mut core = CoppaCore::new();
+        let samples = with_lead_and_trail(&core.encode("moved receive state").unwrap());
+        let midpoint = samples.len() / 2;
+        let mut rx = core.take_receive().unwrap();
+        assert!(rx.push_samples(&samples[..midpoint]).is_empty());
+        core.put_receive(rx);
+        let frames = core.push_samples(&samples[midpoint..]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload.as_ref().unwrap(), b"moved receive state");
+    }
+
+    #[test]
+    fn put_receive_drops_a_stale_half_after_reconfigure() {
+        let mut core = CoppaCore::new();
+        let old = core.take_receive().unwrap();
+        core.set_speed_level(3).unwrap();
+        core.put_receive(old);
+        assert_eq!(core.speed_level(), 3);
+        let samples = with_lead_and_trail(&core.encode("new profile").unwrap());
+        let frames = core.push_samples(&samples);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload.as_ref().unwrap(), b"new profile");
+    }
+
+    #[test]
+    fn floor_frame_survives_speed_level_change() {
+        use coppa_codec::floor::SAMPLE_RATE;
+
+        let mut core = CoppaCore::new();
+        let payload = b"floor probe";
+        let frame = core.floor().encode(payload).unwrap();
+        let midpoint = frame.len() / 2;
+        let mut after_change = frame[midpoint..].to_vec();
+        // The floor detector tries a decode once per second of input.
+        after_change.resize(after_change.len() + SAMPLE_RATE, 0.0);
+
+        assert!(core.push_floor_samples(&frame[..midpoint]).is_empty());
+        core.set_speed_level(3).unwrap();
+        assert_eq!(core.push_floor_samples(&after_change), [payload.to_vec()]);
+    }
+
+    #[test]
+    fn engine_receive_calls_are_inert_while_the_half_is_taken() {
+        let mut core = CoppaCore::new();
+        let samples = with_lead_and_trail(&core.encode("restored").unwrap());
+        let rx = core.take_receive().unwrap();
+        assert!(core.push_samples(&samples).is_empty());
+        assert!(core.push_floor_samples(&samples).is_empty());
+        assert_eq!(core.header_only_decodes(), 0);
+        core.harq_evict(1);
+        core.put_receive(rx);
+        assert_eq!(core.push_samples(&samples).len(), 1);
+    }
+
+    /// COP-246 review: the policy must survive a reconfigure that runs while
+    /// the receive half is taken out for off-loop decoding, since the taken
+    /// half is stale afterwards and cannot restore it.
+    #[test]
+    fn harq_policy_survives_reconfigure_while_the_half_is_taken() {
+        let mut core = CoppaCore::new();
+        let windowed = HarqPolicy {
+            key_mask: 0x0F,
+            rv0_starts_fresh: true,
+            multi_codeword: true,
+        };
+        core.set_harq_policy(windowed);
+        let stale = core.take_receive().unwrap();
+        core.set_speed_level(3).unwrap();
+        core.put_receive(stale);
+        assert_eq!(
+            core.receive.as_ref().unwrap().streaming.harq_policy(),
+            windowed
+        );
+        let samples = with_lead_and_trail(&core.encode("policy kept").unwrap());
+        assert_eq!(core.push_samples(&samples).len(), 1);
+    }
+
+    /// A policy set while the half is taken applies when the half comes back.
+    #[test]
+    fn harq_policy_set_while_the_half_is_taken_applies_on_put_receive() {
+        let mut core = CoppaCore::new();
+        let half = core.take_receive().unwrap();
+        let windowed = HarqPolicy {
+            key_mask: 0x0F,
+            rv0_starts_fresh: true,
+            multi_codeword: true,
+        };
+        core.set_harq_policy(windowed);
+        core.put_receive(half);
+        assert_eq!(
+            core.receive.as_ref().unwrap().streaming.harq_policy(),
+            windowed
+        );
+    }
+
     /// COP-168: the HARQ policy set on the engine survives every rebuild,
     /// since a windowed session must not silently fall back to the default
     /// keying when the speed level changes mid-session.
     #[test]
     fn harq_policy_survives_reconfigure() {
         let mut core = CoppaCore::new();
-        assert_eq!(core.streaming.harq_policy(), HarqPolicy::default());
+        assert_eq!(
+            core.receive.as_ref().unwrap().streaming.harq_policy(),
+            HarqPolicy::default()
+        );
         let windowed = HarqPolicy {
             key_mask: 0x0F,
             rv0_starts_fresh: true,
@@ -957,9 +1145,15 @@ mod tests {
         };
         core.set_harq_policy(windowed);
         core.set_speed_level(3).unwrap();
-        assert_eq!(core.streaming.harq_policy(), windowed);
+        assert_eq!(
+            core.receive.as_ref().unwrap().streaming.harq_policy(),
+            windowed
+        );
         core.reconfigure(core.config().clone());
-        assert_eq!(core.streaming.harq_policy(), windowed);
+        assert_eq!(
+            core.receive.as_ref().unwrap().streaming.harq_policy(),
+            windowed
+        );
         assert_eq!(core.harq_combined_successes(), 0);
         assert!(core.take_failed_headers().is_empty());
     }

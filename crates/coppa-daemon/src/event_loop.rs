@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use coppa_audio::{AudioRingConsumer, AudioRingProducer};
-use coppa_engine::{CoppaCore, OfdmBand};
+use coppa_engine::{CoppaCore, OfdmBand, StreamFrame};
 use coppa_host::vara::{
     queue_data, queue_response, DataQueued, Queued, RigCommand, VaraCommand, VaraResponse,
     COMMAND_QUEUE_DEPTH, DATA_QUEUE_DEPTH,
@@ -236,6 +236,7 @@ const _: () = assert!(
 /// least 0.65 s past the latest measured decode. It is a fixed bound, not
 /// scaled by level, codeword count or host load (docs/LIMITATIONS.md).
 const SESSION_ACK_PROCESSING_ALLOWANCE: Duration = Duration::from_secs(1);
+const RX_DRAIN_TICK: Duration = Duration::from_millis(5);
 
 /// COP-68: how long a fade-held session link waits with ZERO peer evidence
 /// (no fully decoded MAC PDU from the peer, no header-only PHY decode)
@@ -1228,6 +1229,8 @@ pub struct EventLoop {
     /// doc (Finding 1 fix, Phase 4 Task 3 review). Empty outside of a busy
     /// wait; no data is lost, decode is just deferred.
     pending_busy_wait_audio: Vec<f32>,
+    /// Optional receive-job delay for deterministic ring-drain tests.
+    rx_decode_stall: Option<Duration>,
     /// Dedicated FFT sensor for the `spectrum` WebSocket broadcast (Phase 4
     /// Task 4) -- separate from `busy_gate`'s own internal `SpectrumSensor`
     /// (smaller FFT, tuned for occupancy margin rather than bin resolution).
@@ -1458,6 +1461,7 @@ impl EventLoop {
             last_id_time: None,
             last_beacon_time: clock_now(),
             pending_busy_wait_audio: Vec::new(),
+            rx_decode_stall: None,
             #[cfg(feature = "websocket")]
             spectrum_sensor,
             #[cfg(feature = "websocket")]
@@ -6304,27 +6308,35 @@ impl EventLoop {
         }
     }
 
-    /// Decode whatever frames complete as a result of `samples` and dispatch
-    /// each one (MAC PDU handling, ARQ, host forwarding, WebSocket
-    /// broadcast). Split out from `handle_audio_in` (Finding 1, Phase 4 Task
-    /// 3 review) so `poll_audio_input` can run this on audio that was merely
-    /// *observed* by the busy gate during a `wait_for_clear_channel` busy
-    /// wait (see `observe_busy_gate_from_audio_input`) without re-feeding
-    /// that same audio into `busy_gate.observe` a second time.
-    ///
-    /// `CoppaCore::push_samples` owns all the buffering/sync/frame-boundary
-    /// bookkeeping the old DECODE_WINDOW/SLIDE_STEP/MAX_STREAM_BUFFER block used
-    /// to do by hand here; this just dispatches whatever frames complete as a
-    /// result of this chunk.
-    ///
-    /// Whichever call completes a candidate runs the full demod/FEC pass
-    /// synchronously (see `StreamingReceiver::push_samples`'s doc) — since we're
-    /// called with no `spawn_blocking`, that stalls this async event loop for
-    /// the frame's decode time (~tens of ms). Accepted for now: input audio is
-    /// buffered in `audio_in`'s ring during the stall, and its overflow counter
-    /// (`poll_audio_input`) would surface it if that ring ever actually
-    /// overflowed. Moving the decode to a worker thread would be the fix if this
-    /// ever becomes a real problem.
+    /// Decode a chunk on the blocking pool while continuing to drain input.
+    /// The completed frames dispatch before the next parked chunk is decoded.
+    async fn run_rx_decode_job(&mut self, samples: &[f32]) -> (Vec<StreamFrame>, Vec<Vec<u8>>) {
+        let Some(mut rx) = self.engine.take_receive() else {
+            return (Vec::new(), Vec::new());
+        };
+        let chunk: Arc<[f32]> = samples.into();
+        let stall = self.rx_decode_stall;
+        let mut job = tokio::task::spawn_blocking(move || {
+            if let Some(stall) = stall {
+                std::thread::sleep(stall);
+            }
+            let frames = rx.push_samples(&chunk);
+            let floor = rx.push_floor_samples(&chunk);
+            (rx, frames, floor)
+        });
+        let (rx, frames, floor) = loop {
+            match tokio::time::timeout(RX_DRAIN_TICK, &mut job).await {
+                Ok(Ok(done)) => break done,
+                Ok(Err(err)) => std::panic::resume_unwind(err.into_panic()),
+                Err(_) => self.observe_busy_gate_from_audio_input().await,
+            }
+        };
+        self.engine.put_receive(rx);
+        (frames, floor)
+    }
+
+    /// Decode OFDM and floor audio off the event loop, drain the input ring
+    /// during the job, then dispatch all results in their original order.
     async fn decode_and_dispatch_audio(&mut self, samples: &[f32]) {
         // COP-68: a header-only PHY decode (the peer's preamble and protected
         // header decoded, the payload failed FEC) is peer evidence. The
@@ -6333,7 +6345,7 @@ impl EventLoop {
         // case a third station's decodable traffic DELAYS teardown -- it can
         // only delay, never corrupt delivery.
         let header_only_before = self.engine.header_only_decodes();
-        let frames = self.engine.push_samples(samples);
+        let (frames, floor_payloads) = self.run_rx_decode_job(samples).await;
         if self.engine.header_only_decodes() > header_only_before {
             self.note_peer_evidence();
         }
@@ -6713,15 +6725,15 @@ impl EventLoop {
                 }
             }
         }
-        self.decode_and_dispatch_floor(samples).await;
+        self.dispatch_floor_payloads(floor_payloads).await;
     }
 
-    /// COP-202: the floor receive path. The floor detector always runs; the
-    /// shared `admits_floor_pdu` gate decides what reaches the handlers. A
+    /// COP-202: dispatch floor PDUs decoded by the receive job. The detector
+    /// always runs; the shared `admits_floor_pdu` gate decides what reaches the handlers. A
     /// floor frame carries no OFDM metrics, so no SNR, level or CFO
     /// telemetry is pushed for it.
-    async fn decode_and_dispatch_floor(&mut self, samples: &[f32]) {
-        for payload in self.engine.push_floor_samples(samples) {
+    async fn dispatch_floor_payloads(&mut self, payloads: Vec<Vec<u8>>) {
+        for payload in payloads {
             let Ok(pdu) = MacPdu::from_floor_bytes(&payload) else {
                 continue;
             };
@@ -26424,6 +26436,49 @@ mod tests {
                 elapsed <= pre_delay,
                 "an already-keyed station waited {elapsed:?}, more than its {pre_delay:?} pre-delay"
             );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn slow_decode_keeps_draining_the_input_ring_and_the_next_frame_decodes() {
+            const CHUNK: usize = 960;
+            let mut config = arq_config();
+            config.radio.ptt_pre_delay_ms = 0;
+            assert_eq!(config.audio.buffer_size, 8192);
+            let mut station = EventLoop::new(config).unwrap();
+            install_ptt_log(&mut station);
+            station.rx_decode_stall = Some(Duration::from_millis(400));
+            let (mut producer, consumer) = coppa_audio::audio_ring(8192);
+            station.set_audio_in(consumer);
+            let frame = peer_data_frame();
+            let next = peer_data_frame();
+            let total = 27 * CHUNK + next.len();
+            let writer = async {
+                for _ in 0..27 {
+                    producer.write(&[0.0; CHUNK]);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                for chunk in next.chunks(CHUNK) {
+                    producer.write(chunk);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            let driver = async {
+                for _ in 0..((total.div_ceil(CHUNK) as u64) * 4 + 8) {
+                    tokio::time::advance(Duration::from_millis(5)).await;
+                    tokio::task::yield_now().await;
+                }
+            };
+            tokio::join!(station.decode_and_dispatch_audio(&frame), writer, driver);
+            assert_eq!(station.tx_generation, 1);
+            let input = station.audio_in.as_ref().unwrap();
+            assert_eq!(input.overflow_count(), 0);
+            assert_eq!(
+                station.pending_busy_wait_audio.len() + input.available(),
+                total
+            );
+            station.rx_decode_stall = None;
+            station.poll_audio_input().await;
+            assert_eq!(station.tx_generation, 2);
         }
 
         #[tokio::test(start_paused = true)]

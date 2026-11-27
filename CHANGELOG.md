@@ -16,6 +16,10 @@ Older releases have no entry here. Their on-air breaks are listed in
 
 ## Unreleased: 0.18.0
 
+- COP-246: coppad decodes received frames and runs the floor detector on a
+  worker task while its event loop drains the audio input ring. A decode slower
+  than the default ring no longer drops the next frame under CPU contention.
+  `coppa-engine` adds the `ReceiveHalf` take/put API for moving receive DSP.
 - COP-248: a coppad dial that keys one request (`RETRIES 0`, or a pinned
   speed level with `RETRIES` unset) now times out 30 s after that request
   keys, as `docs/HOST-API.md` states. Before, its timeout ran from
