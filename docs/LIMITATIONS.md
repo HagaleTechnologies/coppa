@@ -596,8 +596,8 @@ stall scenario does (`docs/testing/bpq-session.md`).
 - **COP-214 black-box cable limits.** The Linux ALSA FIFO cable is a bare
   `file` PCM in the format a profile's `[audio]` table declares: `f32le` or
   `s16le`, mono, at 8000, 12000, 16000, 24000 or 48000 Hz (COP-221). The
-  relay converts to the channel's f32 48 kHz with integer-factor linear-phase
-  FIR filters, so 44.1 kHz and other rates that do not divide 48000 are
+  relay converts to the channel's f32le, 48 kHz, mono with integer-factor
+  linear-phase FIR filters, so 44.1 kHz and other rates that do not divide 48000 are
   refused. The COP-214 planning probe found that ALSA `plug` conversion at
   12, 8 and 44.1 kHz gave RMS ratios of 0.772, 0.773 and 0.744, with about
   one third of samples zeroed, which is why the relay converts instead. The
