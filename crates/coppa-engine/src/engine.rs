@@ -844,6 +844,7 @@ impl CoppaCore {
     ///
     /// COP-168: the streaming receiver's [`HarqPolicy`] carries over to the
     /// rebuilt receiver; its soft buffers and counters do not.
+    /// The floor detector keeps its history when the receive half is present.
     pub fn reconfigure(&mut self, config: EngineConfig) {
         let policy = self
             .receive
@@ -857,6 +858,9 @@ impl CoppaCore {
         if let Some(rx) = new.receive.as_mut() {
             rx.generation = self.receive_generation;
             rx.streaming.set_harq_policy(policy);
+            if let Some(previous) = self.receive.as_mut() {
+                std::mem::swap(&mut rx.floor_stream, &mut previous.floor_stream);
+            }
         }
         self.receive = new.receive;
     }
@@ -1038,6 +1042,23 @@ mod tests {
         let frames = core.push_samples(&samples);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].payload.as_ref().unwrap(), b"new profile");
+    }
+
+    #[test]
+    fn floor_frame_survives_speed_level_change() {
+        use coppa_codec::floor::SAMPLE_RATE;
+
+        let mut core = CoppaCore::new();
+        let payload = b"floor probe";
+        let frame = core.floor().encode(payload).unwrap();
+        let midpoint = frame.len() / 2;
+        let mut after_change = frame[midpoint..].to_vec();
+        // The floor detector tries a decode once per second of input.
+        after_change.resize(after_change.len() + SAMPLE_RATE, 0.0);
+
+        assert!(core.push_floor_samples(&frame[..midpoint]).is_empty());
+        core.set_speed_level(3).unwrap();
+        assert_eq!(core.push_floor_samples(&after_change), [payload.to_vec()]);
     }
 
     #[test]
