@@ -165,7 +165,9 @@ on a fixed delay.
 - When the session is a pending inbound attempt (after `PENDING`), `DISCONNECT` and `ABORT` push
   `CANCELPENDING` before `DISCONNECTED`.
 - `LISTEN OFF` ends a pending inbound attempt with `CANCELPENDING` and leaves an established
-  session or an outbound dial alone (COP-172).
+  session or an outbound dial alone (COP-172). ARDOP `LISTEN FALSE` does the same on the ARDOP
+  port, in that port's vocabulary: after the `LISTEN FALSE` echo the host gets `DISCONNECTED`
+  and `NEWSTATE DISC ` (COP-247; [ARDOP.md](ARDOP.md)).
 - `DISCONNECT` sends what the host already queued, waits for each frame's ACK, and only then
   ends the session ([OPERATING.md](OPERATING.md#ending-a-session-disconnect)).
 - A crossed call (COP-210) is the one connect request coppad answers with `LISTEN OFF`. It

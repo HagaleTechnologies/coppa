@@ -1453,7 +1453,10 @@ transmission out over it.
 MYCALL accepts one to five callsigns. The first identifies transmissions;
 coppad answers a call to any listed callsign. LISTEN OFF immediately ends
 a pending inbound attempt with CANCELPENDING and leaves established
-sessions and outbound dials alone. See [BPQ.md](BPQ.md) for scanning gateways.
+sessions and outbound dials alone. ARDOP `LISTEN FALSE` does the same for
+an ARDOP host: after its echo, the host gets `DISCONNECTED` and then
+`NEWSTATE DISC ` (COP-247; see [ARDOP.md](ARDOP.md)). See
+[BPQ.md](BPQ.md) for scanning gateways.
 
 A listening coppad (`LISTEN ON`) pushes `PENDING` to every host when it
 answers another station's `CONNECT_REQ`. The attempt then ends in `CONNECTED`
