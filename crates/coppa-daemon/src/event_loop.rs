@@ -5694,15 +5694,19 @@ impl EventLoop {
                                                 .tx_keyed_since
                                                 .map(|t| t.into_std())
                                                 .unwrap_or_else(clock_now);
-                                            if retries > 0 && sent > 0 {
-                                                // COP-210: the reaper measures the
-                                                // staggered repeat from key-up, as
-                                                // `repeat_pending_dial` does, not
-                                                // from before a busy-channel wait.
+                                            if sent > 0 {
+                                                // COP-210/COP-248: the handshake
+                                                // timeout runs from key-up, not from
+                                                // before a busy-channel wait, for a
+                                                // one-request dial as for one with
+                                                // repeats (the reaper also measures
+                                                // the staggered repeat from here).
                                                 if let Some(session) = self.session_mgr.get_mut(id)
                                                 {
                                                     session.touch(keyed);
                                                 }
+                                            }
+                                            if retries > 0 && sent > 0 {
                                                 let sr = self.engine.config().sample_rate as f64;
                                                 let mut interval = coppa_protocol::session::connect_req_retry_interval(
                                                     Duration::from_secs_f64(samples.len() as f64 / sr),
@@ -27480,6 +27484,78 @@ mod tests {
                 a.session_mgr.active_sessions().is_empty(),
                 "an unanswered dial must be reaped after the virtual handshake timeout"
             );
+        }
+
+        /// COP-248: a dial that keys one request times out 30 s after that request
+        /// keys, not 30 s after CONNECT, when it first waits out a busy channel. Both
+        /// single-request forms: a pinned speed level with RETRIES unset, and an Auto
+        /// level with RETRIES 0.
+        #[tokio::test(start_paused = true)]
+        async fn single_request_dial_times_out_from_key_up_after_busy_wait() {
+            for pinned in [true, false] {
+                let mut config = DaemonConfig::default();
+                config.engine.callsign = "VK3ABC".into();
+                config.radio.ptt_pre_delay_ms = 0;
+                config.radio.ptt_tail_delay_ms = 0;
+                config.station_id.busy_hold_ms = 10;
+                let mut a = EventLoop::new(config).unwrap();
+                a.listening = true;
+                if pinned {
+                    a.manual_speed_level = Some(a.engine.speed_level());
+                } else {
+                    a.vara_clients.entry(1).or_default().connect_retries = Some(0);
+                }
+                let (a_producer, _a_consumer) = coppa_audio::audio_ring(4_000_000);
+                a.set_audio_out(a_producer);
+                let (mut air_in, air_in_rx) = coppa_audio::audio_ring(1_000_000);
+                a.set_audio_in(air_in_rx);
+                // The channel reads busy at CONNECT...
+                let mut counter = 1u32;
+                for _ in 0..10 {
+                    a.busy_gate.observe(&cop172_noise(0.01, &mut counter));
+                }
+                for _ in 0..busy_burst_blocks(&a.busy_gate) {
+                    a.busy_gate.observe(&cop172_noise(0.5, &mut counter));
+                }
+                assert!(a.busy_gate.current());
+                let dialed = tokio::time::Instant::now();
+                let busy_for = Duration::from_secs(20);
+                // ...and only goes quiet 20 s later. A steady loud occupant would
+                // read clear within a second as the gate's floor adapts.
+                let channel = async {
+                    tokio::time::sleep(busy_for).await;
+                    for _ in 0..15 {
+                        air_in.write(&cop172_noise(0.01, &mut counter));
+                    }
+                    std::future::pending::<()>().await
+                };
+                tokio::select! {
+                    _ = a.handle_host_event(HostEvent::ConnectRequest {
+                        client_id: 1,
+                        source: "VK3ABC".into(),
+                        destination: "W1AW".into(),
+                    }) => {}
+                    _ = channel => unreachable!(),
+                }
+                let keyed = a.tx_keyed_since.expect("the request keyed");
+                assert!(keyed - dialed >= busy_for, "pinned={pinned}");
+                assert!(a.pending_dial.is_none(), "pinned={pinned}: one request");
+                let until = keyed + Duration::from_millis(29_900);
+                tokio::time::advance(until.saturating_duration_since(tokio::time::Instant::now()))
+                    .await;
+                a.reap_timed_out_sessions().await;
+                assert_eq!(
+                    a.session_mgr.active_sessions().len(),
+                    1,
+                    "pinned={pinned}: reaped before key-up + 30 s"
+                );
+                tokio::time::advance(Duration::from_millis(200)).await;
+                a.reap_timed_out_sessions().await;
+                assert!(
+                    a.session_mgr.active_sessions().is_empty(),
+                    "pinned={pinned}: still alive after key-up + 30 s"
+                );
+            }
         }
     }
 
