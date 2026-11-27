@@ -630,20 +630,23 @@ stall scenario does (`docs/testing/bpq-session.md`).
   counts. That includes COP-227's re-record, which ran before COP-224 moved
   the count to the dial; the rows have not been re-recorded since.
 
-- **COP-244 KISS trials depend on coppad's receive ring.** coppad decodes on
-  its event loop, so receive audio waits in the `[audio] buffer_size` ring
-  while a frame decodes. With the old 16384-sample ring (0.34 s) and 4 busy
-  loops on 2 CPUs, the KISS live trial lost a datagram and ran to the 600 s
-  cap with 1148 of 2048 bytes. KISS never resends a datagram, so the loss is
-  permanent. The harness's starved and overflow ticks stayed 0, because they
-  count relay ticks, not coppad's ring. `tools/compare/coppad-kiss.toml` now
-  gives each coppad 131072 samples (2.7 s), which passed the live test under
-  that load; 12 busy loops on 2 CPUs still lost a datagram, with coppad
-  logging the same overflow, in the ticket's research. The same setting
-  also sizes coppad's TX ring. The VARA-style and ARDOP profiles keep 16384
-  samples, and whether the same overflow contributes to COP-237's capped
-  trials is not measured. The follow-up ticket filed with this one tracks
-  moving the decode off the event loop.
+- **COP-244 KISS ring history.** COP-246 runs coppad's receive decode and floor
+  detector off the event loop and drains the input ring while the job runs.
+  The default 8192-sample ring now preserves the next frame when a decode takes
+  longer than the ring holds audio: the loaded 2 KB KISS trial completed with
+  zero receiver-side overflow warnings. Before this change, a 16384-sample
+  ring under four busy loops on two CPUs lost a datagram and reached the 600 s
+  cap at 1148 of 2048 bytes. The published COP-244 profile keeps its measured
+  131072-sample ring; those older rows used that setting. Whether receive
+  overflow contributed to COP-237's capped VARA-style and ARDOP trials remains
+  unmeasured.
+
+- **COP-246 sender-side TX encode can overflow the input ring.** A loaded 2 KB
+  trial at the default ring logged three sender warnings during TX encoding,
+  about 52 ms after PTT keyed, dropping up to 30208 samples of self-monitor
+  audio. The pat and Reticulum zero-overflow rules count both stations, so
+  those warnings can still fail their runs. Follow-up ticket
+  `2f4c9b1e-7a62-4d30-bae6-c0180ec5dcba` tracks draining during encode.
 
 - **COP-227 re-recorded self-test.** COP-227 re-recorded the six black-box
   self-test rows with coppad 0.18.0 and the seeded payload: 2/6 completed

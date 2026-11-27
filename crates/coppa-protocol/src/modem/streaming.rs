@@ -382,12 +382,8 @@ impl StreamingReceiver {
     /// codeword's LDPC pass, so the worst case grows toward ~8x that for an
     /// 8-codeword frame at the slowest level (amortized per-sample cost is
     /// unchanged — same total FEC work, just concentrated in one call). A caller
-    /// on a latency-sensitive loop (e.g. an async event
-    /// loop driving audio I/O) should expect an occasional call to stall for a
-    /// full frame's decode time, not assume every call is cheap. See
-    /// `coppa-daemon/src/event_loop.rs`'s `handle_audio_in` for how the daemon
-    /// accepts this trade-off (ring-buffered input + an overflow counter) rather
-    /// than routing the decode through a worker thread.
+    /// on a latency-sensitive loop should expect a full frame's decode time.
+    /// coppad runs this work on a worker task and drains its input ring meanwhile.
     pub fn push_samples(&mut self, samples: &[f32]) -> Vec<DecodedFrame> {
         let mut out = Vec::new();
         if samples.is_empty() {

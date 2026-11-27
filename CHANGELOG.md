@@ -16,6 +16,11 @@ Older releases have no entry here. Their on-air breaks are listed in
 
 ## Unreleased: 0.18.0
 
+- COP-246: coppad decodes received frames and runs the floor detector on a
+  worker task while its event loop drains the audio input ring. A decode slower
+  than the default ring no longer drops the next frame under CPU contention.
+  `coppa-engine` adds the `ReceiveHalf` take/put API for moving receive DSP.
+
 - COP-227: `coppa-bench compare blackbox` records each trial's payload CRC-32
   as a last `payload_crc32` column and refuses to resume into a CSV without it
   or with another payload. Stream trials count `delivered_bytes` only up to
