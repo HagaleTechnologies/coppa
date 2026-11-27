@@ -4,6 +4,7 @@
 mod cable;
 pub mod guard;
 pub mod integrity;
+pub mod native;
 pub mod profile;
 pub mod relay;
 pub mod resume;

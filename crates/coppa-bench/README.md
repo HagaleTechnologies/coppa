@@ -36,8 +36,9 @@ Not on crates.io and not a product crate. From a clone of the repository:
   from that CSV, then `compare --check` to verify it.
 - `cargo run --release -p coppa-bench --features cpal-backend -- compare blackbox --modem tools/compare/coppad.toml`
   runs the Linux ALSA cable experiment. Build a release `coppad` with
-  `--features cpal-backend,ardop,kiss-tnc` first. The cable accepts f32le,
-  48 kHz, mono playback. Live tests also need that release binary. The
+  `--features cpal-backend,ardop,kiss-tnc` first. The cable carries the
+  mono format the profile's `[audio]` table declares (`f32le` or `s16le`, at
+  8000 to 48000 Hz; coppad's profiles declare f32le at 48000 Hz). Live tests also need that release binary. The
   integrity probe must pass before a trial is recorded. Each row records the
   CRC-32 of the generated trial payload as `payload_crc32`, even if dialing
   fails before sending. Use a fresh `--out-dir` if the CSV lacks that column
