@@ -177,8 +177,8 @@ a 2-CPU quota, the same cold run took 1551 s (493 s plus 1058 s).
 - The websocket chat test `a_retransmitted_chat_segment_is_byte_identical`
   still sleeps one RTO on the real thread. It drives real sockets, so it
   stays unpaused.
-- `coppad`'s unit-test binary re-declares the daemon's modules, so
-  `cargo test --workspace` runs about 616 of these tests twice.
+- COP-249 removed the duplicate daemon-module unit tests from `coppad`; see
+  [the updated daemon-unit counts](full-ci.md#cop-249-daemon-unit-deduplication).
 - Disk. In planning, a full local gate in one target directory reached
   13 GB after `cargo test --workspace` and 20 GB by `du -sh` after the rest
   of the COP-224 gate. Running `cargo build` and `cargo test` in one target

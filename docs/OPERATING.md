@@ -157,7 +157,7 @@ and it applies to gpio and cm108 PTT. With `none`, `vox` or `rigctld`,
 coppad starts and logs one warning:
 
 ```
-WARN coppad::event_loop: [radio] ptt_invert = true has no effect with ptt_method "rigctld"; it applies to gpio and cm108 PTT
+WARN coppa_daemon::event_loop: [radio] ptt_invert = true has no effect with ptt_method "rigctld"; it applies to gpio and cm108 PTT
 ```
 
 With serial PTT, coppad refuses to start (COP-144). Inverted serial PTT
@@ -277,7 +277,7 @@ to turn the drive up.
 The daemon logs the real figures for every transmission:
 
 ```text
-INFO coppad::event_loop: TX audio level peak_dbfs=-6.0 rms_dbfs=-16.8 duration_ms=1365
+INFO coppa_daemon::event_loop: TX audio level peak_dbfs=-6.0 rms_dbfs=-16.8 duration_ms=1365
 ```
 
 It cannot see your OS mixer or your radio's ALC, which is where over-drive
@@ -798,7 +798,7 @@ Logs carry INFO, WARN and ERROR events with the console line's `key=value`
 fields appended to the message, so a refusal shows its reason:
 
 ```json
-{"type":"log","level":"warn","message":"coppad::event_loop: MYCALL rejected callsign=!!bad!! error=Invalid callsign character: '!'","timestamp_ms":1793600129709}
+{"type":"log","level":"warn","message":"coppa_daemon::event_loop: MYCALL rejected callsign=!!bad!! error=Invalid callsign character: '!'","timestamp_ms":1793600129709}
 ```
 
 Each message is truncated to 2 KiB, fields included.
@@ -1273,7 +1273,7 @@ nothing. coppad logs each change at `INFO` (`CW ID turned on by VARA client
 startup it logs the current state, for example:
 
 ```text
-INFO coppad::event_loop: CW ID after each session this station ends: off until a host sends CWID ON ([station_id] cwid = "host", 20 WPM)
+INFO coppa_daemon::event_loop: CW ID after each session this station ends: off until a host sends CWID ON ([station_id] cwid = "host", 20 WPM)
 ```
 
 Pat's VARA HF driver sends `CWID ON` every time it starts. Under the
@@ -1339,7 +1339,7 @@ longer. If the DISCONNECT frame plus the CW ID would not fit inside
 logs a warning:
 
 ```text
-WARN coppad::event_loop: CW ID skipped: the DISCONNECT frame (1.9 s) plus the CW ID (4.7 s) would exceed [radio] max_tx_duration_s = 3 less a 2 s margin
+WARN coppa_daemon::event_loop: CW ID skipped: the DISCONNECT frame (1.9 s) plus the CW ID (4.7 s) would exceed [radio] max_tx_duration_s = 3 less a 2 s margin
 ```
 
 The margin leaves room for a prepended station-ID frame and the PTT
@@ -1389,7 +1389,7 @@ It checks in this order and reports the first reason that applies:
 With the default config, the log line reads:
 
 ```text
-INFO coppad::event_loop: FREQ 7074000 refused: host rig control is off; set [radio] host_rig_control = true to allow it
+INFO coppa_daemon::event_loop: FREQ 7074000 refused: host rig control is off; set [radio] host_rig_control = true to allow it
 ```
 
 The reply to a set is what the rig reports afterwards, not what the host
@@ -1398,7 +1398,7 @@ asked for. If the rig accepts `F 7074005` but reports 7074000, the host gets
 with its request.
 
 ```text
-WARN coppad::event_loop: FREQ 7074005: rig reports 7074000 Hz after the set
+WARN coppa_daemon::event_loop: FREQ 7074005: rig reports 7074000 Hz after the set
 ```
 
 A retune does not get around the frequency gate (COP-40). On a wideband
@@ -1408,7 +1408,7 @@ therefore gets a warning, and every later transmission is refused until the
 rig is retuned:
 
 ```text
-WARN coppad::event_loop: FREQ 14074000: the rig is now below 29.7 MHz; the VHF_FAST profile's wideband gate will refuse every transmission until it is retuned
+WARN coppa_daemon::event_loop: FREQ 14074000: the rig is now below 29.7 MHz; the VHF_FAST profile's wideband gate will refuse every transmission until it is retuned
 ```
 
 coppad talks to rigctld on its main event loop, as it does for PTT. A

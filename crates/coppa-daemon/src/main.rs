@@ -9,37 +9,20 @@
 // COP-142: the std-clock ban targets event_loop production code only.
 #![allow(clippy::disallowed_methods)]
 
-// Shared with the library target; the binary uses only part of its API
-// (and none of the output worker without `cpal-backend`).
 #[cfg(target_os = "linux")]
 mod appliance;
-#[cfg(feature = "ardop")]
-mod ardop_wiring;
-#[allow(dead_code)]
-mod audio_output;
-mod build_info;
 mod cli;
-mod config;
-mod event_loop;
-mod level_meter;
-mod logging;
-mod ptt_guardian;
-mod session_fragments;
-mod session_outer;
-mod signals;
-#[cfg(feature = "websocket")]
-mod spectrum;
-mod startup_report;
-
+#[cfg(feature = "ardop")]
+use coppa_daemon::ardop_wiring;
+#[cfg(feature = "cpal-backend")]
+use coppa_daemon::audio_output;
+use coppa_daemon::{
+    build_info, config, event_loop, logging, ptt_guardian, signals, startup_report, vara_wiring,
+};
 #[cfg(feature = "kiss-tnc")]
-mod kiss_wiring;
-// Use the library runner, also used by the CLI, rather than compiling it twice.
-#[cfg(feature = "kiss-tnc")]
-use coppa_daemon::tnc;
-mod tx_chunker;
-mod vara_wiring;
+use coppa_daemon::{kiss_wiring, tnc};
 #[cfg(feature = "websocket")]
-mod web;
+use coppa_daemon::{web, ws_log};
 
 use std::io::{IsTerminal, Write};
 
@@ -47,10 +30,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, ConfigSource, LogLevel, Mode};
 use config::{config_candidates, ConfigEnv, DaemonConfig, Discovered};
-use event_loop::{DaemonEvent, EventLoop};
-// COP-140: from the library target, not a second copy, so the binary does not
-// compile the helpers only the library's API and tests use.
+#[cfg(feature = "mdns")]
 use coppa_daemon::mdns;
+use event_loop::{DaemonEvent, EventLoop};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1106,6 +1088,3 @@ fn open_output(
             )
         })
 }
-
-#[cfg(feature = "websocket")]
-mod ws_log;
