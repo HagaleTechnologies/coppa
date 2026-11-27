@@ -130,6 +130,10 @@ pub struct CoppaCore {
     /// transceiver built for the same profile as the transmit path above.
     receive: Option<ReceiveHalf>,
     receive_generation: u64,
+    /// COP-168: the configured IR-HARQ combining policy, held engine-side so
+    /// it survives [`Self::reconfigure`] even while the receive half is taken
+    /// out (COP-246). Every half this core installs is stamped from it.
+    harq_policy: HarqPolicy,
     /// Separately detected low-rate floor receive path (air-protocol
     /// version 2, COP-190/ADR-014), constructed alongside the OFDM paths.
     /// Link feeds this detector alongside OFDM and selects the codec through
@@ -265,6 +269,7 @@ impl CoppaCore {
             config,
             receive,
             receive_generation: 0,
+            harq_policy: HarqPolicy::default(),
             floor,
         }
     }
@@ -576,8 +581,12 @@ impl CoppaCore {
     }
 
     /// COP-168: set the streaming receiver's IR-HARQ combining policy. It
-    /// survives [`Self::reconfigure`] and every rebuild that goes through it.
+    /// survives [`Self::reconfigure`] and every rebuild that goes through it,
+    /// including a rebuild that runs while the receive half is taken out:
+    /// the policy is held on the engine and stamped onto every half it
+    /// installs, so a taken half returning later cannot revert it.
     pub fn set_harq_policy(&mut self, policy: HarqPolicy) {
+        self.harq_policy = policy;
         if let Some(rx) = self.receive.as_mut() {
             rx.streaming.set_harq_policy(policy);
         }
@@ -843,14 +852,12 @@ impl CoppaCore {
     /// Rebuild the engine with a new configuration.
     ///
     /// COP-168: the streaming receiver's [`HarqPolicy`] carries over to the
-    /// rebuilt receiver; its soft buffers and counters do not.
-    /// The floor detector keeps its history when the receive half is present.
+    /// rebuilt receiver; its soft buffers and counters do not. The carry is
+    /// from the engine-held policy, so it also holds when the receive half
+    /// is taken out while this runs. The floor detector keeps its history
+    /// when the receive half is present.
     pub fn reconfigure(&mut self, config: EngineConfig) {
-        let policy = self
-            .receive
-            .as_ref()
-            .map(|rx| rx.streaming.harq_policy())
-            .unwrap_or_default();
+        let policy = self.harq_policy;
         let mut new = Self::build(config);
         self.transceiver = new.transceiver;
         self.config = new.config;
@@ -866,17 +873,23 @@ impl CoppaCore {
     }
 
     /// Move the receive state to a worker while retaining the transmit engine.
-    /// Until [`Self::put_receive`] restores it, engine-side receive calls are
-    /// inert and receive counters read zero. A reconfigure installs a new
-    /// receive half and makes the taken one stale.
+    /// Until [`Self::put_receive`] restores it, the engine-side
+    /// `push_samples`/`push_floor_samples` return nothing, receive counters
+    /// read zero and `harq_evict` is a no-op; configuration calls such as
+    /// [`Self::set_harq_policy`] keep recording engine-side and apply on
+    /// restore. A reconfigure installs a new receive half and makes the
+    /// taken one stale.
     pub fn take_receive(&mut self) -> Option<ReceiveHalf> {
         self.receive.take()
     }
 
     /// Restore a half taken by [`Self::take_receive`]. If reconfiguration
-    /// installed a new half meanwhile, drop the stale one.
-    pub fn put_receive(&mut self, half: ReceiveHalf) {
+    /// installed a new half meanwhile, drop the stale one. The engine-held
+    /// [`HarqPolicy`] is re-applied, so a policy set while the half was out
+    /// takes effect on restore.
+    pub fn put_receive(&mut self, mut half: ReceiveHalf) {
         if half.generation == self.receive_generation && self.receive.is_none() {
+            half.streaming.set_harq_policy(self.harq_policy);
             self.receive = Some(half);
         }
     }
@@ -1072,6 +1085,47 @@ mod tests {
         core.harq_evict(1);
         core.put_receive(rx);
         assert_eq!(core.push_samples(&samples).len(), 1);
+    }
+
+    /// COP-246 review: the policy must survive a reconfigure that runs while
+    /// the receive half is taken out for off-loop decoding, since the taken
+    /// half is stale afterwards and cannot restore it.
+    #[test]
+    fn harq_policy_survives_reconfigure_while_the_half_is_taken() {
+        let mut core = CoppaCore::new();
+        let windowed = HarqPolicy {
+            key_mask: 0x0F,
+            rv0_starts_fresh: true,
+            multi_codeword: true,
+        };
+        core.set_harq_policy(windowed);
+        let stale = core.take_receive().unwrap();
+        core.set_speed_level(3).unwrap();
+        core.put_receive(stale);
+        assert_eq!(
+            core.receive.as_ref().unwrap().streaming.harq_policy(),
+            windowed
+        );
+        let samples = with_lead_and_trail(&core.encode("policy kept").unwrap());
+        assert_eq!(core.push_samples(&samples).len(), 1);
+    }
+
+    /// A policy set while the half is taken applies when the half comes back.
+    #[test]
+    fn harq_policy_set_while_the_half_is_taken_applies_on_put_receive() {
+        let mut core = CoppaCore::new();
+        let half = core.take_receive().unwrap();
+        let windowed = HarqPolicy {
+            key_mask: 0x0F,
+            rv0_starts_fresh: true,
+            multi_codeword: true,
+        };
+        core.set_harq_policy(windowed);
+        core.put_receive(half);
+        assert_eq!(
+            core.receive.as_ref().unwrap().streaming.harq_policy(),
+            windowed
+        );
     }
 
     /// COP-168: the HARQ policy set on the engine survives every rebuild,
