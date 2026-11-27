@@ -113,7 +113,9 @@ fn probe_native(
         sample_rate: native.rate,
         buffer_size: cpal::BufferSize::Default,
     };
-    let pending = Arc::new(Mutex::new(VecDeque::from(native.probe_signal())));
+    // Empty until both streams run, so the output plays silence through the
+    // file PCMs' startup; the f32 probe lost its first samples there.
+    let pending = Arc::new(Mutex::new(VecDeque::new()));
     let captured = Arc::new(Mutex::new(Vec::new()));
     let (queue, store) = (Arc::clone(&pending), Arc::clone(&captured));
     let format = format!("{} {} Hz mono", native.format.name(), native.rate);
@@ -167,6 +169,8 @@ fn probe_native(
     record.play().context("starting the probe input")?;
     play.play().context("starting the probe output")?;
     fs::write(dir.join("probe-start"), b"")?;
+    let signal = native.probe_signal();
+    pending.lock().unwrap().extend(signal);
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(12) {
         if pending.lock().unwrap().is_empty() && !dir.join("probe-end").exists() {
