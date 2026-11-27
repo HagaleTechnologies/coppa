@@ -113,10 +113,15 @@ and the 15 floor recovery tests
 
 ## Release matrix
 
-The matrix ran on the patched tree in a Linux container with a 6-CPU
-cgroup quota (`cpu.max = 600000 100000`, `nproc` 32, shared host load
-average 6 to 10). A 2-CPU quota could not be set here, so every
-qualifying run was pinned to two dedicated cores with `taskset -c`.
+The qualifying matrix is the second attempt of the remediation round, on
+one release build of the patched tree (`7d07cc3`). The first matrix and
+the round's first attempt each had an integrity probe fail, which AC1
+counts as a failed matrix. Both are listed under "Attempts that do not
+count" below. The build and every run used a Linux container with a
+6-CPU cgroup quota (`cpu.max = 600000 100000`, `nproc` 32) on a shared
+host: load average 6 to 11, and every core 20 to 57% busy with other work
+just before this attempt. A 2-CPU quota could not be set here, because
+`/sys/fs/cgroup` is read-only.
 
 ```sh
 cargo build --release -p coppa-bench -p coppa-daemon \
@@ -124,112 +129,140 @@ cargo build --release -p coppa-bench -p coppa-daemon \
 ```
 
 `target/release/coppad --version` printed `coppad 0.18.0`. Its SHA-256,
-`5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594`, is the
+`3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a`, is the
 `binary_sha256` of every row below. Each run had fresh directories and
 default logging:
 
 ```sh
-env -u RUST_LOG TMPDIR="$run_dir/tmp" timeout --kill-after=10s 720s taskset -c <cores> \
+env -u RUST_LOG TMPDIR="$run_dir/tmp" timeout --kill-after=10s 720s \
   target/release/coppa-bench compare blackbox \
   --modem "tools/compare/$profile.toml" --channel wgn --snr 30 \
   --size 2048 --trials 1 --jobs 1 --seed-base 0x17000000 \
   --out-dir "$run_dir/results"
 ```
 
-A row passes only with outcome `complete` (ARDOP, VARA-style) or
-`datagram` (KISS), 2048 bytes delivered, `exact = true`, channel `wgn`,
-SNR 30, seed `0x17000000`, cap 600 s and `payload_crc32 = 0x6887c6a5`.
-ARDOP runs 1 to 3 ran one after another on cores 2,3. After that, two
-streams ran at once on separate core pairs: cores 2,3 took ARDOP 4 to 10
-and VARA-style 1 to 5, and cores 4,5 took KISS 1 to 10 and VARA-style 6 to
-10. No build or test job overlapped a qualifying run.
+A row passes only with exit status 0, outcome `complete` (ARDOP,
+VARA-style) or `datagram` (KISS), 2048 bytes delivered, `exact = true`,
+channel `wgn`, SNR 30, seed `0x17000000`, cap 600 s,
+`payload_crc32 = 0x6887c6a5`, and 0 starved and 0 overflow ticks. The
+script never retried a run index, and after any failed check, a failed
+probe included, neither stream started another run; a run already in
+flight would have finished. Two streams ran at
+once from 12:52:16 UTC: stream A took ARDOP 1 to 10 and then KISS 1 to 5,
+and stream B took VARA-style 1 to 10 and then KISS 6 to 10. The runs were
+not pinned to cores. All three probe failures seen on this host were in
+runs pinned to two cores, so this attempt dropped the pinning; that link
+is suggestive, not shown. The two streams shared the 6-CPU quota, so
+each pair could use more CPU than the 2-CPU cgroup where the baseline
+stalled (see "Not shown"). No build or test job overlapped a qualifying
+run.
 
-Result: ARDOP 10 of 10 `complete`, VARA-style 10 of 10 `complete` and KISS 10 of 10 `datagram`, each with all 2048 bytes exact. No row ended `cap`, and every row counted 0 starved and 0 overflow ticks. One ARDOP run index needed a second attempt after a probe failure, listed below.
+Result: ARDOP 10 of 10 `complete`, VARA-style 10 of 10 `complete` and
+KISS 10 of 10 `datagram`, each with exit status 0 and all 2048 bytes
+exact. Every run's harness log reported its integrity probe passed with
+correlation 1.000000, level +0.00 dB and a cable lead of 355 ms or 375 ms
+(the CSV's `cable_latency_ms`). No row ended `cap`, and
+every row counted 0 starved and 0 overflow ticks.
 
-| Profile | Run | Cores | Started (UTC) | Outcome | Delivered | Exact | Trial wall s | Starved | Overflow |
-|---|---|---|---|---|---|---|---|---|---|
-| ARDOP | 1 | 2,3 | 08:36:29 | `complete` | 2048 | true | 58.694 | 0 | 0 |
-| ARDOP | 2 | 2,3 | 08:38:09 | `complete` | 2048 | true | 58.701 | 0 | 0 |
-| ARDOP | 3 | 2,3 | 08:39:37 | `complete` | 2048 | true | 58.685 | 0 | 0 |
-| ARDOP | 4 | 2,3 | 08:41:05 | `complete` | 2048 | true | 58.660 | 0 | 0 |
-| ARDOP | 5 | 2,3 | 08:42:32 | `complete` | 2048 | true | 58.704 | 0 | 0 |
-| ARDOP | 6 | 2,3 | 08:44:00 | `complete` | 2048 | true | 58.563 | 0 | 0 |
-| ARDOP | 7 | 2,3 | 08:45:29 | `complete` | 2048 | true | 58.615 | 0 | 0 |
-| ARDOP | 8 | 2,3 | 08:46:58 | `complete` | 2048 | true | 58.582 | 0 | 0 |
-| ARDOP | 9 | 2,3 | 08:48:25 | `complete` | 2048 | true | 58.670 | 0 | 0 |
-| ARDOP | 10 | 2,3 | 08:49:54 | `complete` | 2048 | true | 58.684 | 0 | 0 |
-| VARA-style | 1 | 2,3 | 08:51:22 | `complete` | 2048 | true | 58.565 | 0 | 0 |
-| VARA-style | 2 | 2,3 | 08:52:49 | `complete` | 2048 | true | 58.616 | 0 | 0 |
-| VARA-style | 3 | 2,3 | 08:54:16 | `complete` | 2048 | true | 58.597 | 0 | 0 |
-| VARA-style | 4 | 2,3 | 08:55:44 | `complete` | 2048 | true | 58.641 | 0 | 0 |
-| VARA-style | 5 | 2,3 | 08:57:12 | `complete` | 2048 | true | 58.554 | 0 | 0 |
-| VARA-style | 6 | 4,5 | 08:49:26 | `complete` | 2048 | true | 58.564 | 0 | 0 |
-| VARA-style | 7 | 4,5 | 08:50:53 | `complete` | 2048 | true | 58.562 | 0 | 0 |
-| VARA-style | 8 | 4,5 | 08:52:20 | `complete` | 2048 | true | 58.581 | 0 | 0 |
-| VARA-style | 9 | 4,5 | 08:53:48 | `complete` | 2048 | true | 58.602 | 0 | 0 |
-| VARA-style | 10 | 4,5 | 08:55:15 | `complete` | 2048 | true | 58.607 | 0 | 0 |
-| KISS | 1 | 4,5 | 08:41:33 | `datagram` | 2048 | true | 25.542 | 0 | 0 |
-| KISS | 2 | 4,5 | 08:42:21 | `datagram` | 2048 | true | 25.547 | 0 | 0 |
-| KISS | 3 | 4,5 | 08:43:08 | `datagram` | 2048 | true | 25.534 | 0 | 0 |
-| KISS | 4 | 4,5 | 08:43:55 | `datagram` | 2048 | true | 25.537 | 0 | 0 |
-| KISS | 5 | 4,5 | 08:44:42 | `datagram` | 2048 | true | 25.550 | 0 | 0 |
-| KISS | 6 | 4,5 | 08:45:29 | `datagram` | 2048 | true | 25.537 | 0 | 0 |
-| KISS | 7 | 4,5 | 08:46:17 | `datagram` | 2048 | true | 25.514 | 0 | 0 |
-| KISS | 8 | 4,5 | 08:47:04 | `datagram` | 2048 | true | 25.570 | 0 | 0 |
-| KISS | 9 | 4,5 | 08:47:51 | `datagram` | 2048 | true | 25.547 | 0 | 0 |
-| KISS | 10 | 4,5 | 08:48:39 | `datagram` | 2048 | true | 25.535 | 0 | 0 |
+| Profile | Run | Stream | Started (UTC) | Exit | Outcome | Delivered | Exact | Trial wall s | Starved | Overflow |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ARDOP | 1 | A | 12:52:16 | 0 | `complete` | 2048 | true | 58.686 | 0 | 0 |
+| ARDOP | 2 | A | 12:53:44 | 0 | `complete` | 2048 | true | 58.570 | 0 | 0 |
+| ARDOP | 3 | A | 12:55:10 | 0 | `complete` | 2048 | true | 58.654 | 0 | 0 |
+| ARDOP | 4 | A | 12:56:38 | 0 | `complete` | 2048 | true | 58.621 | 0 | 0 |
+| ARDOP | 5 | A | 12:58:05 | 0 | `complete` | 2048 | true | 58.665 | 0 | 0 |
+| ARDOP | 6 | A | 12:59:32 | 0 | `complete` | 2048 | true | 58.688 | 0 | 0 |
+| ARDOP | 7 | A | 13:00:59 | 0 | `complete` | 2048 | true | 58.609 | 0 | 0 |
+| ARDOP | 8 | A | 13:02:26 | 0 | `complete` | 2048 | true | 58.631 | 0 | 0 |
+| ARDOP | 9 | A | 13:03:53 | 0 | `complete` | 2048 | true | 58.658 | 0 | 0 |
+| ARDOP | 10 | A | 13:05:20 | 0 | `complete` | 2048 | true | 59.021 | 0 | 0 |
+| VARA-style | 1 | B | 12:52:16 | 0 | `complete` | 2048 | true | 58.601 | 0 | 0 |
+| VARA-style | 2 | B | 12:53:43 | 0 | `complete` | 2048 | true | 58.579 | 0 | 0 |
+| VARA-style | 3 | B | 12:55:10 | 0 | `complete` | 2048 | true | 58.572 | 0 | 0 |
+| VARA-style | 4 | B | 12:56:37 | 0 | `complete` | 2048 | true | 58.593 | 0 | 0 |
+| VARA-style | 5 | B | 12:58:04 | 0 | `complete` | 2048 | true | 58.568 | 0 | 0 |
+| VARA-style | 6 | B | 12:59:31 | 0 | `complete` | 2048 | true | 58.620 | 0 | 0 |
+| VARA-style | 7 | B | 13:00:58 | 0 | `complete` | 2048 | true | 58.649 | 0 | 0 |
+| VARA-style | 8 | B | 13:02:25 | 0 | `complete` | 2048 | true | 58.611 | 0 | 0 |
+| VARA-style | 9 | B | 13:03:52 | 0 | `complete` | 2048 | true | 58.555 | 0 | 0 |
+| VARA-style | 10 | B | 13:05:19 | 0 | `complete` | 2048 | true | 59.018 | 0 | 0 |
+| KISS | 1 | A | 13:06:48 | 0 | `datagram` | 2048 | true | 25.700 | 0 | 0 |
+| KISS | 2 | A | 13:07:35 | 0 | `datagram` | 2048 | true | 25.562 | 0 | 0 |
+| KISS | 3 | A | 13:08:22 | 0 | `datagram` | 2048 | true | 28.026 | 0 | 0 |
+| KISS | 4 | A | 13:09:12 | 0 | `datagram` | 2048 | true | 25.624 | 0 | 0 |
+| KISS | 5 | A | 13:09:58 | 0 | `datagram` | 2048 | true | 25.620 | 0 | 0 |
+| KISS | 6 | B | 13:06:47 | 0 | `datagram` | 2048 | true | 25.726 | 0 | 0 |
+| KISS | 7 | B | 13:07:34 | 0 | `datagram` | 2048 | true | 25.561 | 0 | 0 |
+| KISS | 8 | B | 13:08:21 | 0 | `datagram` | 2048 | true | 27.801 | 0 | 0 |
+| KISS | 9 | B | 13:09:11 | 0 | `datagram` | 2048 | true | 25.631 | 0 | 0 |
+| KISS | 10 | B | 13:09:57 | 0 | `datagram` | 2048 | true | 25.599 | 0 | 0 |
 
 Full CSV rows, with the profile and the fresh-run index first:
 
 ```csv
 profile,run,modem,adapter,version_reply,binary_sha256,mode,channel,snr_db,size_bytes,trial,seed,ref_power_a,ref_power_b,cap_s,outcome,connect_s,delivered_bytes,exact,transfer_s,net_bytes_per_min,drops,wall_s,cable_latency_ms,starved_ticks,overflow_ticks,payload_crc32
-coppad-ardop,1,coppad-ardop,ardop,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.135,2048,true,51.559,2383.296,0,58.694,355,0,0,0x6887c6a5
-coppad-ardop,2,coppad-ardop,ardop,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.156,2048,true,51.545,2383.936,0,58.701,355,0,0,0x6887c6a5
-coppad-ardop,3,coppad-ardop,ardop,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.160,2048,true,51.525,2384.872,0,58.685,355,0,0,0x6887c6a5
-coppad-ardop,4,coppad-ardop,ardop,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.145,2048,true,51.515,2385.343,0,58.660,375,0,0,0x6887c6a5
-coppad-ardop,5,coppad-ardop,ardop,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.184,2048,true,51.520,2385.086,0,58.704,355,0,0,0x6887c6a5
-coppad-ardop,6,coppad-ardop,ardop,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.172,2048,true,51.392,2391.056,0,58.563,355,0,0,0x6887c6a5
-coppad-ardop,7,coppad-ardop,ardop,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.158,2048,true,51.457,2387.998,0,58.615,355,0,0,0x6887c6a5
-coppad-ardop,8,coppad-ardop,ardop,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.133,2048,true,51.449,2388.374,0,58.582,355,0,0,0x6887c6a5
-coppad-ardop,9,coppad-ardop,ardop,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.200,2048,true,51.471,2387.383,0,58.670,355,0,0,0x6887c6a5
-coppad-ardop,10,coppad-ardop,ardop,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.143,2048,true,51.542,2384.096,0,58.684,355,0,0,0x6887c6a5
-coppad,1,coppad,vara,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.077,2048,true,51.488,2386.571,0,58.565,355,0,0,0x6887c6a5
-coppad,2,coppad,vara,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.054,2048,true,51.562,2383.173,0,58.616,355,0,0,0x6887c6a5
-coppad,3,coppad,vara,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.103,2048,true,51.494,2386.292,0,58.597,355,0,0,0x6887c6a5
-coppad,4,coppad,vara,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.037,2048,true,51.604,2381.204,0,58.641,355,0,0,0x6887c6a5
-coppad,5,coppad,vara,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.090,2048,true,51.463,2387.720,0,58.554,355,0,0,0x6887c6a5
-coppad,6,coppad,vara,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.065,2048,true,51.499,2386.073,0,58.564,355,0,0,0x6887c6a5
-coppad,7,coppad,vara,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.057,2048,true,51.505,2385.802,0,58.562,355,0,0,0x6887c6a5
-coppad,8,coppad,vara,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.082,2048,true,51.499,2386.065,0,58.581,355,0,0,0x6887c6a5
-coppad,9,coppad,vara,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.070,2048,true,51.532,2384.547,0,58.602,355,0,0,0x6887c6a5
-coppad,10,coppad,vara,VERSION Coppa 0.18.0,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.092,2048,true,51.515,2385.316,0,58.607,355,0,0,0x6887c6a5
-coppad-kiss,1,coppad-kiss,kiss,,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019260,600,datagram,,2048,true,25.542,4810.880,0,25.542,355,0,0,0x6887c6a5
-coppad-kiss,2,coppad-kiss,kiss,,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019260,600,datagram,,2048,true,25.547,4809.944,0,25.547,355,0,0,0x6887c6a5
-coppad-kiss,3,coppad-kiss,kiss,,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019260,600,datagram,,2048,true,25.534,4812.479,0,25.534,355,0,0,0x6887c6a5
-coppad-kiss,4,coppad-kiss,kiss,,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019264,600,datagram,,2048,true,25.537,4811.799,0,25.537,355,0,0,0x6887c6a5
-coppad-kiss,5,coppad-kiss,kiss,,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019264,600,datagram,,2048,true,25.550,4809.475,0,25.550,355,0,0,0x6887c6a5
-coppad-kiss,6,coppad-kiss,kiss,,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019264,600,datagram,,2048,true,25.537,4811.916,0,25.537,355,0,0,0x6887c6a5
-coppad-kiss,7,coppad-kiss,kiss,,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019264,600,datagram,,2048,true,25.514,4816.176,0,25.514,355,0,0,0x6887c6a5
-coppad-kiss,8,coppad-kiss,kiss,,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019264,600,datagram,,2048,true,25.570,4805.645,0,25.570,355,0,0,0x6887c6a5
-coppad-kiss,9,coppad-kiss,kiss,,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019260,600,datagram,,2048,true,25.547,4810.000,0,25.547,355,0,0,0x6887c6a5
-coppad-kiss,10,coppad-kiss,kiss,,5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019264,600,datagram,,2048,true,25.535,4812.147,0,25.535,355,0,0,0x6887c6a5
+coppad-ardop,1,coppad-ardop,ardop,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.156,2048,true,51.530,2384.613,0,58.686,355,0,0,0x6887c6a5
+coppad-ardop,2,coppad-ardop,ardop,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.124,2048,true,51.446,2388.543,0,58.570,355,0,0,0x6887c6a5
+coppad-ardop,3,coppad-ardop,ardop,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.151,2048,true,51.503,2385.879,0,58.654,355,0,0,0x6887c6a5
+coppad-ardop,4,coppad-ardop,ardop,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.116,2048,true,51.505,2385.789,0,58.621,355,0,0,0x6887c6a5
+coppad-ardop,5,coppad-ardop,ardop,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.136,2048,true,51.529,2384.677,0,58.665,355,0,0,0x6887c6a5
+coppad-ardop,6,coppad-ardop,ardop,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.172,2048,true,51.516,2385.280,0,58.688,355,0,0,0x6887c6a5
+coppad-ardop,7,coppad-ardop,ardop,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.163,2048,true,51.447,2388.495,0,58.609,355,0,0,0x6887c6a5
+coppad-ardop,8,coppad-ardop,ardop,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.134,2048,true,51.498,2386.130,0,58.631,355,0,0,0x6887c6a5
+coppad-ardop,9,coppad-ardop,ardop,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.176,2048,true,51.482,2386.865,0,58.658,355,0,0,0x6887c6a5
+coppad-ardop,10,coppad-ardop,ardop,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.198,2048,true,51.824,2371.108,0,59.021,355,0,0,0x6887c6a5
+coppad,1,coppad,vara,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.066,2048,true,51.535,2384.398,0,58.601,355,0,0,0x6887c6a5
+coppad,2,coppad,vara,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.061,2048,true,51.518,2385.188,0,58.579,355,0,0,0x6887c6a5
+coppad,3,coppad,vara,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.072,2048,true,51.500,2386.040,0,58.572,355,0,0,0x6887c6a5
+coppad,4,coppad,vara,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.042,2048,true,51.550,2383.686,0,58.593,355,0,0,0x6887c6a5
+coppad,5,coppad,vara,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.079,2048,true,51.488,2386.555,0,58.568,355,0,0,0x6887c6a5
+coppad,6,coppad,vara,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.073,2048,true,51.547,2383.854,0,58.620,355,0,0,0x6887c6a5
+coppad,7,coppad,vara,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.167,2048,true,51.483,2386.817,0,58.649,355,0,0,0x6887c6a5
+coppad,8,coppad,vara,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.064,2048,true,51.547,2383.845,0,58.611,355,0,0,0x6887c6a5
+coppad,9,coppad,vara,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.075,2048,true,51.480,2386.955,0,58.555,355,0,0,0x6887c6a5
+coppad,10,coppad,vara,VERSION Coppa 0.18.0,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.023498,0.020689,600,complete,7.152,2048,true,51.867,2369.153,0,59.018,355,0,0,0x6887c6a5
+coppad-kiss,1,coppad-kiss,kiss,,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019260,600,datagram,,2048,true,25.700,4781.380,0,25.700,355,0,0,0x6887c6a5
+coppad-kiss,2,coppad-kiss,kiss,,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019264,600,datagram,,2048,true,25.562,4807.059,0,25.562,375,0,0,0x6887c6a5
+coppad-kiss,3,coppad-kiss,kiss,,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019264,600,datagram,,2048,true,28.026,4384.423,0,28.026,355,0,0,0x6887c6a5
+coppad-kiss,4,coppad-kiss,kiss,,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019264,600,datagram,,2048,true,25.624,4795.507,0,25.624,355,0,0,0x6887c6a5
+coppad-kiss,5,coppad-kiss,kiss,,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019243,600,datagram,,2048,true,25.620,4796.166,0,25.620,355,0,0,0x6887c6a5
+coppad-kiss,6,coppad-kiss,kiss,,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019260,600,datagram,,2048,true,25.726,4776.491,0,25.726,355,0,0,0x6887c6a5
+coppad-kiss,7,coppad-kiss,kiss,,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019264,600,datagram,,2048,true,25.561,4807.259,0,25.561,355,0,0,0x6887c6a5
+coppad-kiss,8,coppad-kiss,kiss,,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019264,600,datagram,,2048,true,27.801,4419.943,0,27.801,355,0,0,0x6887c6a5
+coppad-kiss,9,coppad-kiss,kiss,,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019264,600,datagram,,2048,true,25.631,4794.164,0,25.631,355,0,0,0x6887c6a5
+coppad-kiss,10,coppad-kiss,kiss,,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019243,600,datagram,,2048,true,25.599,4800.130,0,25.599,355,0,0,0x6887c6a5
 ```
 
-A run whose integrity probe failed before any coppad started records no
-trial. Each such run index was retried once:
+Attempts that do not count:
 
-- ARDOP run 2 at 08:37:56 on cores 2,3
-
-Batches that do not count:
-
+- The round's first attempt, 12:43:53 UTC, on the same binary, with the
+  same two streams pinned to cores 2,3 and 4,5. ARDOP 1 to 4 and
+  VARA-style 1 to 3 passed. VARA-style run 4, started at 12:48:15, failed
+  its integrity probe (correlation 0.998959, level -0.01 dB, 0 starved, 0
+  overflow), so neither stream started another run. ARDOP run 4, started
+  at the same moment, finished `complete` with 2048 bytes exact. In the
+  kept `probe.raw`, the
+  probe's first 960-sample block (20 ms) arrived at capture offset 960,
+  about 335 ms ahead of the rest. The other 479,040 samples arrived
+  bit-exact at the usual 355 ms lead. The analysis aligns on the bulk and
+  scores the first block as silence. Every sample arrived bit-exact, but
+  the first block arrived early. The suspected cause is the probe child's
+  sink letting its first write out before the output stream had built its
+  latency. COP-253 tracks this probe race and is to confirm the cause.
+- The first matrix, from 08:36:29 UTC, on binary
+  `5d6bdf085634d75e21006f3441f75840e34635ddbeabcf0f59a69967ac0ae594`.
+  Its 30 kept rows, listed in this page as of commit `7d07cc3`, were all
+  exact: ARDOP 10 `complete`, VARA-style 10 `complete` and KISS 10
+  `datagram`. ARDOP ran on cores 2,3, first serially and then beside a
+  second stream on cores 4,5. ARDOP run 2, started at 08:37:56, failed its
+  probe with the same correlation, 0.998959, and that run index was
+  retried at 08:38:09. AC1 counts a failed probe as a failed matrix, so validation
+  rejected this matrix.
 - 08:31:39 UTC, unpinned on 6 CPUs: ARDOP run 1 was `complete` (2048
   bytes, exact, trial wall 58.599 s). The batch was stopped during run 2
   to switch to two-core pinning.
 - 08:34:04 UTC, pinned to cores 0,1: run 1's integrity probe failed
   (correlation 0.998959, level -0.01 dB, no trial recorded).
-- The serial stream on cores 2,3 was stopped after ARDOP run 3 so the
-  remaining runs could use two core pairs. ARDOP run 4 had already started
-  and finished normally, so it counts.
 
 ### Patched trace
 
@@ -240,12 +273,12 @@ seed, WGN 30 dB and 2048-byte payload, with fresh output and scratch
 directories. ARDOP returned `complete`, 2048 exact, in 58.662 s;
 VARA-style returned `complete`, 2048 exact, in 58.576 s; and KISS
 returned `datagram`, 2048 exact, in 25.519 s. The fresh binary hash is
-different from the earlier matrix hash, so these smoke rows are separate
+different from both matrix hashes, so these smoke rows are separate
 evidence and do not replace any of the 30 matrix rows.
 
 One debug-logged ARDOP run on the patched binary
 (`RUST_LOG=info,coppad::event_loop=debug,coppa_protocol=debug`, cores 2,3,
-08:34:24 UTC, before the qualifying matrix) was `complete` with 2048
+08:34:24 UTC, before the first matrix) was `complete` with 2048
 bytes, exact, trial wall 58.643 s. Station A's log shows the four
 segments with no retransmission, no 8000 ms floor frame and no clipping
 warning:
@@ -309,3 +342,10 @@ issue ID `56e0272a-76d7-4fa4-8436-42af6e828684`).
   Decode time grows with load and the allowance covers 0.65 s of it past
   the latest measured decode.
 - A natural `cap` row from a stalled run at this base.
+- The patched binary under the baseline's 2-CPU cgroup. The qualifying
+  matrix ran unpinned, two streams sharing a 6-CPU quota on a busy shared
+  host, so each pair could use more than 2 CPUs. Decode time grows as CPU
+  shrinks, so these 30 rows are weaker evidence for a 2-CPU host than a
+  2-CPU run would be. Every transfer in the earlier pinned runs (two
+  cores each) delivered 2048 bytes exactly, but those runs do not count,
+  as listed above.

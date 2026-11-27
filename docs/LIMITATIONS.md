@@ -633,8 +633,12 @@ stall scenario does (`docs/testing/bpq-session.md`).
   the black-box cable, coppad resent a level-2 eight-codeword frame just
   before it processed the frame's ACK: the 12.341 s timeout had no term for
   decode or audio-path latency, and the ACK was decoded 12.60 to 12.69 s
-  after the send. The duplicate cost the next segment, the session fell
-  back to the floor, and the trial ran to the 600 s cap. coppad now adds a
+  after the send. The duplicate cost the next segment and the session fell
+  back to the floor. The research traces were stopped at 300 s, so for
+  them running to the 600 s cap is inferred from the floor's ~18 s
+  fragment exchanges. The COP-236 report's cap rows (512 and 517 bytes
+  delivered) are evidence of the original symptom; no trace ties them to
+  this race. coppad now adds a
   fixed 1 s to the OFDM segment floor (`SESSION_ACK_PROCESSING_ALLOWANCE`),
   0.65 s past the latest measured decode. It does not scale with level,
   codeword count or host load, so a slower decode can reopen the race, and
@@ -642,7 +646,12 @@ stall scenario does (`docs/testing/bpq-session.md`).
   unit-amplitude 16-FSK tones with no peak normalization: they leave at
   0.0 dBFS peak and -3.0 dBFS RMS, not the -6.02 dBFS peak of OFDM frames,
   and each one logs the TX clipping warning. The follow-up ticket filed
-  with COP-236 tracks the floor level. See
+  with COP-236 tracks the floor level. The black-box integrity probe can
+  also fail on its own, before any coppad starts: in 3 of about 50 probes
+  on runs pinned to two cores (and none of the 30 unpinned matrix
+  probes), its first 20 ms block arrived about 335 ms early and scored
+  correlation 0.998959. A failed probe fails the
+  COP-236 release matrix; COP-253 tracks it. See
   [the COP-236 record](testing/blackbox-cop236.md).
 
 - **`coppa-bench compare` publishes coppa rows only, with 8 trials in each of its 42 cells.** [docs/benchmarks/comparison.md](benchmarks/comparison.md) holds 8 trials per cell of the `link-l2` row (library `Link`, level 2, floor off) on WGN, MPG and MPP at 30 to 0 dB, for 2 KB and 16 KB transfers. COP-215 recorded the fading 16 KB cells, so the bare `compare` runs no trial on the committed data. With 8 trials a cell's 95% interval is wide wherever trials vary. The numbers come from two library `Link`s in virtual time, not from coppad, and the two stacks were seen to disagree under fading during COP-170 research. The runner writes the payload at the caller's CONNECTED, which avoids the half-open state that waiting for both ends hits under fading (COP-169 section). Each row's SNR reference is the clean frame power at that row's level, so rows at different levels see different absolute noise at one SNR label. The page's numbers were recorded on Linux x86_64 and are bit-reproducible there only. COP-214 adds a Linux ALSA FIFO black-box harness with an integrity probe and VARA-style, ARDOP and KISS adapters. The published self-test uses two unmodified coppad processes; its real-time results can vary with scheduling. The KISS adapter sends a datagram only while fewer than eight, coppad's queue depth, are unaccounted for at the receiver, and presumes the oldest lost after 60 s with nothing received. A KISS modem with a shorter queue, or one that pauses or takes longer than 60 s to send a datagram, can still drop datagrams before they reach the channel. The Watterson cross-check is now recorded in `results/compare/channel-check.csv` (COP-214): Good, Moderate and Poor met the delay, path-power, Doppler and 3 kHz noise tolerances at 48 kHz. The documented codec2 Poor delay is 1 ms, half coppa MPP's 2 ms; PathSim defines no matching preset delay, so its offset is not measured.
