@@ -16,11 +16,18 @@ Older releases have no entry here. Their on-air breaks are listed in
 
 ## Unreleased: 0.18.0
 
+<<<<<<< HEAD
 - COP-246: coppad decodes received frames and runs the floor detector on a
   worker task while its event loop drains the audio input ring. A decode slower
   than the default ring no longer drops the next frame under CPU contention.
   `coppa-engine` adds the `ReceiveHalf` take/put API for moving receive DSP.
 
+=======
+- COP-248: a coppad dial that keys one request (`RETRIES 0`, or a pinned
+  speed level with `RETRIES` unset) now times out 30 s after that request
+  keys, as `docs/HOST-API.md` states. Before, its timeout ran from
+  `CONNECT`, so a busy-channel wait shortened it.
+>>>>>>> 3ade4f71e2160452b377fdd3f966611e5f49df9a
 - COP-227: `coppa-bench compare blackbox` records each trial's payload CRC-32
   as a last `payload_crc32` column and refuses to resume into a CSV without it
   or with another payload. Stream trials count `delivered_bytes` only up to

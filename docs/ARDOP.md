@@ -72,7 +72,8 @@ command answers `FAULT <text>`.
 Unsolicited notifications: `NEWSTATE <state> ` (note the trailing space,
 preserved for byte-compatibility with real TNCs), `TARGET <local-call>` (a pending
 inbound request — **required before `CONNECTED` for Pat's listen mode**;
-a pending inbound that is cancelled or abandoned ends in a terminal
+a pending inbound that is cancelled or abandoned, including by the host's
+`LISTEN FALSE` (COP-247), ends in a terminal
 `DISCONNECTED` + `NEWSTATE DISC `, because wl2k-go's listener clears its
 remembered target only on `DISCONNECTED`/`CANCELPENDING`, never on
 `NEWSTATE`),
@@ -96,7 +97,7 @@ session flow):
 | `CODEC TRUE/FALSE` | echo (coppa models no codec gate) |
 | `PROTOCOLMODE ARQ` | echo |
 | `ARQTIMEOUT <s>` | echo, recorded — **does not change coppa's retry budget** (COP-38) |
-| `LISTEN TRUE/FALSE` | echo, applied (answers inbound connects) |
+| `LISTEN TRUE/FALSE` | echo, applied (answers inbound connects); `FALSE` also ends a pending inbound attempt with `DISCONNECTED` + `NEWSTATE DISC ` after the echo, leaving an established session or an outbound dial alone (COP-247) |
 | `MYCALL [<call>]` | set: echo, applied to the station-ID gate; query: `MYCALL <call>`; invalid → `WRONG` |
 | `GRIDSQUARE <grid>` | echo, stored, unused by ARQ |
 | `ARQBW [<bw>]` | set: echo, stored per client as a label; query: `ARQBW <bw>` |

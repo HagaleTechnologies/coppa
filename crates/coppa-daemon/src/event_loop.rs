@@ -5698,15 +5698,19 @@ impl EventLoop {
                                                 .tx_keyed_since
                                                 .map(|t| t.into_std())
                                                 .unwrap_or_else(clock_now);
-                                            if retries > 0 && sent > 0 {
-                                                // COP-210: the reaper measures the
-                                                // staggered repeat from key-up, as
-                                                // `repeat_pending_dial` does, not
-                                                // from before a busy-channel wait.
+                                            if sent > 0 {
+                                                // COP-210/COP-248: the handshake
+                                                // timeout runs from key-up, not from
+                                                // before a busy-channel wait, for a
+                                                // one-request dial as for one with
+                                                // repeats (the reaper also measures
+                                                // the staggered repeat from here).
                                                 if let Some(session) = self.session_mgr.get_mut(id)
                                                 {
                                                     session.touch(keyed);
                                                 }
+                                            }
+                                            if retries > 0 && sent > 0 {
                                                 let sr = self.engine.config().sample_rate as f64;
                                                 let mut interval = coppa_protocol::session::connect_req_retry_interval(
                                                     Duration::from_secs_f64(samples.len() as f64 / sr),
@@ -5968,13 +5972,30 @@ impl EventLoop {
             }
             ArdopCommand::Listen(on) => {
                 self.listening = on;
+                // COP-84: reply first, then the effects it causes.
+                self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
+                    .await;
                 if on {
                     tracing::info!("Listening for incoming connections");
                 } else {
-                    tracing::info!("Stopped listening for incoming connections");
+                    // COP-247: the ARDOP twin of the VARA `LISTEN OFF` arm. End
+                    // every host-pending inbound attempt silently (no DISCONNECT
+                    // frame on air, as the reaper does) and tell the host with
+                    // the `PendingCancelled` pair `DISCONNECTED` + `NEWSTATE DISC`.
+                    let pending: Vec<_> = self
+                        .session_mgr
+                        .active_sessions()
+                        .into_iter()
+                        .filter(|&id| self.host_pending(id))
+                        .collect();
+                    for id in pending {
+                        self.discard_session_tx(id).await;
+                        self.session_mgr.remove(id);
+                        self.notify_session(client_id, SessionNotice::PendingCancelled)
+                            .await;
+                    }
+                    tracing::info!("LISTEN FALSE ended any pending inbound attempt");
                 }
-                self.reply_ardop(client_id, ArdopResponse::Echo(line.to_string()))
-                    .await;
             }
             ArdopCommand::MyCall(call) => match Callsign::new(&call) {
                 Ok(callsign) => {
@@ -9860,6 +9881,181 @@ mod tests {
             .any(|r| matches!(r,VaraResponse::Connected(_,ref dest,_) if dest=="N0GW-1")));
         cop172_command(&mut b, 1, "MYCALL N0GW").await;
         assert!(b.extra_callsigns.is_empty());
+    }
+
+    /// COP-247: station "N0GW" driven by an ARDOP host on client 1, with
+    /// `INITIALIZE` and `MYCALL N0GW` already sent and their echoes drained.
+    #[cfg(feature = "ardop")]
+    async fn cop247_ardop_station() -> (
+        EventLoop,
+        coppa_audio::AudioRingConsumer,
+        mpsc::Receiver<coppa_host::ardop::ArdopResponse>,
+    ) {
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "N0GW".into();
+        config.radio.ptt_pre_delay_ms = 0;
+        config.radio.ptt_tail_delay_ms = 0;
+        let mut station = EventLoop::new(config).unwrap();
+        let (producer, consumer) = coppa_audio::audio_ring(1_000_000);
+        station.set_audio_out(producer);
+        let (tx, mut rx) = mpsc::channel(1024);
+        station.set_ardop_responses(Arc::new(Mutex::new(HashMap::from([(1u32, tx)]))));
+        station.handle_ardop_command(1, "INITIALIZE").await;
+        station.handle_ardop_command(1, "MYCALL N0GW").await;
+        let _ = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        (station, consumer, rx)
+    }
+
+    /// COP-247 (AC1): the ARDOP twin of COP-172's `LISTEN OFF`. While an
+    /// inbound attempt is pending for the ARDOP host, `LISTEN FALSE` ends it:
+    /// the echo comes first, then `DISCONNECTED` + `NEWSTATE DISC`, the session
+    /// is gone, and the caller's late confirmation yields no `CONNECTED`.
+    #[cfg(feature = "ardop")]
+    #[tokio::test(start_paused = true)]
+    async fn cop247_ardop_listen_false_cancels_a_pending_inbound_attempt() {
+        use coppa_host::ardop::ArdopResponse;
+
+        let (mut b, mut b_audio, mut b_rx) = cop247_ardop_station().await;
+        b.handle_ardop_command(1, "LISTEN TRUE").await;
+        let _ = std::iter::from_fn(|| b_rx.try_recv().ok()).collect::<Vec<_>>();
+
+        // A: the VARA-driven caller (the COP-172 pattern).
+        let (mut a, mut a_audio, _a_rx) = cop172_station("N1CALL");
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "N1CALL".into(),
+            destination: "N0GW".into(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_audio, "request"))
+            .await;
+        a.decode_and_dispatch_audio(&take_leg(&mut b_audio, "ack"))
+            .await;
+        let pending_id = *b
+            .session_mgr
+            .active_sessions()
+            .first()
+            .expect("pending session");
+        assert!(b.host_pending(pending_id));
+
+        // The ARDOP host sends LISTEN FALSE.
+        b.handle_ardop_command(1, "LISTEN FALSE").await;
+        let lines: Vec<_> = std::iter::from_fn(|| b_rx.try_recv().ok()).collect();
+        // Echo first, then the terminal notification in ARDOP vocabulary.
+        // PTT/BUSY telemetry may interleave, so assert membership and
+        // relative order, not an exact sequence.
+        let echo_at = lines
+            .iter()
+            .position(|r| matches!(r, ArdopResponse::Echo(l) if l == "LISTEN FALSE"))
+            .expect("the echo ack");
+        let disc_at = lines
+            .iter()
+            .position(|r| matches!(r, ArdopResponse::Disconnected))
+            .expect("DISCONNECTED after LISTEN FALSE");
+        let newstate_at = lines
+            .iter()
+            .position(|r| matches!(r, ArdopResponse::NewState(s) if s == "DISC"))
+            .expect("NEWSTATE DISC after LISTEN FALSE");
+        assert!(echo_at < disc_at && disc_at < newstate_at, "{lines:?}");
+        assert!(
+            !lines
+                .iter()
+                .any(|r| matches!(r, ArdopResponse::Connected(_, _))),
+            "{lines:?}"
+        );
+        assert!(b.session_mgr.active_sessions().is_empty());
+
+        // The caller's late confirmation is refused.
+        b.decode_and_dispatch_audio(&take_leg(&mut a_audio, "confirmation"))
+            .await;
+        assert!(b.session_mgr.active_sessions().is_empty());
+        let late: Vec<_> = std::iter::from_fn(|| b_rx.try_recv().ok()).collect();
+        assert!(late.is_empty(), "no CONNECTED after cancellation: {late:?}");
+    }
+
+    /// COP-247 (AC2): `LISTEN FALSE` leaves an established session alone. Pat's
+    /// `Close()` sends `LISTEN FALSE` and `DISCONNECT` together, so ending the
+    /// live session here would race the host's own disconnect.
+    #[cfg(feature = "ardop")]
+    #[tokio::test(start_paused = true)]
+    async fn cop247_ardop_listen_false_leaves_an_established_session_alone() {
+        use coppa_host::ardop::ArdopResponse;
+
+        let (mut b, mut b_audio, mut b_rx) = cop247_ardop_station().await;
+        b.handle_ardop_command(1, "LISTEN TRUE").await;
+
+        let (mut a, mut a_audio, _a_rx) = cop172_station("N1CALL");
+        a.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "N1CALL".into(),
+            destination: "N0GW".into(),
+        })
+        .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_audio, "request"))
+            .await;
+        a.decode_and_dispatch_audio(&take_leg(&mut b_audio, "ack"))
+            .await;
+        b.decode_and_dispatch_audio(&take_leg(&mut a_audio, "confirmation"))
+            .await;
+        let id = *b
+            .session_mgr
+            .active_sessions()
+            .first()
+            .expect("established session");
+        assert!(b.session_mgr.get(id).unwrap().is_established());
+        let _ = std::iter::from_fn(|| b_rx.try_recv().ok()).collect::<Vec<_>>();
+
+        b.handle_ardop_command(1, "LISTEN FALSE").await;
+        let lines: Vec<_> = std::iter::from_fn(|| b_rx.try_recv().ok()).collect();
+        assert_eq!(lines, vec![ArdopResponse::Echo("LISTEN FALSE".into())]);
+        assert!(b.session_mgr.get(id).unwrap().is_established());
+    }
+
+    /// COP-247 (AC3): `LISTEN FALSE` leaves an outbound dial alone: the dial is
+    /// `Connecting`, not host-pending, so it stays and no terminal pair is sent.
+    #[cfg(feature = "ardop")]
+    #[tokio::test(start_paused = true)]
+    async fn cop247_ardop_listen_false_leaves_an_outbound_dial_alone() {
+        use coppa_host::ardop::ArdopResponse;
+
+        let (mut b, _b_audio, mut b_rx) = cop247_ardop_station().await;
+        b.handle_host_event(HostEvent::ConnectRequest {
+            client_id: 1,
+            source: "N0GW".into(),
+            destination: "N1CALL".into(),
+        })
+        .await;
+        let id = *b
+            .session_mgr
+            .active_sessions()
+            .first()
+            .expect("outbound dial");
+        assert_eq!(
+            b.session_mgr.get(id).unwrap().state,
+            SessionState::Connecting
+        );
+        assert!(!b.host_pending(id));
+
+        b.handle_ardop_command(1, "LISTEN FALSE").await;
+        // The dial's own `PTT TRUE` telemetry interleaves, so assert
+        // membership, not an exact sequence.
+        let lines: Vec<_> = std::iter::from_fn(|| b_rx.try_recv().ok()).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|r| matches!(r, ArdopResponse::Echo(l) if l == "LISTEN FALSE")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|r| matches!(r, ArdopResponse::Disconnected | ArdopResponse::NewState(_))),
+            "{lines:?}"
+        );
+        assert_eq!(
+            b.session_mgr.get(id).unwrap().state,
+            SessionState::Connecting
+        );
     }
     #[test]
     fn rate_loop_caps_peer_recommendations_at_the_engine_band_limit() {
@@ -27343,6 +27539,78 @@ mod tests {
                 a.session_mgr.active_sessions().is_empty(),
                 "an unanswered dial must be reaped after the virtual handshake timeout"
             );
+        }
+
+        /// COP-248: a dial that keys one request times out 30 s after that request
+        /// keys, not 30 s after CONNECT, when it first waits out a busy channel. Both
+        /// single-request forms: a pinned speed level with RETRIES unset, and an Auto
+        /// level with RETRIES 0.
+        #[tokio::test(start_paused = true)]
+        async fn single_request_dial_times_out_from_key_up_after_busy_wait() {
+            for pinned in [true, false] {
+                let mut config = DaemonConfig::default();
+                config.engine.callsign = "VK3ABC".into();
+                config.radio.ptt_pre_delay_ms = 0;
+                config.radio.ptt_tail_delay_ms = 0;
+                config.station_id.busy_hold_ms = 10;
+                let mut a = EventLoop::new(config).unwrap();
+                a.listening = true;
+                if pinned {
+                    a.manual_speed_level = Some(a.engine.speed_level());
+                } else {
+                    a.vara_clients.entry(1).or_default().connect_retries = Some(0);
+                }
+                let (a_producer, _a_consumer) = coppa_audio::audio_ring(4_000_000);
+                a.set_audio_out(a_producer);
+                let (mut air_in, air_in_rx) = coppa_audio::audio_ring(1_000_000);
+                a.set_audio_in(air_in_rx);
+                // The channel reads busy at CONNECT...
+                let mut counter = 1u32;
+                for _ in 0..10 {
+                    a.busy_gate.observe(&cop172_noise(0.01, &mut counter));
+                }
+                for _ in 0..busy_burst_blocks(&a.busy_gate) {
+                    a.busy_gate.observe(&cop172_noise(0.5, &mut counter));
+                }
+                assert!(a.busy_gate.current());
+                let dialed = tokio::time::Instant::now();
+                let busy_for = Duration::from_secs(20);
+                // ...and only goes quiet 20 s later. A steady loud occupant would
+                // read clear within a second as the gate's floor adapts.
+                let channel = async {
+                    tokio::time::sleep(busy_for).await;
+                    for _ in 0..15 {
+                        air_in.write(&cop172_noise(0.01, &mut counter));
+                    }
+                    std::future::pending::<()>().await
+                };
+                tokio::select! {
+                    _ = a.handle_host_event(HostEvent::ConnectRequest {
+                        client_id: 1,
+                        source: "VK3ABC".into(),
+                        destination: "W1AW".into(),
+                    }) => {}
+                    _ = channel => unreachable!(),
+                }
+                let keyed = a.tx_keyed_since.expect("the request keyed");
+                assert!(keyed - dialed >= busy_for, "pinned={pinned}");
+                assert!(a.pending_dial.is_none(), "pinned={pinned}: one request");
+                let until = keyed + Duration::from_millis(29_900);
+                tokio::time::advance(until.saturating_duration_since(tokio::time::Instant::now()))
+                    .await;
+                a.reap_timed_out_sessions().await;
+                assert_eq!(
+                    a.session_mgr.active_sessions().len(),
+                    1,
+                    "pinned={pinned}: reaped before key-up + 30 s"
+                );
+                tokio::time::advance(Duration::from_millis(200)).await;
+                a.reap_timed_out_sessions().await;
+                assert!(
+                    a.session_mgr.active_sessions().is_empty(),
+                    "pinned={pinned}: still alive after key-up + 30 s"
+                );
+            }
         }
     }
 

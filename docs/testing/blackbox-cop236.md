@@ -3,8 +3,10 @@
 This page records the evidence for COP-236. Two release `coppad`
 processes on the COP-214 black-box cable sometimes stopped a 2048-byte
 transfer after the first 512-byte segment and ran to the 600 s cap. It
-gives the cause, the timer change, the release matrix the change was
-accepted on, and why a stalled run logs `TX audio is clipping`.
+gives the cause, the timer change, the release runs, and why a stalled
+run logs `TX audio is clipping`. No recorded batch qualifies as COP-236's
+release matrix, so release acceptance is unproven. The 30-run batch under
+"Release matrix" is supporting evidence only.
 
 ## Cause
 
@@ -113,11 +115,22 @@ and the 15 floor recovery tests
 
 ## Release matrix
 
-The qualifying matrix is the second attempt of the remediation round, on
-one release build of the patched tree (`7d07cc3`). The first matrix and
-the round's first attempt each had an integrity probe fail, which AC1
-counts as a failed matrix. Both are listed under "Attempts that do not
-count" below. The build and every run used a Linux container with a
+No recorded batch qualifies as the release matrix, so COP-236's release
+acceptance is unproven. A failed integrity probe, like any other failed
+check, ends the matrix for the binary it ran on. A new matrix needs a new
+build after a code correction, and a later successful restart on the same
+binary cannot qualify it.
+
+The 30 rows below are supporting evidence, not a qualifying matrix. They
+are the second attempt on one release build of the patched tree
+(`7d07cc3`), whose SHA-256 is printed below. The first attempt on that
+same binary failed: VARA-style run 4's integrity probe failed at
+12:48:15 UTC (the first entry under "Failed and stopped attempts"
+below). That failure ended the matrix for this binary. The second attempt
+restarted on it at 12:52:16 UTC with core pinning dropped and no code
+change, so its 30 passes cannot qualify it. The first matrix, on another
+binary, also had a failed probe and is listed below too. The build and
+every run used a Linux container with a
 6-CPU cgroup quota (`cpu.max = 600000 100000`, `nproc` 32) on a shared
 host: load average 6 to 11, and every core 20 to 57% busy with other work
 just before this attempt. A 2-CPU quota could not be set here, because
@@ -130,8 +143,8 @@ cargo build --release -p coppa-bench -p coppa-daemon \
 
 `target/release/coppad --version` printed `coppad 0.18.0`. Its SHA-256,
 `3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a`, is the
-`binary_sha256` of every row below. Each run had fresh directories and
-default logging:
+`binary_sha256` of every row below. The same binary ran the failed first
+attempt. Each run had fresh directories and default logging:
 
 ```sh
 env -u RUST_LOG TMPDIR="$run_dir/tmp" timeout --kill-after=10s 720s \
@@ -144,18 +157,18 @@ env -u RUST_LOG TMPDIR="$run_dir/tmp" timeout --kill-after=10s 720s \
 A row passes only with exit status 0, outcome `complete` (ARDOP,
 VARA-style) or `datagram` (KISS), 2048 bytes delivered, `exact = true`,
 channel `wgn`, SNR 30, seed `0x17000000`, cap 600 s,
-`payload_crc32 = 0x6887c6a5`, and 0 starved and 0 overflow ticks. The
-script never retried a run index, and after any failed check, a failed
-probe included, neither stream started another run; a run already in
-flight would have finished. Two streams ran at
+`payload_crc32 = 0x6887c6a5`, and 0 starved and 0 overflow ticks. Within
+this attempt, the script never retried a run index, and after any failed
+check, a failed probe included, neither stream started another run; a
+run already in flight would have finished. Two streams ran at
 once from 12:52:16 UTC: stream A took ARDOP 1 to 10 and then KISS 1 to 5,
 and stream B took VARA-style 1 to 10 and then KISS 6 to 10. The runs were
 not pinned to cores. All three probe failures seen on this host were in
 runs pinned to two cores, so this attempt dropped the pinning; that link
 is suggestive, not shown. The two streams shared the 6-CPU quota, so
 each pair could use more CPU than the 2-CPU cgroup where the baseline
-stalled (see "Not shown"). No build or test job overlapped a qualifying
-run.
+stalled (see "Not shown"). No build or test job overlapped any of these
+30 runs.
 
 Result: ARDOP 10 of 10 `complete`, VARA-style 10 of 10 `complete` and
 KISS 10 of 10 `datagram`, each with exit status 0 and all 2048 bytes
@@ -233,14 +246,18 @@ coppad-kiss,9,coppad-kiss,kiss,,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d21
 coppad-kiss,10,coppad-kiss,kiss,,3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a,HF_STANDARD,wgn,30,2048,0,0x17000000,0.019621,0.019243,600,datagram,,2048,true,25.599,4800.130,0,25.599,355,0,0,0x6887c6a5
 ```
 
-Attempts that do not count:
+Failed and stopped attempts:
 
-- The round's first attempt, 12:43:53 UTC, on the same binary, with the
+- The first attempt on binary
+  `3a91780c82cecd2475d492b12a1b236a7823ebfb62a99d216b3393e6e61ff43a`, the
+  binary of the 30 supporting rows above, from 12:43:53 UTC, with the
   same two streams pinned to cores 2,3 and 4,5. ARDOP 1 to 4 and
-  VARA-style 1 to 3 passed. VARA-style run 4, started at 12:48:15, failed
-  its integrity probe (correlation 0.998959, level -0.01 dB, 0 starved, 0
-  overflow), so neither stream started another run. ARDOP run 4, started
-  at the same moment, finished `complete` with 2048 bytes exact. In the
+  VARA-style 1 to 3 passed. VARA-style run 4, started at 12:48:15 UTC,
+  failed its integrity probe (correlation 0.998959, level -0.01 dB, 0
+  starved, 0 overflow), so neither stream started another run. That
+  failed probe ended the matrix for this binary, so the restart at
+  12:52:16 UTC is supporting evidence only. ARDOP run 4, also started
+  at 12:48:15 UTC, finished `complete` with 2048 bytes exact. In the
   kept `probe.raw`, the
   probe's first 960-sample block (20 ms) arrived at capture offset 960,
   about 335 ms ahead of the rest. The other 479,040 samples arrived
@@ -256,7 +273,8 @@ Attempts that do not count:
   `datagram`. ARDOP ran on cores 2,3, first serially and then beside a
   second stream on cores 4,5. ARDOP run 2, started at 08:37:56, failed its
   probe with the same correlation, 0.998959, and that run index was
-  retried at 08:38:09. AC1 counts a failed probe as a failed matrix, so validation
+  retried at 08:38:09. A failed probe ends the matrix for that binary,
+  and a retried run index cannot replace the failed run, so validation
   rejected this matrix.
 - 08:31:39 UTC, unpinned on 6 CPUs: ARDOP run 1 was `complete` (2048
   bytes, exact, trial wall 58.599 s). The batch was stopped during run 2
@@ -273,8 +291,8 @@ seed, WGN 30 dB and 2048-byte payload, with fresh output and scratch
 directories. ARDOP returned `complete`, 2048 exact, in 58.662 s;
 VARA-style returned `complete`, 2048 exact, in 58.576 s; and KISS
 returned `datagram`, 2048 exact, in 25.519 s. The fresh binary hash is
-different from both matrix hashes, so these smoke rows are separate
-evidence and do not replace any of the 30 matrix rows.
+different from both earlier batch hashes, so these smoke rows are
+separate evidence and do not replace any of the 30 supporting rows.
 
 One debug-logged ARDOP run on the patched binary
 (`RUST_LOG=info,coppad::event_loop=debug,coppa_protocol=debug`, cores 2,3,
@@ -342,10 +360,14 @@ issue ID `56e0272a-76d7-4fa4-8436-42af6e828684`).
   Decode time grows with load and the allowance covers 0.65 s of it past
   the latest measured decode.
 - A natural `cap` row from a stalled run at this base.
-- The patched binary under the baseline's 2-CPU cgroup. The qualifying
-  matrix ran unpinned, two streams sharing a 6-CPU quota on a busy shared
-  host, so each pair could use more than 2 CPUs. Decode time grows as CPU
-  shrinks, so these 30 rows are weaker evidence for a 2-CPU host than a
-  2-CPU run would be. Every transfer in the earlier pinned runs (two
-  cores each) delivered 2048 bytes exactly, but those runs do not count,
-  as listed above.
+- A qualifying release matrix. No recorded batch qualifies. The first
+  matrix retried a run index after a failed probe. The 30 supporting rows
+  restarted on binary `3a91780c...`, whose first attempt had failed its
+  probe at 12:48:15 UTC. COP-236's release acceptance stays unproven.
+- The patched binary under the baseline's 2-CPU cgroup. The 30
+  supporting rows ran unpinned, two streams sharing a 6-CPU quota on a
+  busy shared host, so each pair could use more than 2 CPUs. Decode time
+  grows as CPU shrinks, so these 30 rows are weaker evidence for a 2-CPU
+  host than a 2-CPU run would be. Every transfer in the earlier pinned
+  runs (two cores each) delivered 2048 bytes exactly, but none of those
+  runs qualifies either, as listed above.
