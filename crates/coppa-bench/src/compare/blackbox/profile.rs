@@ -1,5 +1,6 @@
 //! Declarative description of an unmodified modem binary.
 
+use super::native::NativeFormat;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,25 @@ pub struct Profile {
     pub ports: Ports,
     pub files: Vec<StationFile>,
     pub datagram_bytes: Option<usize>,
+    /// COP-221: the format the modem opens its ALSA device in. Optional for
+    /// serde so that `load` can name a missing key and its supported values.
+    #[serde(default)]
+    pub audio: Audio,
+}
+
+/// A profile's `[audio]` table, checked by [`Audio::native`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Audio {
+    pub format: Option<String>,
+    pub rate: Option<u32>,
+    pub channels: Option<u32>,
+}
+
+impl Audio {
+    pub fn native(&self) -> Result<NativeFormat> {
+        NativeFormat::declared(self.format.as_deref(), self.rate, self.channels)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +71,10 @@ impl Profile {
         if profile.adapter == "kiss" && profile.datagram_bytes.is_none() {
             bail!("kiss adapter requires datagram_bytes");
         }
+        profile
+            .audio
+            .native()
+            .with_context(|| format!("checking {}", path.display()))?;
         Ok(profile)
     }
 
@@ -128,11 +152,57 @@ mod tests {
     #[test]
     fn shipped_profiles_parse() {
         for name in ["coppad", "coppad-ardop", "coppad-kiss"] {
-            Profile::load(
+            let profile = Profile::load(
                 &super::super::super::repo_root().join(format!("tools/compare/{name}.toml")),
             )
             .unwrap();
+            // AC3: every coppad profile declares what coppad opens.
+            assert_eq!(profile.audio.native().unwrap(), NativeFormat::CHANNEL);
         }
+    }
+
+    fn load_with_audio(name: &str, audio: &str) -> String {
+        let source = std::fs::read_to_string(
+            super::super::super::repo_root().join("tools/compare/coppad.toml"),
+        )
+        .unwrap();
+        let start = source.find("\n[audio]\nformat").unwrap();
+        let end = start + 1 + source[start + 1..].find("\n\n").unwrap();
+        let source = format!("{}{}{}", &source[..start], audio, &source[end..]);
+        let dir = std::env::temp_dir().join(format!("coppa-profile-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("profile.toml");
+        std::fs::write(&path, source).unwrap();
+        let result = Profile::load(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        format!("{:#}", result.unwrap_err())
+    }
+
+    /// AC2: a profile with no format, or one the cable cannot carry, is
+    /// refused at load with the key and the values it accepts.
+    #[test]
+    fn undeclared_or_unsupported_audio_is_refused_by_key() {
+        let error = load_with_audio("undeclared", "\n");
+        assert!(error.contains("audio.format is undeclared"), "{error}");
+        assert!(error.contains("supported values: f32le, s16le"), "{error}");
+        let error = load_with_audio(
+            "unsupported",
+            "\n[audio]\nformat = \"u8\"\nrate = 48000\nchannels = 1\n",
+        );
+        assert!(
+            error.contains("audio.format \"u8\" is unsupported"),
+            "{error}"
+        );
+        assert!(error.contains("supported values: f32le, s16le"), "{error}");
+        let error = load_with_audio(
+            "rate",
+            "\n[audio]\nformat = \"s16le\"\nrate = 11025\nchannels = 1\n",
+        );
+        assert!(error.contains("audio.rate 11025 is unsupported"), "{error}");
+        assert!(
+            error.contains("supported values: 8000, 12000, 16000, 24000, 48000"),
+            "{error}"
+        );
     }
 
     /// COP-244: KISS datagrams are never resent, so each coppad's receive ring
@@ -192,6 +262,7 @@ mod tests {
             },
             files: vec![],
             datagram_bytes: None,
+            audio: Audio::default(),
         };
         assert!(p
             .verify_binary()

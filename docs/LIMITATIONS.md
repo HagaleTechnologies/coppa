@@ -593,14 +593,27 @@ stall scenario does (`docs/testing/bpq-session.md`).
 
 ## COP-170 same-simulator comparison (first slice)
 
-- **COP-214 black-box cable limits.** The Linux ALSA FIFO cable accepts f32le,
-  48 kHz, mono audio. The COP-214 planning probe found that ALSA `plug`
-  conversion at 12, 8 and 44.1 kHz gave RMS ratios of 0.772, 0.773 and
-  0.744, with about one third of samples zeroed. The f32 path passed the
-  integrity probe with correlation 1.000000, level error +0.00 dB and about
-  355 ms cable lead. Real-time trials keep fixed channel seeds but scheduling
-  can change their results. Other native audio formats are tracked by the
-  follow-up ticket filed with COP-214. PathSim's delay offset is not measured.
+- **COP-214 black-box cable limits.** The Linux ALSA FIFO cable is a bare
+  `file` PCM in the format a profile's `[audio]` table declares: `f32le` or
+  `s16le`, mono, at 8000, 12000, 16000, 24000 or 48000 Hz (COP-221). The
+  relay converts to the channel's f32 48 kHz with integer-factor linear-phase
+  FIR filters, so 44.1 kHz and other rates that do not divide 48000 are
+  refused. The COP-214 planning probe found that ALSA `plug` conversion at
+  12, 8 and 44.1 kHz gave RMS ratios of 0.772, 0.773 and 0.744, with about
+  one third of samples zeroed, which is why the relay converts instead. The
+  f32 path passed the integrity probe with correlation 1.000000, level error
+  +0.00 dB and about 355 ms cable lead. In the COP-221 implement container
+  the probe, opened in the declared format, printed correlation 1.000000 for
+  s16le at 8000, 12000 and 48000 Hz and f32le at 24000 Hz, with leads of
+  80 to 322 ms. Below 48 kHz the probe is noise limited to 0.35 of the rate,
+  and the conversion passband ends near 0.38 of it, so a modem that puts
+  energy closer to its Nyquist edge loses some of it. Each native FIFO is
+  resized to hold about as much time as the f32 one; that needs Linux 2.6.35
+  or later. No non-coppad modem has run a trial through the native cable yet.
+  The f32 probe still builds its signal after starting the streams: in the
+  same container, writing from the first callback lost about 1000 samples and
+  gave correlation 0.998959. Real-time trials keep fixed channel seeds but
+  scheduling can change their results. PathSim's delay offset is not measured.
   The six published self-test rows counted starved and overflow ticks from
   the payload write, so each trial's roughly 7 s connect is outside their
   counts. That includes COP-227's re-record, which ran before COP-224 moved

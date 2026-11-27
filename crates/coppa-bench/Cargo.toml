@@ -10,18 +10,22 @@ description = "Measurement harness: BER/FER/goodput-vs-SNR for Coppa PHY modes"
 autoexamples = false
 
 [features]
-cpal-backend = ["coppa-audio/cpal-backend"]
+cpal-backend = ["coppa-audio/cpal-backend", "dep:cpal"]
 
 [dependencies]
 coppa-codec = { path = "../coppa-codec" }
 coppa-protocol = { path = "../coppa-protocol" }
 coppa-channel = { path = "../coppa-channel" }
+# COP-221: the relay converts native modem audio with coppa-dsp FIR designs.
+coppa-dsp = { path = "../coppa-dsp" }
 coppa-ml = { path = "../coppa-ml" }
 # COP-170: `compare` drives two library Links in virtual time.
 coppa-engine = { path = "../coppa-engine" }
 # default-features = false: coppa-audio's defaults turn on cpal-backend (ALSA on
 # Linux). The COP-112 TNC benchmark needs only the WAV file backend and the resampler.
 coppa-audio = { path = "../coppa-audio", default-features = false, features = ["file-backend"] }
+# COP-221: the integrity probe opens non-f32 native formats directly.
+cpal = { workspace = true, optional = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
 clap = { workspace = true }
@@ -30,6 +34,11 @@ hound = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
 crc = { workspace = true }
+
+# COP-221: the relay sizes each FIFO so a native-format cable holds the same
+# 20 ms ticks of lead as the f32le 48000 Hz one (rustix is already locked).
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "pipe"] }
 
 [lints]
 workspace = true

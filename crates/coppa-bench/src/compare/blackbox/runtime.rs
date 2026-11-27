@@ -2,6 +2,7 @@
 use super::{
     cable::Cable,
     guard, integrity,
+    native::{self, NativeFormat, SampleFormat},
     profile::Profile,
     relay::io::Relay,
     resume::{self, CsvIdentity},
@@ -36,33 +37,43 @@ fn scratch() -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn probe_signal() -> Vec<f32> {
-    let mut state = 0x1700_2140u64;
-    (0..48000 * 10)
-        .map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((state >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.2
-        })
-        .collect()
-}
-
 pub fn probe_child() -> Result<()> {
     let out = PathBuf::from(
         std::env::var_os("COPPA_COMPARE_PROBE_OUT")
             .context("COPPA_COMPARE_PROBE_OUT is required")?,
     );
+    let native = NativeFormat::from_env(
+        &std::env::var("COPPA_COMPARE_PROBE_FORMAT")
+            .context("COPPA_COMPARE_PROBE_FORMAT is required")?,
+    )?;
     let output = coppa_audio::resolve_output_device(Some("coppa-cmp-A"), None)?
         .context("probe output device unavailable")?;
     let input = coppa_audio::resolve_input_device(Some("coppa-cmp-B"), None)?
         .context("probe input device unavailable")?;
+    let dir = out.parent().context("probe output has no parent")?;
+    let captured = if native == NativeFormat::CHANNEL {
+        probe_f32_48k(output, input, dir)?
+    } else {
+        probe_native(output, input, native, dir)?
+    };
+    let mut file = fs::File::create(out)?;
+    for sample in captured {
+        file.write_all(&sample.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// COP-214's probe, through coppa-audio's f32 wrappers as coppad opens them.
+fn probe_f32_48k(output: cpal::Device, input: cpal::Device, dir: &Path) -> Result<Vec<f32>> {
     let mut sink = CpalSink::from_device(output, 48000, 16384)?;
     let mut source = CpalSource::from_device(input, 48000, 16384)?;
     source.start()?;
     sink.start()?;
-    let signal = probe_signal();
+    // Built after the streams start, as COP-214 shipped it: the first
+    // writes then land after the file PCMs' startup, not inside it.
+    let signal = NativeFormat::CHANNEL.probe_signal();
     let mut captured = Vec::new();
     let mut sent = 0usize;
-    let dir = out.parent().context("probe output has no parent")?;
     fs::write(dir.join("probe-start"), b"")?;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(12) {
@@ -81,21 +92,104 @@ pub fn probe_child() -> Result<()> {
     // ALSA's file PCM does not implement pause; dropping the streams closes it.
     let _ = sink.stop();
     let _ = source.stop();
-    let mut file = fs::File::create(out)?;
-    for sample in captured {
-        file.write_all(&sample.to_le_bytes())?;
-    }
-    Ok(())
+    Ok(captured)
 }
 
-fn probe(cable: &Cable) -> Result<integrity::Metrics> {
-    let relay = Relay::start(&cable.dir, None, None, [1.0, 1.0], 0)?;
+/// COP-221: opens both devices in the modem's declared format and rate, as
+/// the modem would. coppa-audio's wrappers open f32 only, so this builds
+/// mono cpal streams directly.
+fn probe_native(
+    output: cpal::Device,
+    input: cpal::Device,
+    native: NativeFormat,
+    dir: &Path,
+) -> Result<Vec<f32>> {
+    use cpal::traits::{DeviceTrait, StreamTrait};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    let config = cpal::StreamConfig {
+        channels: 1,
+        sample_rate: native.rate,
+        buffer_size: cpal::BufferSize::Default,
+    };
+    let pending = Arc::new(Mutex::new(VecDeque::from(native.probe_signal())));
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let (queue, store) = (Arc::clone(&pending), Arc::clone(&captured));
+    let format = format!("{} {} Hz mono", native.format.name(), native.rate);
+    let (play, record) = match native.format {
+        SampleFormat::S16le => (
+            output.build_output_stream::<i16, _, _>(
+                config,
+                move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    let mut queue = queue.lock().unwrap();
+                    for sample in data {
+                        *sample = native::to_i16(queue.pop_front().unwrap_or(0.0));
+                    }
+                },
+                |e| eprintln!("integrity probe: output error: {e}"),
+                None,
+            ),
+            input.build_input_stream::<i16, _, _>(
+                config,
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    let mut store = store.lock().unwrap();
+                    store.extend(data.iter().map(|&x| f32::from(x) / 32768.0));
+                },
+                |e| eprintln!("integrity probe: input error: {e}"),
+                None,
+            ),
+        ),
+        SampleFormat::F32le => (
+            output.build_output_stream::<f32, _, _>(
+                config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    let mut queue = queue.lock().unwrap();
+                    for sample in data {
+                        *sample = queue.pop_front().unwrap_or(0.0);
+                    }
+                },
+                |e| eprintln!("integrity probe: output error: {e}"),
+                None,
+            ),
+            input.build_input_stream::<f32, _, _>(
+                config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    store.lock().unwrap().extend_from_slice(data);
+                },
+                |e| eprintln!("integrity probe: input error: {e}"),
+                None,
+            ),
+        ),
+    };
+    let play = play.with_context(|| format!("opening the probe output as {format}"))?;
+    let record = record.with_context(|| format!("opening the probe input as {format}"))?;
+    record.play().context("starting the probe input")?;
+    play.play().context("starting the probe output")?;
+    fs::write(dir.join("probe-start"), b"")?;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(12) {
+        if pending.lock().unwrap().is_empty() && !dir.join("probe-end").exists() {
+            fs::write(dir.join("probe-end"), b"")?;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    // As above: dropping the streams closes the file PCMs.
+    drop(play);
+    drop(record);
+    let captured = std::mem::take(&mut *captured.lock().unwrap());
+    Ok(captured)
+}
+
+fn probe(cable: &Cable, native: NativeFormat) -> Result<integrity::Metrics> {
+    let relay = Relay::start(&cable.dir, native, None, None, [1.0, 1.0], 0)?;
     let home = cable.station_home('A')?;
     let output = cable.dir.join("probe.raw");
     let status = Command::new(std::env::current_exe()?)
         .args(["compare", "blackbox-probe"])
         .env("HOME", home)
         .env("COPPA_COMPARE_PROBE_OUT", &output)
+        .env("COPPA_COMPARE_PROBE_FORMAT", native.to_env())
         .status()?;
     if !status.success() {
         bail!("integrity probe child failed ({status})");
@@ -108,11 +202,18 @@ fn probe(cable: &Cable) -> Result<integrity::Metrics> {
         .chunks_exact(4)
         .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
         .collect();
-    integrity::analyse(&probe_signal(), &received, 48000, starved, overflow)
+    integrity::analyse(
+        &native.probe_signal(),
+        &received,
+        native.rate as usize,
+        starved,
+        overflow,
+    )
 }
 
 pub fn run(args: &BlackboxArgs) -> Result<()> {
     let profile = Profile::load(&args.modem)?;
+    let native = profile.audio.native()?;
     let sha = profile.verify_binary()?;
     let channel = super::super::grid::Channel::parse(&args.channel)
         .context("unknown channel (expected wgn, mpg or mpp)")?;
@@ -147,7 +248,7 @@ pub fn run(args: &BlackboxArgs) -> Result<()> {
     }
     let root = scratch()?;
     let result = super::gated(
-        || probe(&Cable::create(&root.join("probe"))?),
+        || probe(&Cable::create(&root.join("probe"))?, native),
         |metrics| run_trials(args, &profile, &sha, &out_dir, &root, cell, &metrics),
     );
     if result.is_ok() {
@@ -251,7 +352,14 @@ fn calibrate(
     let cable = Cable::create(&root.join("calibration"))?;
     let home_a = cable.station_home('A')?;
     let home_b = cable.station_home('B')?;
-    let relay = Relay::start(&cable.dir, None, None, [1.0, 1.0], 0)?;
+    let relay = Relay::start(
+        &cable.dir,
+        profile.audio.native()?,
+        None,
+        None,
+        [1.0, 1.0],
+        0,
+    )?;
     let a = Station::launch(profile, &cable.dir.join("station-a"), &home_a, 'A')?;
     let b = Station::launch(profile, &cable.dir.join("station-b"), &home_b, 'B')?;
     let mut host_a = Host::connect(&a.command_addr, &a.data_addr)?;
@@ -372,7 +480,14 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
     let home_a = cable.station_home('A')?;
     let home_b = cable.station_home('B')?;
     let fading = channel.preset().map(WattersonPreset::config);
-    let relay = Relay::start(&cable.dir, fading, Some(args.snr), power, seed)?;
+    let relay = Relay::start(
+        &cable.dir,
+        profile.audio.native()?,
+        fading,
+        Some(args.snr),
+        power,
+        seed,
+    )?;
     let a = Station::launch(profile, &cable.dir.join("station-a"), &home_a, 'A')?;
     let b = Station::launch(profile, &cable.dir.join("station-b"), &home_b, 'B')?;
     let mut host_a = Host::connect(&a.command_addr, &a.data_addr)?;

@@ -1,5 +1,5 @@
 # A modem the black-box harness launches twice, unmodified.
-# The modem must open its ALSA device as f32le, 48000 Hz, mono (coppad does).
+# coppad opens its ALSA device as f32le, 48000 Hz, mono ([audio] below).
 name = "coppad"
 adapter = "vara"
 binary = "target/release/coppad"
@@ -7,6 +7,14 @@ sha256 = ""
 mode = "HF_STANDARD"
 args = ["--config", "{dir}/coppad.toml"]
 ready_timeout_s = 20
+
+# COP-221: the format the modem opens its ALSA device in. The relay converts
+# between it and the channel's f32le 48000 Hz mono. format: f32le or s16le;
+# rate: 8000, 12000, 16000, 24000 or 48000; channels: 1.
+[audio]
+format = "f32le"
+rate = 48000
+channels = 1
 
 [ports]
 log_line = "VARA TCP server listening"

@@ -55,6 +55,86 @@ fn cable_integrity_probe() {
     assert!(log.contains("pass"), "{log}");
 }
 
+/// COP-221 AC1: a profile declaring s16le at 12000 Hz mono gets a cable
+/// whose integrity probe, opened in that format, passes the AC10 gate. The
+/// modem is `/bin/true`, so the run stops at calibration, after the probe.
+#[test]
+#[ignore = "requires ALSA file PCM and real time"]
+fn native_s16le_12k_integrity_probe() {
+    let root = coppa_bench::compare::repo_root();
+    let source = fs::read_to_string(root.join("tools/compare/coppad.toml")).unwrap();
+    let source = source
+        .replace("name = \"coppad\"", "name = \"native-s16le-12k\"")
+        .replace("target/release/coppad", "/bin/true")
+        .replace(
+            "format = \"f32le\"\nrate = 48000",
+            "format = \"s16le\"\nrate = 12000",
+        );
+    assert!(
+        source.contains("rate = 12000"),
+        "coppad.toml lost its [audio] table"
+    );
+    let dir = std::env::temp_dir().join(format!("coppa-live-test-{}-native", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("profile.toml");
+    fs::write(&path, source).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_coppa-bench"))
+        .args(["compare", "blackbox", "--modem"])
+        .arg(&path)
+        .arg("--out-dir")
+        .arg(dir.join("results"))
+        .output()
+        .unwrap();
+    let log = String::from_utf8(output.stderr).unwrap();
+    let _ = fs::remove_dir_all(&dir);
+    // `gated` prints this line only when the AC10 thresholds held.
+    assert!(log.contains("integrity probe: correlation"), "{log}");
+    assert!(log.contains(": pass"), "{log}");
+}
+
+/// COP-221 AC2: a profile with no `[audio]` table, or a format the cable
+/// cannot carry, stops the harness at start with exit 1, naming the key and
+/// the values it accepts.
+#[test]
+fn undeclared_or_unsupported_audio_exits_1_naming_the_key() {
+    let root = coppa_bench::compare::repo_root();
+    let source = fs::read_to_string(root.join("tools/compare/coppad.toml")).unwrap();
+    let dir = std::env::temp_dir().join(format!("coppa-audio-key-test-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let start = source.find("\n[audio]\nformat").unwrap();
+    let end = start + 1 + source[start + 1..].find("\n\n").unwrap();
+    for (case, audio, expected) in [
+        (
+            "undeclared",
+            String::new(),
+            "audio.format is undeclared; supported values: f32le, s16le",
+        ),
+        (
+            "unsupported",
+            "\n[audio]\nformat = \"s24le\"\nrate = 48000\nchannels = 1".to_string(),
+            "audio.format \"s24le\" is unsupported; supported values: f32le, s16le",
+        ),
+    ] {
+        let path = dir.join(format!("{case}.toml"));
+        fs::write(
+            &path,
+            format!("{}{}{}", &source[..start], audio, &source[end..]),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_coppa-bench"))
+            .args(["compare", "blackbox", "--modem"])
+            .arg(&path)
+            .arg("--out-dir")
+            .arg(dir.join("results"))
+            .output()
+            .unwrap();
+        let log = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{case}: {log}");
+        assert!(log.contains(expected), "{case}: {log}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 #[ignore = "requires release coppad, ALSA file PCM, and real time"]
 fn coppad_vara_transfer_through_cable() {
