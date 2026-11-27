@@ -161,14 +161,34 @@ mod tests {
         }
     }
 
+    /// Replaces the profile's `[audio]` table with `audio`. A Windows
+    /// checkout carries CRLF, so the source is normalized to LF first.
+    fn splice_audio(source: &str, audio: &str) -> String {
+        let source = source.replace("\r\n", "\n");
+        let start = source.find("\n[audio]\nformat").unwrap();
+        let end = start + 1 + source[start + 1..].find("\n\n").unwrap();
+        format!("{}{}{}", &source[..start], audio, &source[end..])
+    }
+
+    #[test]
+    fn audio_splice_survives_a_crlf_checkout() {
+        let source = std::fs::read_to_string(
+            super::super::super::repo_root().join("tools/compare/coppad.toml"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let table = "\n[audio]\nformat = \"f32le\"\nrate = 48000\nchannels = 1";
+        assert!(source.contains(table), "coppad.toml lost its [audio] table");
+        let crlf = source.replace('\n', "\r\n");
+        assert_eq!(splice_audio(&crlf, "\n"), source.replace(table, "\n"));
+    }
+
     fn load_with_audio(name: &str, audio: &str) -> String {
         let source = std::fs::read_to_string(
             super::super::super::repo_root().join("tools/compare/coppad.toml"),
         )
         .unwrap();
-        let start = source.find("\n[audio]\nformat").unwrap();
-        let end = start + 1 + source[start + 1..].find("\n\n").unwrap();
-        let source = format!("{}{}{}", &source[..start], audio, &source[end..]);
+        let source = splice_audio(&source, audio);
         let dir = std::env::temp_dir().join(format!("coppa-profile-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("profile.toml");
