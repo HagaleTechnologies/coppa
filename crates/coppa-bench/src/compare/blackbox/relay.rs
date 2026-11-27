@@ -152,8 +152,22 @@ pub mod io {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
             if let Some(handle) = self.thread.take() {
-                let _ = handle.join();
+                // An error returned past a relay that already stopped (a
+                // station that cannot open its FIFO after an s16le capture
+                // was refused, say) would otherwise hide the relay's reason.
+                if let Some(reason) = dropped_failure(handle.join()) {
+                    eprintln!("{reason}");
+                }
             }
+        }
+    }
+
+    /// What a relay dropped without `stop` reports, if its thread failed.
+    pub(super) fn dropped_failure(joined: thread::Result<Result<()>>) -> Option<String> {
+        match joined {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(format!("compare blackbox: the cable relay stopped: {e:#}")),
+            Err(_) => Some("compare blackbox: the cable relay panicked".into()),
         }
     }
 
@@ -201,7 +215,7 @@ pub mod io {
 
     fn write_samples(file: &mut File, format: SampleFormat, samples: &[f32]) -> Result<bool> {
         let mut bytes = Vec::with_capacity(samples.len() * format.bytes());
-        format.encode(samples, &mut bytes);
+        format.encode(samples, &mut bytes)?;
         match file.write(&bytes) {
             Ok(n) => Ok(n == bytes.len()),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
@@ -308,6 +322,15 @@ mod tests {
         b.push(0.25);
         assert_eq!(take_whole_block(&mut b, 240).unwrap().len(), 240);
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dropped_relay_reports_why_it_stopped() {
+        let refused =
+            anyhow::anyhow!("s16le capture sample 1.5 is outside the representable range");
+        let reason = io::dropped_failure(Ok(Err(refused))).unwrap();
+        assert!(reason.contains("s16le capture sample 1.5"), "{reason}");
+        assert_eq!(io::dropped_failure(Ok(Ok(()))), None);
+    }
     #[test]
     fn non_f32_playback_is_refused() {
         let error = validate_playback(&[f32::INFINITY], NativeFormat::CHANNEL).unwrap_err();
@@ -401,7 +424,7 @@ mod tests {
         // 1.5 s of the native probe; the gate needs at least one second.
         let sent: Vec<f32> = native.probe_signal()[..18_000].to_vec();
         let mut bytes = Vec::new();
-        native.format.encode(&sent, &mut bytes);
+        native.format.encode(&sent, &mut bytes).unwrap();
         let (mut written, mut received) = (0, Vec::new());
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && received.len() < 2 * (sent.len() + 12_000) {

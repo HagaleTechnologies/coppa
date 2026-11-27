@@ -609,7 +609,14 @@ stall scenario does (`docs/testing/bpq-session.md`).
   and the conversion passband ends near 0.38 of it, so a modem that puts
   energy closer to its Nyquist edge loses some of it. Each native FIFO is
   resized to hold about as much time as the f32 one; that needs Linux 2.6.35
-  or later. No non-coppad modem has run a trial through the native cable yet.
+  or later. If a sample an s16le modem would capture is past full scale,
+  the relay stops, the trial is not recorded and the run exits with an
+  error; f32le carries such samples unchanged. The cable has no capture
+  gain, and the channel noise covers the whole 24 kHz band at a level set by
+  the modem's TX power: at 48 kHz and a TX power of 0.125 its standard
+  deviation is 1.0 at 0 dB and 0.32 at 10 dB. So an s16le profile can have
+  most of the grid refused, depending on its TX level and rate. No
+  non-coppad modem has run a trial through the native cable yet.
   A resumed CSV is matched on the profile's name, not its `[audio]` table, so
   a profile that changes its format needs a new name or a fresh `--out-dir`.
   The f32 probe still builds its signal after starting the streams: in the

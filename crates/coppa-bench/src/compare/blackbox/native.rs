@@ -71,11 +71,26 @@ impl SampleFormat {
         }
     }
 
-    pub fn encode(self, samples: &[f32], out: &mut Vec<u8>) {
+    /// Appends a block of samples. Refuses an s16le block that would clip,
+    /// writing nothing, so the relay stops rather than record a channel the
+    /// modem hears clipped. The cable has no capture gain.
+    pub fn encode(self, samples: &[f32], out: &mut Vec<u8>) -> Result<()> {
         match self {
             Self::F32le => out.extend(samples.iter().flat_map(|x| x.to_le_bytes())),
-            Self::S16le => out.extend(samples.iter().flat_map(|&x| to_i16(x).to_le_bytes())),
+            Self::S16le => {
+                if let Some(sample) = samples
+                    .iter()
+                    .find(|&&x| !(-32768.0..=32767.0).contains(&(x * 32768.0).round()))
+                {
+                    bail!(
+                        "s16le capture sample {sample} is outside the representable range; \
+                         the trial is not recorded because s16le would clip it"
+                    );
+                }
+                out.extend(samples.iter().flat_map(|&x| to_i16(x).to_le_bytes()));
+            }
         }
+        Ok(())
     }
 }
 
@@ -208,7 +223,9 @@ impl NativeFormat {
             return signal;
         }
         let mut bytes = Vec::with_capacity(signal.len() * self.format.bytes());
-        self.format.encode(&signal, &mut bytes);
+        self.format
+            .encode(&signal, &mut bytes)
+            .expect("the probe signal is within the s16le range");
         let mut exact = Vec::with_capacity(signal.len());
         self.format.decode(&bytes, &mut exact);
         exact
@@ -329,14 +346,17 @@ mod tests {
             let back = converter.down(&channel);
             assert_eq!(back.len(), native.block());
             bytes.clear();
-            native.format.encode(&back, &mut bytes);
+            native.format.encode(&back, &mut bytes).unwrap();
             native.format.decode(&bytes, &mut received);
         }
         // Capture runs past the end of the probe, as the live probe does.
         for _ in 0..50 {
             let channel = converter.up(&vec![0.0; native.block()]);
             bytes.clear();
-            native.format.encode(&converter.down(&channel), &mut bytes);
+            native
+                .format
+                .encode(&converter.down(&channel), &mut bytes)
+                .unwrap();
             native.format.decode(&bytes, &mut received);
         }
         received
@@ -464,11 +484,40 @@ mod tests {
     }
 
     #[test]
-    fn s16_codes_round_trip_and_saturate() {
+    fn s16_codes_round_trip_at_full_scale() {
         let mut bytes = Vec::new();
-        SampleFormat::S16le.encode(&[0.5, -1.0, 2.0], &mut bytes);
+        let samples = [0.5, -1.0, 32767.0 / 32768.0];
+        SampleFormat::S16le.encode(&samples, &mut bytes).unwrap();
         let mut back = Vec::new();
         SampleFormat::S16le.decode(&bytes, &mut back);
-        assert_eq!(back, vec![0.5, -1.0, 32767.0 / 32768.0]);
+        assert_eq!(back, samples);
+        // The probe's cpal output still saturates rather than wraps.
+        assert_eq!((to_i16(2.0), to_i16(-2.0)), (i16::MAX, i16::MIN));
+    }
+
+    #[test]
+    fn s16le_capture_refuses_clipping_at_zero_db() {
+        use coppa_channel::persistent::{PersistentChannel, SnrProfile};
+
+        let native = NativeFormat::declared(Some("s16le"), Some(CHANNEL_RATE), Some(1)).unwrap();
+        let signal: Vec<_> = (0..native.block())
+            .map(|i| 0.5 * (std::f32::consts::TAU * i as f32 / 48.0).sin())
+            .collect();
+        let mut channel = PersistentChannel::new(
+            CHANNEL_RATE as f32,
+            None,
+            Some(SnrProfile::constant(0.0)),
+            0.125,
+            7,
+            0,
+        );
+        let capture = Converter::new(native).down(&channel.process(&signal));
+        let mut bytes = Vec::new();
+        let error = native.format.encode(&capture, &mut bytes).unwrap_err();
+        assert!(
+            error.to_string().contains("s16le capture sample"),
+            "{error}"
+        );
+        assert!(bytes.is_empty(), "a rejected capture block wrote bytes");
     }
 }
