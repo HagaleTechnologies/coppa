@@ -201,7 +201,7 @@ pub mod io {
 
     fn write_samples(file: &mut File, format: SampleFormat, samples: &[f32]) -> Result<bool> {
         let mut bytes = Vec::with_capacity(samples.len() * format.bytes());
-        format.encode(samples, &mut bytes);
+        format.encode(samples, &mut bytes)?;
         match file.write(&bytes) {
             Ok(n) => Ok(n == bytes.len()),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
@@ -401,7 +401,7 @@ mod tests {
         // 1.5 s of the native probe; the gate needs at least one second.
         let sent: Vec<f32> = native.probe_signal()[..18_000].to_vec();
         let mut bytes = Vec::new();
-        native.format.encode(&sent, &mut bytes);
+        native.format.encode(&sent, &mut bytes).unwrap();
         let (mut written, mut received) = (0, Vec::new());
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && received.len() < 2 * (sent.len() + 12_000) {
