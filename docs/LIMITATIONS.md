@@ -614,7 +614,9 @@ stall scenario does (`docs/testing/bpq-session.md`).
   a profile that changes its format needs a new name or a fresh `--out-dir`.
   The f32 probe still builds its signal after starting the streams: in the
   same container, writing from the first callback lost about 1000 samples and
-  gave correlation 0.998959. Real-time trials keep fixed channel seeds but
+  gave correlation 0.998959. In the COP-221 container one coppad VARA trial
+  (wgn, 30 dB, 2048 bytes) capped at 512 bytes once, then completed in
+  52.2 s on rerun; the base commit completed it in 52.4 s. Real-time trials keep fixed channel seeds but
   scheduling can change their results. PathSim's delay offset is not measured.
   The six published self-test rows counted starved and overflow ticks from
   the payload write, so each trial's roughly 7 s connect is outside their

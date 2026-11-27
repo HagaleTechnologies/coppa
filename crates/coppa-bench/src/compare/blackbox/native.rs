@@ -202,6 +202,11 @@ impl NativeFormat {
                 })
                 .collect()
         };
+        if self.format == SampleFormat::F32le {
+            // Already exact, and the f32 48 kHz probe builds this after its
+            // streams start, so a no-op round trip would only add lead.
+            return signal;
+        }
         let mut bytes = Vec::with_capacity(signal.len() * self.format.bytes());
         self.format.encode(&signal, &mut bytes);
         let mut exact = Vec::with_capacity(signal.len());
