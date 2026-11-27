@@ -671,10 +671,15 @@ stall scenario does (`docs/testing/bpq-session.md`).
   0.0 dBFS peak and -3.0 dBFS RMS, not the -6.02 dBFS peak of OFDM frames,
   and each one logs the TX clipping warning. The follow-up ticket filed
   with COP-236 tracks the floor level. The black-box integrity probe can
-  also fail on its own, before any coppad starts: in 3 of about 50 probes
-  on runs pinned to two cores (and none of the 30 unpinned matrix
-  probes), its first 20 ms block arrived about 335 ms early and scored
-  correlation 0.998959. A failed probe fails the
+  also fail on its own, before any coppad starts. In the COP-236 runs it
+  failed 3 times, each time on a run pinned to two cores and with
+  correlation 0.998959. None of the 30 unpinned matrix probes failed. The
+  COP-236 record analyses one of the three failed captures, in which the
+  first 20 ms block arrived about 335 ms early. The record has no capture
+  analysis for the other two, so it does not show whether their first
+  block also arrived early. The score alone cannot show it. In the COP-221
+  container, a probe variant that lost about 1000 samples also scored
+  0.998959, as the COP-214 bullet above records. A failed probe fails the
   COP-236 release matrix; COP-253 tracks it. See
   [the COP-236 record](testing/blackbox-cop236.md).
 
