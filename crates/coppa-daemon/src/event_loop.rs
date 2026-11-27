@@ -224,6 +224,19 @@ const _: () = assert!(
     "COP-121 receipts assume stop-and-wait"
 );
 
+/// COP-236: the part of a session frame's round trip that airtime and
+/// turnaround do not cover: the peer's decode and RX-to-TX hold, the audio
+/// path in each direction, and our own decode of the (last) ACK. Added once
+/// to every OFDM segment floor `set_session_segment_floor` sets, so a
+/// multi-codeword frame, an ID-carrying frame and an RS burst with its two
+/// ACK copies. The black-box cable measured a level-2 eight-codeword
+/// frame's ACK decoded 12.60 to 12.69 s after the send, against a 12.341 s
+/// airtime-and-turnaround budget, so the 500 ms retransmit poll could
+/// resend the frame just before its ACK was processed. One second leaves at
+/// least 0.65 s past the latest measured decode. It is a fixed bound, not
+/// scaled by level, codeword count or host load (docs/LIMITATIONS.md).
+const SESSION_ACK_PROCESSING_ALLOWANCE: Duration = Duration::from_secs(1);
+
 /// COP-68: how long a fade-held session link waits with ZERO peer evidence
 /// (no fully decoded MAC PDU from the peer, no header-only PHY decode)
 /// before tearing down. Derived like `SWITCH_PROBATION_SECS`'s margin: the
@@ -3608,6 +3621,11 @@ impl EventLoop {
     /// ACK is a conservative upper bound for the supported HF short-CP and
     /// VHF profiles too; this branch still sends full-frame ACKs.
     ///
+    /// COP-236: a multi-codeword (or ID-carrying) OFDM frame's floor also
+    /// carries `SESSION_ACK_PROCESSING_ALLOWANCE` for decode and audio-path
+    /// latency, so the retransmit poll cannot resend a frame whose ACK is
+    /// already in the input ring.
+    ///
     /// COP-202: a floor key-up's floor is the shared floor RTO floor plus
     /// the peer's station-ID allowance and any ID we prepended (Decision 8).
     fn set_session_segment_floor(
@@ -3660,11 +3678,13 @@ impl EventLoop {
             as f64
             / 1000.0;
         if let Some(link) = self.session_link.as_mut() {
-            link.tx.set_segment_floor(Duration::from_secs_f64(
-                data_s
-                    + 2.0 * turnaround_s
-                    + ack_s * if link.tx_outer.is_some() { 2.0 } else { 1.0 },
-            ));
+            link.tx.set_segment_floor(
+                Duration::from_secs_f64(
+                    data_s
+                        + 2.0 * turnaround_s
+                        + ack_s * if link.tx_outer.is_some() { 2.0 } else { 1.0 },
+                ) + SESSION_ACK_PROCESSING_ALLOWANCE,
+            );
         }
     }
 
@@ -21197,6 +21217,121 @@ mod tests {
                     .get_retransmits(Instant::now() + Duration::from_secs(6))
                     .is_empty(),
                 "the short frame must be due by 6 s"
+            );
+        }
+
+        /// COP-236: the schedule a stalled black-box run recorded, measured
+        /// from the first data send. The 500 ms retransmit poll ran at
+        /// 12.554 s and the station finished decoding the peer's ACK at
+        /// 12.689 s, the latest of the measured ACK decodes.
+        const COP236_STALLED_POLL: Duration = Duration::from_millis(12_554);
+        const COP236_ACK_DECODED: Duration = Duration::from_millis(12_689);
+
+        /// COP-236 test rig: `cop111_station` on paused time, its station-ID
+        /// stamp taken from the same clock, after one incompressible host
+        /// write has keyed a single level-2 eight-codeword data frame with
+        /// no ID. Returns the station and the virtual instant the send
+        /// returned.
+        async fn cop236_sent_multi_codeword_frame() -> (EventLoop, Instant) {
+            let (mut event_loop, mut consumer) = cop111_station();
+            event_loop.last_id_time = Some(clock_now());
+            event_loop
+                .handle_host_event(HostEvent::DataReceived {
+                    client_id: 1,
+                    data: cop69_incompressible(2000),
+                })
+                .await;
+            let sent = clock_now();
+            let keyed_s = read_all(&mut consumer).len() as f64 / 48_000.0;
+            assert!(
+                (9.0..10.0).contains(&keyed_s),
+                "one level-2 data frame and no ID must key: {keyed_s} s"
+            );
+            let link = event_loop.session_link.as_ref().unwrap();
+            assert_eq!(link.tx.in_flight(), 1);
+            assert_eq!(link.tx_codewords, 8);
+            (event_loop, sent)
+        }
+
+        /// COP-236 test rig: advance paused time to `sent + at` and return
+        /// the virtual instant reached.
+        async fn cop236_advance_to(sent: Instant, at: Duration) -> Instant {
+            let elapsed = clock_now().duration_since(sent);
+            tokio::time::advance(at.saturating_sub(elapsed)).await;
+            let now = clock_now();
+            let reached = now.duration_since(sent);
+            assert!(
+                reached >= at && reached < at + Duration::from_millis(1),
+                "paused time reached {reached:?}, wanted {at:?}"
+            );
+            now
+        }
+
+        /// COP-236 (AC2): an eight-codeword level-2 frame stays in flight
+        /// through the late-ACK window a stalled black-box run measured.
+        /// Before the fix its 12.341 s timeout made the frame due at the
+        /// 12.554 s poll, so the sender keyed a duplicate 9.5 s frame that
+        /// broke the stop-and-wait exchange.
+        #[tokio::test(start_paused = true)]
+        async fn cop236_multi_codeword_ack_arrives_before_retry() {
+            let (mut event_loop, sent) = cop236_sent_multi_codeword_frame().await;
+            let rto = event_loop.session_link.as_ref().unwrap().tx.rto();
+            for at in [
+                COP236_STALLED_POLL,
+                COP236_ACK_DECODED - Duration::from_millis(1),
+            ] {
+                let now = cop236_advance_to(sent, at).await;
+                let link = event_loop.session_link.as_mut().unwrap();
+                assert!(
+                    link.tx.get_retransmits(now).is_empty(),
+                    "the frame was due {at:?} after the send, before its ACK (RTO {rto:?})"
+                );
+                assert_eq!(link.tx.rto(), rto, "a poll before the deadline backed off");
+            }
+            let now = cop236_advance_to(sent, COP236_ACK_DECODED).await;
+            let link = event_loop.session_link.as_mut().unwrap();
+            let seq = link.tx.send_base();
+            let ack = link.tx.next_seq();
+            assert_eq!(link.tx.process_ack(ack, 0, now), vec![seq]);
+            assert_eq!(link.tx.in_flight(), 0, "the ACK must retire the segment");
+        }
+
+        /// COP-236 (AC3): with the ACK withheld, the same frame still comes
+        /// due at the revised deadline, and that one expiry backs the
+        /// timeout off once. The upper bound stops a timeout long enough to
+        /// hide a lost frame from passing.
+        #[tokio::test(start_paused = true)]
+        async fn cop236_multi_codeword_missing_ack_still_retries() {
+            let (mut event_loop, sent) = cop236_sent_multi_codeword_frame().await;
+            let link = event_loop.session_link.as_ref().unwrap();
+            let rto = link.tx.rto();
+            let seq = link.tx.send_base();
+            assert!(
+                rto >= COP236_ACK_DECODED + Duration::from_millis(650),
+                "RTO {rto:?} leaves under 0.65 s past the latest measured ACK decode"
+            );
+            assert!(
+                rto < Duration::from_millis(13_350),
+                "RTO {rto:?} is longer than this fixture's budget"
+            );
+            let now = cop236_advance_to(sent, rto - Duration::from_millis(1)).await;
+            let link = event_loop.session_link.as_mut().unwrap();
+            assert!(
+                link.tx.get_retransmits(now).is_empty(),
+                "the frame was due 1 ms before its deadline"
+            );
+            assert_eq!(link.tx.rto(), rto);
+            let now = cop236_advance_to(sent, rto).await;
+            let link = event_loop.session_link.as_mut().unwrap();
+            assert_eq!(
+                link.tx.get_retransmits(now),
+                vec![seq],
+                "the unacknowledged frame must be due at its deadline"
+            );
+            let backed_off = link.tx.rto();
+            assert!(
+                backed_off.abs_diff(rto * 2) < Duration::from_millis(1),
+                "one expiry must back off once: {rto:?} -> {backed_off:?}"
             );
         }
 
