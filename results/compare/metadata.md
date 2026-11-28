@@ -108,7 +108,14 @@ the follow-up ticket COP-237; this is an observation, not a diagnosis.
 
 Each row records `payload_crc32`, the CRC-32 of the seeded bytes the trial
 wrote, and `compare blackbox` refuses to resume into a CSV without that
-column or whose row carries another value for its seed and size. Before
+column or whose row carries another value for its seed and size. Since
+COP-256 each row also records `capture_gain_db`, the whole-dB capture gain
+the harness derived for the trial; coppad's f32le captures never pass a
+gain stage, so the published rows carry 0, and the column was appended to
+them as a schema migration rather than a re-record: payload, rates, binary
+identity and timing values are unchanged. An s16le row records the
+attenuation its trial applied, and a resumed run must derive the same gain
+for the requested cell. Before
 COP-227 the published rows came from coppad 0.16.0 (sha256 `9b8b4957…`) and
 wrote a 256-byte repeating ramp. None of those rows remains. The ramp had
 not lowered those removed rows' on-air work. coppad compresses each frame's chunk on its

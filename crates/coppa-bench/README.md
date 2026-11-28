@@ -39,10 +39,21 @@ Not on crates.io and not a product crate. From a clone of the repository:
   `--features cpal-backend,ardop,kiss-tnc` first. The cable carries the
   mono format the profile's `[audio]` table declares (`f32le` or `s16le`, at
   8000 to 48000 Hz; coppad's profiles declare f32le at 48000 Hz). Live tests also need that release binary. The
-  integrity probe must pass before a trial is recorded. Each row records the
+  integrity probe must pass before a trial is recorded, and it runs at unity
+  gain: its level check still measures the cable itself. Each row records the
   CRC-32 of the generated trial payload as `payload_crc32`, even if dialing
-  fails before sending. Use a fresh `--out-dir` if the CSV lacks that column
-  or a row's checksum differs from the expected value for its seed and size.
+  fails before sending, and the trial's capture gain as a final
+  `capture_gain_db` column (COP-256): for s16le the harness derives one
+  fixed whole-dB attenuation from the calibrated TX power, the cell's
+  channel and SNR and the native rate, and scales both captures by it
+  before quantization, so the SNR is unchanged and low-SNR cells can be
+  recorded; f32le rows record `0` and never pass a gain stage. A block that
+  would still clip is refused exactly as before: the trial is not recorded
+  and the run exits 1. Use a fresh `--out-dir` if the CSV lacks the
+  `payload_crc32` or `capture_gain_db` column, a row's checksum differs
+  from the expected value for its seed and size, or the requested cell's
+  rows carry another capture gain (recalibration can cross a whole-dB
+  boundary; pin the powers with `--ref-power A,B` to resume instead).
 
 Results are logged in [BENCHMARKS.md](https://github.com/HagaleTechnologies/coppa/blob/main/BENCHMARKS.md).
 Read its [Conventions](../../BENCHMARKS.md) section and the

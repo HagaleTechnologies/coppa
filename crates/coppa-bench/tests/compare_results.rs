@@ -351,7 +351,7 @@ fn blackbox_selftest_records_every_field() {
     let path = default_out_dir().join("blackbox-coppad.csv");
     let text = read(&path);
     let mut rows = text.lines();
-    assert_eq!(rows.next(), Some("modem,adapter,version_reply,binary_sha256,mode,channel,snr_db,size_bytes,trial,seed,ref_power_a,ref_power_b,cap_s,outcome,connect_s,delivered_bytes,exact,transfer_s,net_bytes_per_min,drops,wall_s,cable_latency_ms,starved_ticks,overflow_ticks,payload_crc32"));
+    assert_eq!(rows.next(), Some("modem,adapter,version_reply,binary_sha256,mode,channel,snr_db,size_bytes,trial,seed,ref_power_a,ref_power_b,cap_s,outcome,connect_s,delivered_bytes,exact,transfer_s,net_bytes_per_min,drops,wall_s,cable_latency_ms,starved_ticks,overflow_ticks,payload_crc32,capture_gain_db"));
     let lines: Vec<_> = rows.collect();
     assert_eq!(lines.len(), 6);
     for (channel, snr) in [(Channel::Wgn, 30), (Channel::Mpg, 20)] {
@@ -368,13 +368,15 @@ fn blackbox_selftest_records_every_field() {
                     f[5] == channel.name() && f[6] == snr.to_string() && f[8] == trial.to_string()
                 })
                 .unwrap();
-            assert_eq!(fields.len(), 25);
+            assert_eq!(fields.len(), 26);
             assert_eq!(fields[0], "coppad");
             assert!(fields[2].starts_with("VERSION Coppa"));
             assert_eq!(
                 fields[9],
                 format!("0x{:x}", cell.seed(SEED_BASE, trial).unwrap())
             );
+            // COP-256: the published f32le rows carry a 0 dB capture gain.
+            assert_eq!(fields[25], "0");
             assert!(fields
                 .iter()
                 .enumerate()
@@ -420,18 +422,19 @@ fn blackbox_selftest_rows_carry_the_seeded_payload() {
     let text = read(&default_out_dir().join("blackbox-coppad.csv"));
     let mut lines = text.lines();
     let header: Vec<_> = lines.next().unwrap().split(',').collect();
-    assert_eq!(header.last(), Some(&"payload_crc32"));
+    assert_eq!(header.last(), Some(&"capture_gain_db"));
     let column = |name: &str| {
         header
             .iter()
             .position(|h| *h == name)
             .unwrap_or_else(|| panic!("no {name} column"))
     };
-    let (sha, seed, size, crc) = (
+    let (sha, seed, size, crc, gain) = (
         column("binary_sha256"),
         column("seed"),
         column("size_bytes"),
         column("payload_crc32"),
+        column("capture_gain_db"),
     );
     let rows: Vec<Vec<&str>> = lines.map(|l| l.split(',').collect()).collect();
     assert_eq!(rows.len(), 6);
@@ -443,6 +446,9 @@ fn blackbox_selftest_rows_carry_the_seeded_payload() {
     for row in &rows {
         assert_eq!(row.len(), header.len(), "{row:?}");
         assert_eq!(row[sha], first_sha, "rows from two binaries: {row:?}");
+        // COP-256: f32le rows never pass a gain stage, so the appended
+        // column is a schema migration, not a re-record.
+        assert_eq!(row[gain], "0", "a gained f32le row: {row:?}");
         let seed = u64::from_str_radix(row[seed].strip_prefix("0x").unwrap(), 16).unwrap();
         let size: usize = row[size].parse().unwrap();
         let payload = coppa_bench::compare::link_stack::payload(seed, size);

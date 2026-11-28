@@ -16,6 +16,17 @@ Older releases have no entry here. Their on-air breaks are listed in
 
 ## Unreleased: 0.18.0
 
+- COP-256: `coppa-bench compare blackbox` records s16le trials at the low
+  end of the SNR grid instead of refusing them. Each trial derives one
+  fixed whole-dB capture gain from the calibrated TX power, the cell's
+  channel and SNR and the native capture rate, and scales both captures
+  after the channel and before quantization, so the SNR is unchanged; the
+  gain is recorded as a final `capture_gain_db` column and a resumed run
+  must derive the same value for the requested cell, while a CSV from
+  before the column is refused. The integrity probe and the calibration
+  stay at unity gain, f32le rows record 0, and a block that would still
+  clip is refused exactly as before. The six published coppad rows gained
+  the column as a schema migration, not a re-record.
 - COP-246: coppad decodes received frames and runs the floor detector on a
   worker task while its event loop drains the audio input ring. A decode slower
   than the default ring no longer drops the next frame under CPU contention.

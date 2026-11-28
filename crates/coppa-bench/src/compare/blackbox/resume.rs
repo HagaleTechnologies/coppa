@@ -1,4 +1,5 @@
-//! Resume rules for a black-box CSV (COP-214; COP-227 added the payload).
+//! Resume rules for a black-box CSV (COP-214; COP-227 added the payload,
+//! COP-256 the capture gain).
 
 use super::{profile::Profile, score, CSV_COLUMNS, CSV_HEADER as HEADER};
 use crate::compare::grid::{Cell, Channel};
@@ -12,12 +13,15 @@ pub struct CsvIdentity<'a> {
     pub version: &'a str,
     pub seed_base: u64,
     pub power: [f32; 2],
+    /// COP-256: the capture gain this run derives for the requested cell.
+    pub capture_gain_db: i32,
     pub requested: (Channel, i32, usize),
 }
 
-/// Accept only the current header. A CSV from before COP-227 has no
-/// `payload_crc32` column, so its rows' payload is unknown and it is refused
-/// by name.
+/// Accept only the current header. A CSV from before COP-256 has no
+/// `capture_gain_db` column, so its rows' capture level is unknown and it
+/// is refused by name; the still older pre-COP-227 CSV keeps its payload
+/// error.
 ///
 /// # Errors
 ///
@@ -27,8 +31,13 @@ pub fn check_header(csv: &str) -> Result<()> {
     if first == Some(HEADER) {
         return Ok(());
     }
+    let pre_gain = HEADER.strip_suffix(",capture_gain_db");
     anyhow::ensure!(
-        first != HEADER.strip_suffix(",payload_crc32"),
+        first != pre_gain,
+        "black-box CSV has no capture_gain_db column; use a fresh --out-dir"
+    );
+    anyhow::ensure!(
+        first != pre_gain.and_then(|h| h.strip_suffix(",payload_crc32")),
         "black-box CSV has no payload_crc32 column, so the payload of its rows is unknown; use a fresh --out-dir"
     );
     anyhow::bail!("black-box CSV header mismatch")
@@ -41,7 +50,7 @@ pub fn check_header(csv: &str) -> Result<()> {
 /// # Errors
 ///
 /// The header is not current, a row is malformed or off the grid, a row's
-/// identity or payload differs, or a cell is recorded twice.
+/// identity, payload or capture gain differs, or a cell is recorded twice.
 pub fn recorded_cells(
     csv: &str,
     identity: &CsvIdentity<'_>,
@@ -93,6 +102,26 @@ pub fn recorded_cells(
             line_no + 1,
             c[24]
         );
+        // COP-256: every row states a whole-dB capture gain, and the
+        // requested cell's rows must carry the gain this run derived, so a
+        // resumed CSV cannot mix gained and ungained rows. Other cells keep
+        // their own gain, as they keep their own power.
+        let gain_db: i32 = c[25]
+            .parse()
+            .with_context(|| format!("malformed capture gain on CSV row {}", line_no + 1))?;
+        anyhow::ensure!(
+            gain_db <= 0,
+            "malformed capture gain on CSV row {}: capture_gain_db {gain_db} is not a whole-dB attenuation",
+            line_no + 1
+        );
+        if (channel, snr, size) == identity.requested {
+            anyhow::ensure!(
+                gain_db == identity.capture_gain_db,
+                "recorded capture gain mismatch on CSV row {}: capture_gain_db {gain_db}, expected {}; use a fresh --out-dir",
+                line_no + 1,
+                identity.capture_gain_db
+            );
+        }
         anyhow::ensure!(
             seen.insert((channel.name().to_string(), snr, size, trial)),
             "duplicate black-box CSV row {}",
@@ -117,11 +146,12 @@ mod tests {
             version: "VERSION Coppa 0.16.0",
             seed_base: 0x1700_0000,
             power: [0.02, 0.03],
+            capture_gain_db: 0,
             requested: (Channel::Wgn, 30, 2048),
         }
     }
 
-    const ROW: &str = "coppad,vara,VERSION Coppa 0.16.0,abc,HF_STANDARD,wgn,30,2048,0,0x17000000,0.020000,0.030000,600,complete,7,2048,true,50,2457,0,58,355,0,0,0x6887c6a5";
+    const ROW: &str = "coppad,vara,VERSION Coppa 0.16.0,abc,HF_STANDARD,wgn,30,2048,0,0x17000000,0.020000,0.030000,600,complete,7,2048,true,50,2457,0,58,355,0,0,0x6887c6a5,0";
 
     #[test]
     fn resumed_rows_require_same_seed_binary_version_and_cell_power() {
@@ -152,7 +182,10 @@ mod tests {
     fn resume_refuses_a_csv_without_the_payload_column() {
         let profile = profile();
         let identity = identity(&profile);
-        let legacy_header = HEADER.strip_suffix(",payload_crc32").unwrap();
+        let legacy_header = HEADER
+            .strip_suffix(",capture_gain_db")
+            .and_then(|h| h.strip_suffix(",payload_crc32"))
+            .unwrap();
         assert_eq!(legacy_header.split(',').count(), 24);
         let legacy = format!(
             "{legacy_header}\ncoppad,vara,VERSION Coppa 0.16.0,9b8b4957d0c18b1df65c23d26a97b2a855101fff94fb6902757ff0c1d6d1327e,HF_STANDARD,wgn,30,2048,0,0x17000000,0.022691,0.020689,600,complete,7.078,2048,true,51.477,2387.090,0,58.555,355,0,0\n"
@@ -171,6 +204,96 @@ mod tests {
             "{message}"
         );
         assert!(check_header(&format!("{HEADER}\n")).is_ok());
+    }
+
+    /// COP-256: a 25-column CSV from before the gain column is refused by
+    /// name, before the still older payload error is considered.
+    #[test]
+    fn resume_refuses_a_csv_without_the_capture_gain_column() {
+        let profile = profile();
+        let identity = identity(&profile);
+        let legacy_header = HEADER.strip_suffix(",capture_gain_db").unwrap();
+        assert_eq!(legacy_header.split(',').count(), 25);
+        assert!(legacy_header.ends_with(",payload_crc32"));
+        let row = ROW.strip_suffix(",0").unwrap();
+        let legacy = format!("{legacy_header}\n{row}\n");
+        for message in [
+            format!("{:#}", check_header(&legacy).unwrap_err()),
+            format!("{:#}", recorded_cells(&legacy, &identity).unwrap_err()),
+        ] {
+            assert!(message.contains("no capture_gain_db column"), "{message}");
+            assert!(message.contains("use a fresh --out-dir"), "{message}");
+            assert!(!message.contains("no payload_crc32 column"), "{message}");
+        }
+    }
+
+    /// COP-256 AC6: the requested cell's rows must carry the gain this run
+    /// derived; other cells keep their own gain values.
+    #[test]
+    fn resumed_rows_require_same_gain_in_the_requested_cell() {
+        let profile = profile();
+        let identity = identity(&profile);
+        let csv = format!("{HEADER}\n{ROW}\n");
+        assert_eq!(recorded_cells(&csv, &identity).unwrap().len(), 1);
+        // A different gain in the requested cell is refused with both values.
+        let other_gain = csv.replace(",0x6887c6a5,0", ",0x6887c6a5,-7");
+        let message = format!("{:#}", recorded_cells(&other_gain, &identity).unwrap_err());
+        assert!(
+            message.contains("recorded capture gain mismatch on CSV row 2"),
+            "{message}"
+        );
+        assert!(
+            message.contains("capture_gain_db -7, expected 0"),
+            "{message}"
+        );
+        assert!(message.contains("use a fresh --out-dir"), "{message}");
+        // The same row in another cell keeps its own gain, as its own power.
+        let other_cell = csv
+            .replace("wgn,30", "mpg,20")
+            .replace("0x17000000", "0x17120000")
+            .replace("0.020000", "0.040000")
+            .replace(
+                "0x6887c6a5,0",
+                &format!(
+                    "{},-9",
+                    score::payload_crc32(&score::trial_payload(0x1712_0000, 2048))
+                ),
+            );
+        assert!(recorded_cells(&other_cell, &identity).is_ok());
+    }
+
+    /// COP-256 AC6: every row's gain must be a whole-dB attenuation.
+    #[test]
+    fn resume_refuses_invalid_capture_gain() {
+        let profile = profile();
+        let identity = identity(&profile);
+        let csv = format!("{HEADER}\n{ROW}\n");
+        for (value, needle) in [
+            ("x", "malformed capture gain on CSV row 2"),
+            ("3", "capture_gain_db 3 is not a whole-dB attenuation"),
+            ("", "malformed capture gain on CSV row 2"),
+            ("0.5", "malformed capture gain on CSV row 2"),
+        ] {
+            let bad = csv.replace(",0x6887c6a5,0", &format!(",0x6887c6a5,{value}"));
+            let message = format!("{:#}", recorded_cells(&bad, &identity).unwrap_err());
+            assert!(message.contains(needle), "{value}: {message}");
+        }
+        // An invalid gain in another cell is refused too, not just ignored.
+        let other_cell = csv
+            .replace("wgn,30", "mpg,20")
+            .replace("0x17000000", "0x17120000")
+            .replace(
+                "0x6887c6a5,0",
+                &format!(
+                    "{},7",
+                    score::payload_crc32(&score::trial_payload(0x1712_0000, 2048))
+                ),
+            );
+        let message = format!("{:#}", recorded_cells(&other_cell, &identity).unwrap_err());
+        assert!(
+            message.contains("capture_gain_db 7 is not a whole-dB attenuation"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -203,7 +326,7 @@ mod tests {
             assert!(message.contains("0x6887c6a5"), "{message}");
             assert!(message.contains("use a fresh --out-dir"), "{message}");
         }
-        let short_row = ROW.strip_suffix(",0x6887c6a5").unwrap();
+        let short_row = ROW.strip_suffix(",0x6887c6a5,0").unwrap();
         let message = format!(
             "{:#}",
             recorded_cells(&format!("{HEADER}\n{short_row}\n"), &identity).unwrap_err()

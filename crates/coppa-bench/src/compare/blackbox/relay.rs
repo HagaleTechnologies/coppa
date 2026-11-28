@@ -44,7 +44,7 @@ pub fn mute_for_own_playback(playback: &[f32], hold: &mut u8) -> bool {
 
 #[cfg(target_os = "linux")]
 pub mod io {
-    use super::super::native::{Converter, NativeFormat, SampleFormat};
+    use super::super::native::{Capture, Converter, NativeFormat, SampleFormat};
     use super::{mute_for_own_playback, take_whole_block, validate_playback, BLOCK};
     use anyhow::{Context, Result};
     use coppa_channel::persistent::{PersistentChannel, SnrProfile};
@@ -91,8 +91,10 @@ pub mod io {
     }
 
     impl Relay {
-        /// Starts the cable's clock. Each station plays and captures in
-        /// `native`; the channel runs at f32 48000 Hz between conversions.
+        /// Starts the cable's clock at unity capture gain, the path the
+        /// integrity probe and the calibration use. Each station plays and
+        /// captures in `native`; the channel runs at f32 48000 Hz between
+        /// conversions.
         pub fn start(
             dir: &Path,
             native: NativeFormat,
@@ -101,6 +103,21 @@ pub mod io {
             ref_power: [f32; 2],
             seed: u64,
         ) -> Result<Self> {
+            Self::start_capture(dir, Capture::unity(native), config, snr_db, ref_power, seed)
+        }
+
+        /// The trial entry (COP-256): the same cable carrying a fixed
+        /// capture gain, one value for both directions of the whole trial.
+        /// The probe and the calibration stay on [`Relay::start`].
+        pub(in crate::compare::blackbox) fn start_capture(
+            dir: &Path,
+            capture: Capture,
+            config: Option<WattersonConfig>,
+            snr_db: Option<i32>,
+            ref_power: [f32; 2],
+            seed: u64,
+        ) -> Result<Self> {
+            let native = capture.native;
             let a_in = open(&dir.join("ab_in"), native)?;
             let b_in = open(&dir.join("ba_in"), native)?;
             let a_out = open(&dir.join("ab_out"), native)?;
@@ -120,7 +137,7 @@ pub mod io {
                 run_loop(
                     [a_in, b_in],
                     [a_out, b_out],
-                    native,
+                    capture,
                     &mut channels,
                     &st,
                     &ct,
@@ -226,12 +243,13 @@ pub mod io {
     fn run_loop(
         mut inputs: [File; 2],
         mut outputs: [File; 2],
-        native: NativeFormat,
+        capture: Capture,
         channels: &mut [PersistentChannel; 2],
         stop: &AtomicBool,
         counts: &Counters,
         marker_dir: &Path,
     ) -> Result<()> {
+        let native = capture.native;
         let mut bytes = [Vec::new(), Vec::new()];
         let mut samples = [Vec::new(), Vec::new()];
         let mut hold = [0u8; 2];
@@ -278,8 +296,13 @@ pub mod io {
                 ba.fill(0.0);
             }
             // Station B captures A's channel output, and A captures B's.
-            let ab = converters[1].down(&ab);
-            let ba = converters[0].down(&ba);
+            // COP-256: one fixed gain scales both captures after the
+            // channel and before quantization, so the SNR is unchanged;
+            // a block that still clips is refused by the encoder below.
+            let mut ab = converters[1].down(&ab);
+            let mut ba = converters[0].down(&ba);
+            capture.scale(&mut ab);
+            capture.scale(&mut ba);
             if !write_samples(&mut outputs[0], native.format, &ab)? && counting {
                 counts.overflow.fetch_add(1, Ordering::Relaxed);
             }
@@ -336,6 +359,79 @@ mod tests {
         let error = validate_playback(&[f32::INFINITY], NativeFormat::CHANNEL).unwrap_err();
         assert!(error.to_string().contains("f32le 48000 Hz"), "{error}");
         assert!(validate_playback(&[3.4e12], NativeFormat::CHANNEL).is_err());
+    }
+
+    /// COP-256 AC2: one gain scales signal and noise equally in both
+    /// directions for a whole s16le trial, before quantization. Each pair
+    /// replays the same seeded channel and converter state, so the decoded
+    /// integer capture must be the pre-gain floating-point reference times
+    /// the one amplitude multiplier, to within half an s16 code step plus
+    /// float rounding.
+    #[test]
+    fn s16le_trial_gain_preserves_signal_and_noise() {
+        use super::super::native::{Capture, Converter};
+        use coppa_channel::persistent::{PersistentChannel, SnrProfile};
+
+        let native = NativeFormat::declared(Some("s16le"), Some(12_000), Some(1)).unwrap();
+        let power = [0.023_498, 0.020_689];
+        let capture = Capture::trial(native, false, 0, power);
+        assert_eq!(capture.gain_db, -7);
+        let amplitude = capture.amplitude();
+        let seed = 0x170c_0000u64;
+        // The AC1 planning waveform: 350 ticks of five tones at 0.1 each.
+        let signal: Vec<f32> = (0..350 * native.block())
+            .map(|n| {
+                [350.0, 700.0, 1050.0, 1400.0, 1750.0]
+                    .iter()
+                    .map(|&f| 0.1 * (std::f32::consts::TAU * f * n as f32 / 12_000.0).cos())
+                    .sum()
+            })
+            .collect();
+        let silence = vec![0.0f32; signal.len()];
+        for direction in 0u8..2 {
+            for (label, played) in [("signal+noise", &signal), ("noise-only", &silence)] {
+                let mut gained = Vec::new();
+                let mut reference = Vec::new();
+                let mut bytes = Vec::new();
+                for run in 0..2 {
+                    let mut converter = Converter::new(native);
+                    let mut channel = PersistentChannel::new(
+                        48_000.0,
+                        None,
+                        Some(SnrProfile::constant(0.0)),
+                        power[direction as usize],
+                        seed,
+                        direction,
+                    );
+                    for tick in played.chunks(native.block()) {
+                        let out = channel.process(&converter.up(tick));
+                        let mut block = converter.down(&out);
+                        if run == 0 {
+                            // The capture path, as run_loop applies it.
+                            capture.scale(&mut block);
+                            bytes.clear();
+                            native.format.encode(&block, &mut bytes).unwrap();
+                            native.format.decode(&bytes, &mut gained);
+                        } else {
+                            // The pre-gain reference.
+                            reference.extend_from_slice(&block);
+                        }
+                    }
+                }
+                assert_eq!(
+                    gained.len(),
+                    reference.len(),
+                    "{label} direction {direction}"
+                );
+                for (n, (&coded, &clean)) in gained.iter().zip(&reference).enumerate() {
+                    assert!(
+                        (coded - clean * amplitude).abs() <= 0.5 / 32_768.0 + 2e-7,
+                        "{label} direction {direction} sample {n}: {coded} vs {}",
+                        clean * amplitude
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(all(feature = "cpal-backend", target_os = "linux"))]

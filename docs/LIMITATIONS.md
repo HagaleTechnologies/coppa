@@ -611,12 +611,29 @@ stall scenario does (`docs/testing/bpq-session.md`).
   resized to hold about as much time as the f32 one; that needs Linux 2.6.35
   or later. If a sample an s16le modem would capture is past full scale,
   the relay stops, the trial is not recorded and the run exits with an
-  error; f32le carries such samples unchanged. The cable has no capture
-  gain, and the channel noise covers the whole 24 kHz band at a level set by
+  error; f32le carries such samples unchanged. Since COP-256 the cable has a
+  per-trial capture gain for s16le: one fixed whole-dB attenuation derived
+  from the larger calibrated TX power (a 12 dB crest allowance), the cell's
+  channel (a 4x fading allowance on MPG and MPP), its SNR and the native
+  capture rate's filter, applied to both captures after the channel and
+  before quantization, so the SNR is unchanged and the low end of the grid
+  records instead of refusing. The gain is an estimate, not a bound: a
+  modem whose crest exceeds 12 dB over its calibrated power, a fade beyond
+  the allowance or a TX level that changes between frame types can still
+  clip, and that block is still refused. The integrity probe and the
+  calibration run at unity gain, so AC10's level check still measures the
+  cable itself. The modem hears the attenuated level (a fading cell gets
+  about -9 to -15 dB at every SNR); a modem that gates on absolute level
+  would behave differently from one on a real radio, and the CSV's
+  `capture_gain_db` column records the attenuation so a reader can see it.
+  A resumed run must derive the same gain for the requested cell, so
+  recalibration across a whole-dB boundary needs a fresh `--out-dir` or
+  `--ref-power A,B`, and a CSV from before the column is refused. The
+  channel noise covers the whole 24 kHz band at a level set by
   the modem's TX power: at 48 kHz and a TX power of 0.125 its standard
-  deviation is 1.0 at 0 dB and 0.32 at 10 dB. So an s16le profile can have
-  most of the grid refused, depending on its TX level and rate. No
-  non-coppad modem has run a trial through the native cable yet.
+  deviation is 1.0 at 0 dB and 0.32 at 10 dB. No
+  non-coppad modem has run a trial through the native cable yet; the s16le
+  path is proven with a scripted station, not a real modem.
   A resumed CSV is matched on the profile's name, not its `[audio]` table, so
   a profile that changes its format needs a new name or a fresh `--out-dir`.
   The f32 probe still builds its signal after starting the streams: in the
