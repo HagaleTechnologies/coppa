@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use coppa_audio::{AudioRingConsumer, AudioRingProducer};
-use coppa_engine::{CoppaCore, OfdmBand, StreamFrame};
+use coppa_engine::{CoppaCore, EngineError, OfdmBand, StreamFrame, TransmitHalf};
 use coppa_host::vara::{
     queue_data, queue_response, DataQueued, Queued, RigCommand, VaraCommand, VaraResponse,
     COMMAND_QUEUE_DEPTH, DATA_QUEUE_DEPTH,
@@ -236,6 +236,9 @@ const _: () = assert!(
 /// least 0.65 s past the latest measured decode. It is a fixed bound, not
 /// scaled by level, codeword count or host load (docs/LIMITATIONS.md).
 const SESSION_ACK_PROCESSING_ALLOWANCE: Duration = Duration::from_secs(1);
+/// The drain interval for both off-loop jobs: `run_rx_decode_job` (COP-246)
+/// and `run_tx_encode_job` (COP-258). 5 ms is far below the 8,192-sample
+/// production ring's 170 ms hold, so the loop can drain many times per job.
 const RX_DRAIN_TICK: Duration = Duration::from_millis(5);
 
 /// COP-68: how long a fade-held session link waits with ZERO peer evidence
@@ -1231,6 +1234,10 @@ pub struct EventLoop {
     pending_busy_wait_audio: Vec<f32>,
     /// Optional receive-job delay for deterministic ring-drain tests.
     rx_decode_stall: Option<Duration>,
+    /// Optional transmit-encode-job delay for deterministic ring-drain tests
+    /// (COP-258): holds one `run_tx_encode_job` worker while the event loop
+    /// keeps draining, mirroring `rx_decode_stall`.
+    tx_encode_stall: Option<Duration>,
     /// Dedicated FFT sensor for the `spectrum` WebSocket broadcast (Phase 4
     /// Task 4) -- separate from `busy_gate`'s own internal `SpectrumSensor`
     /// (smaller FFT, tuned for occupancy margin rather than bin resolution).
@@ -1462,6 +1469,7 @@ impl EventLoop {
             last_beacon_time: clock_now(),
             pending_busy_wait_audio: Vec::new(),
             rx_decode_stall: None,
+            tx_encode_stall: None,
             #[cfg(feature = "websocket")]
             spectrum_sensor,
             #[cfg(feature = "websocket")]
@@ -2754,13 +2762,15 @@ impl EventLoop {
                     .and_then(|session| session.keepalive(now).ok())
                     .map(|ka_pdu| ka_pdu.to_bytes());
                 // COP-202: keyed in the shared controller's waveform.
-                if let Some(Ok((samples, mode))) =
-                    ka_bytes.map(|ka_bytes| self.encode_session_frame(&ka_bytes, None))
-                {
-                    // COP-46: `tools/pat-loop` counts these.
-                    tracing::info!(session = id, "Sending session KEEPALIVE");
-                    if self.transmit_samples_keyed(&samples).await > 0 {
-                        self.phy_tx = Some(mode);
+                // COP-258: the encode is an off-loop job, so the Option
+                // combinator became explicit awaits.
+                if let Some(ka_bytes) = ka_bytes {
+                    if let Ok((samples, mode)) = self.encode_session_frame(&ka_bytes, None).await {
+                        // COP-46: `tools/pat-loop` counts these.
+                        tracing::info!(session = id, "Sending session KEEPALIVE");
+                        if self.transmit_samples_keyed(&samples).await > 0 {
+                            self.phy_tx = Some(mode);
+                        }
                     }
                 }
             }
@@ -2949,9 +2959,11 @@ impl EventLoop {
             tracing::warn!(bytes, level, "Queued KISS datagram no longer fits; dropped");
             return;
         };
+        // COP-258: the encode runs off the loop, so the input ring keeps
+        // draining for the whole multi-codeword payload encode.
         match self
-            .engine
-            .encode_uncompressed_with_codewords(&pdu, codewords)
+            .tx_encode_uncompressed_with_codewords(&pdu, codewords)
+            .await
         {
             Ok(samples) => {
                 tracing::info!(bytes, level, codewords, "Sending KISS datagram");
@@ -3122,7 +3134,7 @@ impl EventLoop {
                 }
             }
 
-            match self.engine.encode_bytes(&data) {
+            match self.tx_encode_bytes(&data).await {
                 // Boxed: `transmit_samples` -> `handle_ptt_change` -> (on PTT
                 // release) `try_drain_tx_queue` forms a 3-way async call cycle;
                 // one edge needs indirection to give the compiler a finite-sized
@@ -3197,13 +3209,15 @@ impl EventLoop {
         let take = capacity.min(backlog.len());
         let data: Vec<_> = backlog.iter().take(take).copied().collect();
         let seq = link.tx.next_seq();
-        let encoded = encode_burst(
-            &self.engine,
-            (&link.remote, &link.local, link.ssid),
-            (stream, seq),
-            &data,
-            level,
-        );
+        let addresses = (link.remote.clone(), link.local.clone(), link.ssid);
+        let encoded = self
+            .tx_encode_burst(
+                (&addresses.0, &addresses.1, addresses.2),
+                (stream, seq),
+                &data,
+                level,
+            )
+            .await;
         let (samples, packet_len) = match encoded {
             Ok(encoded) => encoded,
             Err(error) => {
@@ -3211,10 +3225,19 @@ impl EventLoop {
                 return true;
             }
         };
+        // The separate Data encode sizes the ID a key-up would prepend
+        // (COP-121 duration guard). COP-258: off the loop like the burst
+        // itself, so this sizing encode cannot overflow the input ring
+        // either.
         let id_len = if self.id_due() {
-            self.build_beacon_mac_pdu()
-                .and_then(|p| self.engine.encode_bytes(&p.to_bytes()).ok())
-                .map_or(0, |s| s.len())
+            let pdu = self.build_beacon_mac_pdu();
+            match pdu {
+                Some(pdu) => self
+                    .tx_encode_bytes(&pdu.to_bytes())
+                    .await
+                    .map_or(0, |s| s.len()),
+                None => 0,
+            }
         } else {
             0
         };
@@ -3248,7 +3271,8 @@ impl EventLoop {
             });
             link.tx_codewords = 1;
         }
-        self.set_session_segment_floor(keyed, packet_len, 1, LinkPhyMode::Ofdm { level });
+        self.set_session_segment_floor(keyed, packet_len, 1, LinkPhyMode::Ofdm { level })
+            .await;
         if let Some(link) = self.session_link.as_mut() {
             link.stream_backlog_mut(stream).drain(..take);
             link.tx_stream = stream;
@@ -3284,7 +3308,7 @@ impl EventLoop {
         let ack = session_ack_frame(link);
         // COP-210: `encode_bytes` encodes at the engine's current level.
         let level = self.engine.speed_level();
-        match self.engine.encode_bytes(&ack) {
+        match self.tx_encode_bytes(&ack).await {
             Ok(samples) => {
                 let doubled = [samples.as_slice(), samples.as_slice()].concat();
                 let generation = self.tx_generation;
@@ -3536,11 +3560,12 @@ impl EventLoop {
         // COP-202: a floor segment goes through the shared waveform choice
         // (the floor, or the level-1 probe); every other segment keeps
         // today's multi-codeword OFDM encode at the engine level.
+        // COP-258: both branches run their encode off the loop.
         let encoded = if floor_segment {
-            self.encode_session_frame(&frame, None)
+            self.encode_session_frame(&frame, None).await
         } else {
-            self.engine
-                .encode_bytes_with_codewords(&frame, codewords)
+            self.tx_encode_bytes_with_codewords(&frame, codewords)
+                .await
                 .map(|samples| (samples, LinkPhyMode::Ofdm { level }))
                 .map_err(|e| e.to_string())
         };
@@ -3565,7 +3590,8 @@ impl EventLoop {
                 link.tx_outer = None;
             }
         }
-        self.set_session_segment_floor(keyed, samples.len(), codewords, mode);
+        self.set_session_segment_floor(keyed, samples.len(), codewords, mode)
+            .await;
         if self.tx_generation == generation {
             // The gate passed above but refused after the courtesy wait (the
             // one `transmit_samples` path that keys nothing and leaves
@@ -3632,7 +3658,7 @@ impl EventLoop {
     ///
     /// COP-202: a floor key-up's floor is the shared floor RTO floor plus
     /// the peer's station-ID allowance and any ID we prepended (Decision 8).
-    fn set_session_segment_floor(
+    async fn set_session_segment_floor(
         &mut self,
         keyed: usize,
         frame_len: usize,
@@ -3646,7 +3672,7 @@ impl EventLoop {
             let sr = self.engine.config().sample_rate as f64;
             let own_id = Duration::from_secs_f64(keyed.saturating_sub(frame_len) as f64 / sr);
             let floor = floor_policy::floor_rto_floor(self.turnaround())
-                + self.station_id_allowance()
+                + self.station_id_allowance().await
                 + own_id;
             if let Some(link) = self.session_link.as_mut() {
                 link.tx.set_segment_floor(floor);
@@ -3946,20 +3972,25 @@ impl EventLoop {
     /// may prepend to its reply, sized from our own ID frame. The peer's ID
     /// timer decides whether it prepends one, so this does not depend on our
     /// `id_interval_secs`; an ID we prepend is counted separately by the
-    /// callers. Zero only when no local callsign is configured.
-    fn station_id_allowance(&self) -> Duration {
-        self.encode_id_beacon_frame().map_or(Duration::ZERO, |id| {
-            Duration::from_secs_f64(id.len() as f64 / self.engine.config().sample_rate as f64)
-        })
+    /// callers. Zero only when no local callsign is configured. COP-258:
+    /// the ID encode runs off the loop, so the ring keeps draining while it
+    /// is sized.
+    async fn station_id_allowance(&mut self) -> Duration {
+        self.encode_id_beacon_frame()
+            .await
+            .map_or(Duration::ZERO, |id| {
+                Duration::from_secs_f64(id.len() as f64 / self.engine.config().sample_rate as f64)
+            })
     }
 
     /// COP-202: the one encode path for session frames. The waveform is
     /// `Ofdm { level: pin }` while a speed level is pinned, else `reply_to`
     /// (the waveform the frame being answered arrived on), else the shared
     /// controller's choice. A floor frame larger than one floor PDU goes on
-    /// OFDM at the current level instead.
-    fn encode_session_frame(
-        &self,
+    /// OFDM at the current level instead. COP-258: async because the encode
+    /// runs off the loop through [`Self::run_tx_encode_job`].
+    async fn encode_session_frame(
+        &mut self,
         bytes: &[u8],
         reply_to: Option<LinkPhyMode>,
     ) -> Result<(Vec<f32>, LinkPhyMode), String> {
@@ -3976,27 +4007,34 @@ impl EventLoop {
             LinkPhyMode::Floor if bytes.len() > FLOOR_MAX_PAYLOAD => LinkPhyMode::Ofdm { level },
             other => other,
         };
-        let samples = self.encode_session_mode(bytes, mode)?;
+        let samples = self.encode_session_mode(bytes, mode).await?;
         Ok((samples, mode))
     }
 
     /// COP-202: encode one session frame in an already chosen waveform.
-    fn encode_session_mode(&self, bytes: &[u8], mode: LinkPhyMode) -> Result<Vec<f32>, String> {
+    /// COP-258: async, and every branch (OFDM and floor alike) runs in one
+    /// off-loop job so the input ring keeps draining during the encode.
+    async fn encode_session_mode(
+        &mut self,
+        bytes: &[u8],
+        mode: LinkPhyMode,
+    ) -> Result<Vec<f32>, String> {
         let level = self.engine.speed_level();
+        let bytes = bytes.to_vec();
         match mode {
-            LinkPhyMode::Floor => self
-                .engine
-                .floor()
-                .encode(bytes)
-                .map_err(|e| format!("{e:?}")),
-            LinkPhyMode::Ofdm { level: l } if l == level => {
-                self.engine.encode_bytes(bytes).map_err(|e| e.to_string())
-            }
-            LinkPhyMode::Ofdm { level: l } => self
-                .engine
-                .encode_bytes_at_level(bytes, l)
+            LinkPhyMode::Floor => self.tx_encode_floor(&bytes).await,
+            LinkPhyMode::Ofdm { level: l } if l == level => self
+                .tx_encode_bytes(&bytes)
+                .await
                 .map_err(|e| e.to_string()),
-            _ => self.engine.encode_bytes(bytes).map_err(|e| e.to_string()),
+            LinkPhyMode::Ofdm { level: l } => self
+                .tx_encode_bytes_at_level(&bytes, l)
+                .await
+                .map_err(|e| e.to_string()),
+            _ => self
+                .tx_encode_bytes(&bytes)
+                .await
+                .map_err(|e| e.to_string()),
         }
     }
 
@@ -4023,7 +4061,7 @@ impl EventLoop {
                 self.floor.timeout(dial.floor);
                 dial.window_expired = true;
             }
-            match self.encode_session_frame(&dial.request, None) {
+            match self.encode_session_frame(&dial.request, None).await {
                 Ok((samples, mode)) => {
                     let destination = self
                         .session_mgr
@@ -4064,7 +4102,7 @@ impl EventLoop {
                                 LinkPhyMode::Floor,
                                 Duration::ZERO,
                                 self.turnaround(),
-                            ) + self.station_id_allowance()
+                            ) + self.station_id_allowance().await
                                 + own_id,
                         );
                     }
@@ -4259,14 +4297,18 @@ impl EventLoop {
                     .session_link
                     .as_ref()
                     .expect("retransmission owns a link");
-                let data = link.tx.get_segment_data(seq).unwrap_or_default();
-                match encode_burst(
-                    &self.engine,
-                    (&link.remote, &link.local, link.ssid),
-                    (link.tx_stream, seq),
-                    data,
-                    outer.level,
-                ) {
+                let data: Vec<u8> = link.tx.get_segment_data(seq).unwrap_or_default().to_vec();
+                let addresses = (link.remote.clone(), link.local.clone(), link.ssid);
+                let tx_stream = link.tx_stream;
+                match self
+                    .tx_encode_burst(
+                        (&addresses.0, &addresses.1, addresses.2),
+                        (tx_stream, seq),
+                        &data,
+                        outer.level,
+                    )
+                    .await
+                {
                     Ok((samples, _)) => {
                         let keyed = Box::pin(self.transmit_samples_keyed(&samples)).await;
                         if keyed > 0 {
@@ -4277,7 +4319,8 @@ impl EventLoop {
                             outer.packets_len,
                             1,
                             LinkPhyMode::Ofdm { level: outer.level },
-                        );
+                        )
+                        .await;
                     }
                     Err(error) => tracing::warn!(%error, "Failed to encode outer retransmission"),
                 }
@@ -4306,27 +4349,35 @@ impl EventLoop {
             // including after an outer-coded OFDM send. A larger frame uses
             // floor fragments only with bit 7 negotiated; otherwise its
             // original ARQ slot remains on the OFDM retry path.
+            // COP-258: the OFDM fallback and plain retransmits run their
+            // encodes off the loop, one job per frame.
             let encoded = if floor_retransmit {
-                self.encode_session_frame(&frame, None)
+                self.encode_session_frame(&frame, None).await
             } else {
-                match self.session_link.as_ref().and_then(|l| l.fallback.as_ref()) {
-                    Some(fallback) => self
-                        .engine
-                        .encode_bytes_with_level_and_codewords(&frame, fallback.level, codewords)
+                let fallback = self
+                    .session_link
+                    .as_ref()
+                    .and_then(|l| l.fallback.as_ref())
+                    .map(|fallback| fallback.level);
+                match fallback {
+                    Some(fallback_level) => self
+                        .tx_encode_bytes_with_level_and_codewords(&frame, fallback_level, codewords)
+                        .await
                         .map(|samples| {
                             (
                                 samples,
                                 LinkPhyMode::Ofdm {
-                                    level: fallback.level,
+                                    level: fallback_level,
                                 },
                             )
-                        }),
+                        })
+                        .map_err(|e| e.to_string()),
                     None => self
-                        .engine
-                        .encode_bytes_with_codewords(&frame, codewords)
-                        .map(|samples| (samples, LinkPhyMode::Ofdm { level })),
+                        .tx_encode_bytes_with_codewords(&frame, codewords)
+                        .await
+                        .map(|samples| (samples, LinkPhyMode::Ofdm { level }))
+                        .map_err(|e| e.to_string()),
                 }
-                .map_err(|e| e.to_string())
             };
             match encoded {
                 Ok((samples, mode)) => {
@@ -4335,7 +4386,8 @@ impl EventLoop {
                     if keyed > 0 {
                         self.phy_tx = Some(mode);
                     }
-                    self.set_session_segment_floor(keyed, samples.len(), codewords, mode);
+                    self.set_session_segment_floor(keyed, samples.len(), codewords, mode)
+                        .await;
                 }
                 Err(e) => tracing::warn!(
                     error = %e,
@@ -4435,7 +4487,7 @@ impl EventLoop {
         }) else {
             return;
         };
-        let Ok(samples) = self.encode_session_mode(&frame, LinkPhyMode::Floor) else {
+        let Ok(samples) = self.encode_session_mode(&frame, LinkPhyMode::Floor).await else {
             return;
         };
         let keyed = Box::pin(self.transmit_samples_keyed(&samples)).await;
@@ -4443,7 +4495,7 @@ impl EventLoop {
         let own_id = Duration::from_secs_f64(
             keyed.saturating_sub(samples.len()) as f64 / self.engine.config().sample_rate as f64,
         );
-        let interval = self.fragment_response_window(own_id);
+        let interval = self.fragment_response_window(own_id).await;
         // COP-68: a later OFDM retry of this slot encodes the real plain
         // frame at the fallback level, so size it from that frame and the
         // segment's codeword count, as the OFDM retry path does.
@@ -4638,17 +4690,19 @@ impl EventLoop {
     /// frames, two turnarounds and the delivery margin), the peer's
     /// station-ID allowance and any ID we prepended, as for an ordinary
     /// floor key-up, plus PTT pre-delay and tail for both key-ups, which the
-    /// normal OFDM budget also counts.
-    fn fragment_response_window(&self, own_id: Duration) -> Duration {
+    /// normal OFDM budget also counts. COP-258: async because sizing the
+    /// peer's ID allowance encodes a frame off the loop.
+    async fn fragment_response_window(&mut self, own_id: Duration) -> Duration {
         let radio = &self.config.radio;
+        let keyups = Duration::from_millis(radio.ptt_pre_delay_ms + radio.ptt_tail_delay_ms) * 2;
         floor_policy::floor_rto_floor(self.turnaround())
-            + self.station_id_allowance()
+            + self.station_id_allowance().await
             + own_id
-            + Duration::from_millis(radio.ptt_pre_delay_ms + radio.ptt_tail_delay_ms) * 2
+            + keyups
     }
 
     async fn send_floor_fragment_reply(&mut self, frame: Vec<u8>) {
-        if let Ok(samples) = self.encode_session_mode(&frame, LinkPhyMode::Floor) {
+        if let Ok(samples) = self.encode_session_mode(&frame, LinkPhyMode::Floor).await {
             if Box::pin(self.transmit_samples_keyed(&samples)).await > 0 {
                 self.phy_tx = Some(LinkPhyMode::Floor);
             }
@@ -4702,7 +4756,7 @@ impl EventLoop {
                 Ok(disc_pdu) => {
                     let pdu_bytes = disc_pdu.to_bytes();
                     // COP-202: keyed in the shared controller's waveform.
-                    match self.encode_session_frame(&pdu_bytes, None) {
+                    match self.encode_session_frame(&pdu_bytes, None).await {
                         Ok((samples, _)) => {
                             let samples = self.with_closing_cw_id(samples, session_id);
                             Box::pin(self.transmit_samples(&samples)).await
@@ -5005,7 +5059,7 @@ impl EventLoop {
         self.discard_session_tx(pending.session_id).await; // Drops the drained link.
 
         // COP-202: keyed in the shared controller's waveform.
-        match self.encode_session_frame(&pending.pdu_bytes, None) {
+        match self.encode_session_frame(&pending.pdu_bytes, None).await {
             // Boxed: `handle_ptt_change` -> `finish_drained_disconnect` ->
             // `transmit_samples` -> `handle_ptt_change` is the same async
             // call cycle `drain_session_link` documents.
@@ -5670,7 +5724,7 @@ impl EventLoop {
                                         .await;
                                     }
                                     let pdu_bytes = req_pdu.to_bytes();
-                                    match self.engine.encode_bytes(&pdu_bytes) {
+                                    match self.tx_encode_bytes(&pdu_bytes).await {
                                         Ok(samples) => {
                                             // COP-202: an explicit RETRIES is
                                             // honoured exactly; unset (always
@@ -5724,7 +5778,9 @@ impl EventLoop {
                                                     interval += Duration::from_secs_f64(
                                                         sent.saturating_sub(samples.len()) as f64
                                                             / sr,
-                                                    ) + self.station_id_allowance();
+                                                    ) + self
+                                                        .station_id_allowance()
+                                                        .await;
                                                 }
                                                 // COP-210: the lexically higher
                                                 // floor-enabled caller listens
@@ -6043,7 +6099,7 @@ impl EventLoop {
                         .await;
                     return;
                 }
-                if let Some(samples) = self.encode_id_beacon_frame() {
+                if let Some(samples) = self.encode_id_beacon_frame().await {
                     let id_before = self.last_id_time.replace(clock_now());
                     let generation = self.tx_generation;
                     self.transmit_samples(&samples).await;
@@ -6335,6 +6391,155 @@ impl EventLoop {
         (frames, floor)
     }
 
+    /// Encode on the blocking pool while continuing to drain input (COP-258),
+    /// the transmit counterpart of [`Self::run_rx_decode_job`]. `job` runs
+    /// exactly once with the checked-out [`TransmitHalf`] on a worker thread
+    /// and may take as long as the encode needs; while it runs, this loop
+    /// drains the input ring every [`RX_DRAIN_TICK`] through
+    /// [`Self::observe_busy_gate_from_audio_input`], so unkeyed input reaches
+    /// the busy detector and is parked for the next receive poll instead of
+    /// overflowing the ring. The half is restored before any result (or
+    /// error, or panic) is returned. `Err` only reports the half being
+    /// checked out, which cannot happen while every job is awaited to
+    /// completion on this single-threaded loop.
+    async fn run_tx_encode_job<T, F>(&mut self, job: F) -> Result<T, EngineError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&TransmitHalf) -> T + Send + 'static,
+    {
+        let Some(half) = self.engine.take_transmit() else {
+            return Err(EngineError::TransmitHalfUnavailable);
+        };
+        let stall = self.tx_encode_stall;
+        let mut task = tokio::task::spawn_blocking(move || {
+            if let Some(stall) = stall {
+                std::thread::sleep(stall);
+            }
+            // Catch the job's panic so the half always comes back to the
+            // loop, then resume it below exactly like the RX path resumes a
+            // worker panic. A resumed panic still kills the loop task, but
+            // the engine is never left with its encoder checked out.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&half)));
+            (half, result)
+        });
+        let (half, result) = loop {
+            match tokio::time::timeout(RX_DRAIN_TICK, &mut task).await {
+                Ok(Ok(done)) => break done,
+                Ok(Err(err)) => std::panic::resume_unwind(err.into_panic()),
+                Err(_) => self.observe_busy_gate_from_audio_input().await,
+            }
+        };
+        self.engine.put_transmit(half);
+        // Drain at completion as well, so consecutive short jobs still give
+        // input a chance to move between them.
+        self.observe_busy_gate_from_audio_input().await;
+        let result = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        Ok(result)
+    }
+
+    /// [`CoppaCore::encode_bytes`] off the loop (COP-258). Identical samples
+    /// and errors; the event loop keeps draining while it runs.
+    async fn tx_encode_bytes(&mut self, data: &[u8]) -> Result<Vec<f32>, EngineError> {
+        let data = data.to_vec();
+        self.run_tx_encode_job(move |half| half.encode_bytes(&data))
+            .await
+            .and_then(|encoded| encoded)
+    }
+
+    /// [`CoppaCore::encode_bytes_with_codewords`] off the loop (COP-258).
+    async fn tx_encode_bytes_with_codewords(
+        &mut self,
+        data: &[u8],
+        codewords: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        let data = data.to_vec();
+        self.run_tx_encode_job(move |half| half.encode_bytes_with_codewords(&data, codewords))
+            .await
+            .and_then(|encoded| encoded)
+    }
+
+    /// [`CoppaCore::encode_bytes_with_level_and_codewords`] off the loop
+    /// (COP-258): the session fade-hold retransmit path.
+    async fn tx_encode_bytes_with_level_and_codewords(
+        &mut self,
+        data: &[u8],
+        level: u8,
+        codewords: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        let data = data.to_vec();
+        self.run_tx_encode_job(move |half| {
+            half.encode_bytes_with_level_and_codewords(&data, level, codewords)
+        })
+        .await
+        .and_then(|encoded| encoded)
+    }
+
+    /// [`CoppaCore::encode_uncompressed_with_codewords`] off the loop
+    /// (COP-258): the KISS datagram path.
+    async fn tx_encode_uncompressed_with_codewords(
+        &mut self,
+        data: &[u8],
+        codewords: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        let data = data.to_vec();
+        self.run_tx_encode_job(move |half| {
+            half.encode_uncompressed_with_codewords(&data, codewords)
+        })
+        .await
+        .and_then(|encoded| encoded)
+    }
+
+    /// [`CoppaCore::encode_bytes_at_level`] off the loop (COP-258): the
+    /// station-ID/beacon path.
+    async fn tx_encode_bytes_at_level(
+        &mut self,
+        data: &[u8],
+        level: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        let data = data.to_vec();
+        self.run_tx_encode_job(move |half| half.encode_bytes_at_level(&data, level))
+            .await
+            .and_then(|encoded| encoded)
+    }
+
+    /// [`CoppaCore::floor`] encoding off the loop (COP-258): a floor session
+    /// frame. The floor codec is shared with the core, so it stays available
+    /// either way; running it in the job keeps a slow floor encode from
+    /// blocking the drain too.
+    async fn tx_encode_floor(&mut self, bytes: &[u8]) -> Result<Vec<f32>, String> {
+        let bytes = bytes.to_vec();
+        match self
+            .run_tx_encode_job(move |half| half.floor().encode(&bytes))
+            .await
+        {
+            Ok(result) => result.map_err(|e| format!("{e:?}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// [`crate::session_outer::encode_burst`] as one whole off-loop job
+    /// (COP-258): an outer-code burst is up to `OUTER_N` frames, the largest
+    /// single encode the daemon runs.
+    async fn tx_encode_burst(
+        &mut self,
+        addresses: (&Callsign, &Callsign, u8),
+        stream_seq: (u8, u8),
+        data: &[u8],
+        level: u8,
+    ) -> Result<(Vec<f32>, usize), anyhow::Error> {
+        let (remote, local, ssid) = (addresses.0.clone(), addresses.1.clone(), addresses.2);
+        let data = data.to_vec();
+        match self
+            .run_tx_encode_job(move |half| {
+                encode_burst(half, (&remote, &local, ssid), stream_seq, &data, level)
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        }
+    }
+
     /// Decode OFDM and floor audio off the event loop, drain the input ring
     /// during the job, then dispatch all results in their original order.
     async fn decode_and_dispatch_audio(&mut self, samples: &[f32]) {
@@ -6439,7 +6644,7 @@ impl EventLoop {
                                             ack_bitmap,
                                             payload,
                                         );
-                                        match self.engine.encode_bytes(&pdu.to_bytes()) {
+                                        match self.tx_encode_bytes(&pdu.to_bytes()).await {
                                             Ok(samples) => self.transmit_samples(&samples).await,
                                             Err(e) => {
                                                 tracing::warn!(error = %e, "Failed to encode CpControl Propose")
@@ -6590,7 +6795,7 @@ impl EventLoop {
                                                 ack_bitmap,
                                                 recommended_level,
                                             );
-                                            match self.engine.encode_bytes(&ack_pdu.to_bytes()) {
+                                            match self.tx_encode_bytes(&ack_pdu.to_bytes()).await {
                                                 Ok(ack_samples) => {
                                                     self.transmit_samples(&ack_samples).await;
                                                 }
@@ -7109,7 +7314,7 @@ impl EventLoop {
         // placement for free rather than needing separate bookkeeping.
         let combined;
         let samples: &[f32] = if self.id_due() {
-            match self.encode_id_beacon_frame() {
+            match self.encode_id_beacon_frame().await {
                 Some(id_samples) => {
                     self.last_id_time = Some(clock_now());
                     let mut buf = id_samples;
@@ -7137,10 +7342,26 @@ impl EventLoop {
             .tx_stall_clock
             .get_or_insert_with(|| Arc::new(StallClock::new(played_now, keyed_since)))
             .clone();
-        // Enforce PTT pre-delay before writing audio
+        // Enforce PTT pre-delay before writing audio. COP-258: a draining
+        // wait, not a plain sleep -- the pre-delay is unbounded in config
+        // (`ptt_pre_delay_ms` is reloadable), and a slow rig's lead longer
+        // than the 8,192-sample ring's 170 ms would otherwise overflow the
+        // input ring on every key-up. Same narrow drain helper
+        // `wait_for_rx_turnaround` uses (busy-gate observation only, no
+        // dispatch; the keyed samples' audio keeps its existing path to
+        // normal receive handling).
         let pre_delay_ms = self.config.radio.ptt_pre_delay_ms;
         if pre_delay_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(pre_delay_ms)).await;
+            let until =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(pre_delay_ms);
+            loop {
+                self.observe_busy_gate_from_audio_input().await;
+                let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                tokio::time::sleep(remaining.min(RX_DRAIN_TICK)).await;
+            }
         }
         let prior_target = self.tx_output().submitted();
         let feedback_for_submission = self.output_feedback.clone();
@@ -7478,10 +7699,12 @@ impl EventLoop {
     /// Returns `None` if no local callsign is configured, or if encoding
     /// unexpectedly fails (logged; the caller falls back to proceeding
     /// without an ID rather than dropping the real payload it was about to
-    /// send).
-    fn encode_id_beacon_frame(&self) -> Option<Vec<f32>> {
+    /// send). COP-258: async, and the encode runs off the loop so the input
+    /// ring keeps draining while an ID is built.
+    async fn encode_id_beacon_frame(&mut self) -> Option<Vec<f32>> {
         let pdu = self.build_beacon_mac_pdu()?;
-        match self.engine.encode_bytes_at_level(&pdu.to_bytes(), 1) {
+        let bytes = pdu.to_bytes();
+        match self.tx_encode_bytes_at_level(&bytes, 1).await {
             Ok(samples) => Some(samples),
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to encode station-ID/beacon frame");
@@ -7513,7 +7736,7 @@ impl EventLoop {
         if self.busy_gate.current() {
             return;
         }
-        if let Some(samples) = self.encode_id_beacon_frame() {
+        if let Some(samples) = self.encode_id_beacon_frame().await {
             self.last_beacon_time = clock_now();
             // A beacon already fully identifies the station; avoid also
             // prepending a redundant separate ID frame to it.
@@ -7631,7 +7854,7 @@ impl EventLoop {
         }
         // Now encode and transmit (no more borrow on arq_tx)
         for (seq, pdu_bytes) in retransmit_pdus {
-            match self.engine.encode_bytes(&pdu_bytes) {
+            match self.tx_encode_bytes(&pdu_bytes).await {
                 Ok(samples) => {
                     self.transmit_samples(&samples).await;
                     // Only mark a segment retransmitted once its bytes were
@@ -7686,7 +7909,7 @@ impl EventLoop {
                 }
             }
             for (seq, pdu_bytes) in cp_retransmit_pdus {
-                match self.engine.encode_bytes(&pdu_bytes) {
+                match self.tx_encode_bytes(&pdu_bytes).await {
                     Ok(samples) => self.transmit_samples(&samples).await,
                     Err(e) => tracing::warn!(error = %e, "Failed to encode CpControl retransmit"),
                 }
@@ -7883,7 +8106,7 @@ impl EventLoop {
                 return;
             }
             let ack_pdu = TransportPdu::new_cp_control_ack(pdu.session_id, ack_num, ack_bitmap);
-            match self.engine.encode_bytes(&ack_pdu.to_bytes()) {
+            match self.tx_encode_bytes(&ack_pdu.to_bytes()).await {
                 Ok(samples) => self.transmit_samples(&samples).await,
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to encode CpControl duplicate re-ack")
@@ -7931,7 +8154,7 @@ impl EventLoop {
                                 ack_bitmap,
                                 confirm_payload,
                             );
-                            match self.engine.encode_bytes(&reply.to_bytes()) {
+                            match self.tx_encode_bytes(&reply.to_bytes()).await {
                                 Ok(samples) => self.transmit_samples(&samples).await,
                                 Err(e) => {
                                     tracing::warn!(error = %e, "Failed to encode CpControl Confirm")
@@ -7989,7 +8212,7 @@ impl EventLoop {
                     // mutually-undecodable profiles.
                     let ack_pdu =
                         TransportPdu::new_cp_control_ack(pdu.session_id, ack_num, ack_bitmap);
-                    match self.engine.encode_bytes(&ack_pdu.to_bytes()) {
+                    match self.tx_encode_bytes(&ack_pdu.to_bytes()).await {
                         Ok(samples) => self.transmit_samples(&samples).await,
                         Err(e) => tracing::warn!(error = %e, "Failed to encode CpControl ack"),
                     }
@@ -8034,7 +8257,7 @@ impl EventLoop {
                     }
                     let ack_pdu =
                         TransportPdu::new_cp_control_ack(pdu.session_id, ack_num, ack_bitmap);
-                    match self.engine.encode_bytes(&ack_pdu.to_bytes()) {
+                    match self.tx_encode_bytes(&ack_pdu.to_bytes()).await {
                         Ok(samples) => self.transmit_samples(&samples).await,
                         Err(e) => {
                             tracing::warn!(error = %e, "Failed to encode CpControl Switched-ack")
@@ -8062,7 +8285,7 @@ impl EventLoop {
                 let switched_pdu = TransportPdu::new_cp_control_content(
                     session_id, seq, ack_num, ack_bitmap, payload,
                 );
-                match self.engine.encode_bytes(&switched_pdu.to_bytes()) {
+                match self.tx_encode_bytes(&switched_pdu.to_bytes()).await {
                     Ok(samples) => self.transmit_samples(&samples).await,
                     Err(e) => tracing::warn!(error = %e, "Failed to encode CpControl Switched"),
                 }
@@ -8580,7 +8803,7 @@ impl EventLoop {
                                 .await;
                             }
                             let ack_bytes = ack_pdu.to_bytes();
-                            match self.encode_session_frame(&ack_bytes, rx_mode) {
+                            match self.encode_session_frame(&ack_bytes, rx_mode).await {
                                 Ok((samples, mode)) => {
                                     if self.transmit_samples_keyed(&samples).await > 0 {
                                         self.phy_tx = Some(mode);
@@ -8641,7 +8864,7 @@ impl EventLoop {
                     }
                     self.apply_floor_session_timers(session_id);
                     let cfm_bytes = cfm_pdu.to_bytes();
-                    match self.encode_session_frame(&cfm_bytes, rx_mode) {
+                    match self.encode_session_frame(&cfm_bytes, rx_mode).await {
                         Ok((samples, mode)) => {
                             if self.transmit_samples_keyed(&samples).await > 0 {
                                 self.phy_tx = Some(mode);
@@ -8822,9 +9045,11 @@ impl EventLoop {
         self.note_validated_rx();
         let probe = LinkPhyMode::Ofdm { level: 1 };
         let encoded = if was_floor && rx_mode == Some(probe) && self.floor_enabled() {
-            self.encode_session_mode(&ack, probe).map(|s| (s, probe))
+            self.encode_session_mode(&ack, probe)
+                .await
+                .map(|s| (s, probe))
         } else {
-            self.encode_session_frame(&ack, rx_mode)
+            self.encode_session_frame(&ack, rx_mode).await
         };
         match encoded {
             Ok((samples, mode)) => {
@@ -13259,15 +13484,17 @@ mod tests {
         a.handle_ptt_change(true).await;
         a.check_session_retransmits().await;
         assert!(read_all(&mut audio).is_empty(), "no fragment while keyed");
-        let tx = a
-            .session_link
-            .as_ref()
-            .unwrap()
-            .fragment_tx
-            .as_ref()
-            .unwrap();
-        assert!(!tx.keyed && tx.index == 2, "the index is retained");
-        assert!(tx.deadline > clock_now(), "retried on a later poll");
+        {
+            let tx = a
+                .session_link
+                .as_ref()
+                .unwrap()
+                .fragment_tx
+                .as_ref()
+                .unwrap();
+            assert!(!tx.keyed && tx.index == 2, "the index is retained");
+            assert!(tx.deadline > clock_now(), "retried on a later poll");
+        }
         assert_eq!(
             a.session_link.as_ref().unwrap().tx.transmit_count(seq),
             attempts,
@@ -13287,17 +13514,21 @@ mod tests {
         a.check_session_retransmits().await;
         take_leg(&mut audio, "fragment 2 after PTT release");
         let keyed_at = clock_now();
-        let tx = a
-            .session_link
-            .as_ref()
-            .unwrap()
-            .fragment_tx
-            .as_ref()
-            .unwrap();
-        assert!(tx.keyed && tx.index == 2);
-        let without_ptt = floor_policy::floor_rto_floor(a.turnaround()) + a.station_id_allowance();
+        let (tx_keyed, tx_index, tx_deadline) = {
+            let tx = a
+                .session_link
+                .as_ref()
+                .unwrap()
+                .fragment_tx
+                .as_ref()
+                .unwrap();
+            (tx.keyed, tx.index, tx.deadline)
+        };
+        assert!(tx_keyed && tx_index == 2);
+        let without_ptt =
+            floor_policy::floor_rto_floor(a.turnaround()) + a.station_id_allowance().await;
         assert!(
-            tx.deadline >= keyed_at + without_ptt + Duration::from_millis(2 * (400 + 300)),
+            tx_deadline >= keyed_at + without_ptt + Duration::from_millis(2 * (400 + 300)),
             "the response window counts PTT pre-delay and tail for both key-ups"
         );
     }
@@ -16570,6 +16801,7 @@ mod tests {
         let id_frame = rig
             .event_loop
             .encode_id_beacon_frame()
+            .await
             .expect("a configured callsign builds an ID frame");
         let payload = rig.event_loop.engine.encode_bytes(b"payload").unwrap();
         rig.event_loop.transmit_samples(&payload).await;
@@ -16604,6 +16836,77 @@ mod tests {
         assert!(
             played_at.elapsed() >= Duration::from_millis(200),
             "tail after playback"
+        );
+    }
+
+    /// COP-258 (AC3): a PTT pre-delay longer than the default ring's 171 ms
+    /// keeps draining the input ring while it observes the full lead, so no
+    /// input is lost and no audio is submitted before the lead ends. The
+    /// payload is pre-encoded and the station already identified, so the
+    /// pre-delay is the only wait.
+    #[tokio::test(start_paused = true)]
+    async fn long_ptt_pre_delay_keeps_draining_before_audio_submission() {
+        const CHUNK: usize = 960; // 20 ms at 48 kHz
+        const CHUNKS: usize = 27; // 540 ms of input, more than 3x the ring
+        let mut config = DaemonConfig::default();
+        config.engine.callsign = "N0CALL".to_string();
+        config.radio.ptt_pre_delay_ms = 400;
+        config.radio.ptt_tail_delay_ms = 0;
+        config.radio.turnaround_ms = 0;
+        assert_eq!(config.audio.buffer_size, 8192);
+        let mut station = EventLoop::new(config).unwrap();
+        mark_identified(&mut station);
+        let (tx_out, out_consumer) = coppa_audio::audio_ring(4_000_000);
+        station.set_audio_out(tx_out);
+        let (mut producer, consumer) = coppa_audio::audio_ring(8192);
+        station.set_audio_in(consumer);
+        let payload = station.engine.encode_bytes(b"pre-delay probe").unwrap();
+
+        let writer = async {
+            for i in 0..CHUNKS {
+                producer.write(&vec![(i as f32) * 1e-6; CHUNK]);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        // No audio may reach the output before the configured lead ends.
+        let submit_probe = async {
+            tokio::time::sleep(Duration::from_millis(400 - 10)).await;
+            assert_eq!(
+                out_consumer.available(),
+                0,
+                "no audio submitted before the lead ends"
+            );
+        };
+        let started = tokio::time::Instant::now();
+        tokio::join!(station.transmit_samples(&payload), writer, submit_probe);
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "the full lead was observed"
+        );
+        let mut input = station.audio_in.take().expect("input ring wired");
+        assert_eq!(input.overflow_count(), 0, "the ring never overflowed");
+        assert_eq!(
+            station.pending_busy_wait_audio.len() + input.available(),
+            CHUNKS * CHUNK,
+            "every written sample is held for decode or still in the ring"
+        );
+        let mut ring_tail = vec![0.0f32; input.available()];
+        let read = input.read(&mut ring_tail);
+        ring_tail.truncate(read);
+        let mut parked = station.pending_busy_wait_audio.clone();
+        parked.extend_from_slice(&ring_tail);
+        let expected: Vec<f32> = (0..CHUNKS)
+            .flat_map(|i| std::iter::repeat_n((i as f32) * 1e-6, CHUNK))
+            .collect();
+        assert_eq!(
+            parked, expected,
+            "input order is preserved for the next poll"
+        );
+        assert_eq!(
+            out_consumer.available(),
+            payload.len(),
+            "the payload was submitted after the lead"
         );
     }
 
@@ -20910,14 +21213,18 @@ mod tests {
             station.config.radio.ptt_pre_delay_ms = 0;
             station.config.radio.ptt_tail_delay_ms = 0;
             let link = station.session_link.as_mut().unwrap();
+            // COP-258: the burst encoder takes the movable transmit half.
+            let addresses = (link.remote.clone(), link.local.clone(), link.ssid);
+            let half = station.engine.take_transmit().unwrap();
             let (burst, packet_len) = encode_burst(
-                &station.engine,
-                (&link.remote, &link.local, link.ssid),
+                &half,
+                (&addresses.0, &addresses.1, addresses.2),
                 (HOST_STREAM, 0),
                 &[31; 200],
                 8,
             )
             .unwrap();
+            station.engine.put_transmit(half);
             link.tx_outer = Some(OuterTx {
                 level: 8,
                 packets_len: packet_len,
@@ -20927,23 +21234,27 @@ mod tests {
             let ack = peer.engine.encode_bytes(&session_ack_frame(link)).unwrap();
             let floor =
                 Duration::from_secs_f64((burst.len() + 2 * ack.len()) as f64 / 48000.0 + 1.5);
-            station.set_session_segment_floor(
-                burst.len(),
-                packet_len,
-                1,
-                LinkPhyMode::Ofdm { level: 1 },
-            );
+            station
+                .set_session_segment_floor(
+                    burst.len(),
+                    packet_len,
+                    1,
+                    LinkPhyMode::Ofdm { level: 1 },
+                )
+                .await;
             assert!(
                 station.session_link.as_ref().unwrap().tx.rto() >= floor,
                 "RS timeout must cover both level-2 peer ACKs"
             );
             station.engine.set_speed_level(7).unwrap();
-            station.set_session_segment_floor(
-                burst.len(),
-                packet_len,
-                1,
-                LinkPhyMode::Ofdm { level: 1 },
-            );
+            station
+                .set_session_segment_floor(
+                    burst.len(),
+                    packet_len,
+                    1,
+                    LinkPhyMode::Ofdm { level: 1 },
+                )
+                .await;
             let link = station.session_link.as_ref().unwrap();
             assert_eq!(link.tx_outer.unwrap().level, 8);
             assert!(
@@ -25541,7 +25852,9 @@ mod tests {
                 }
                 station.apply_reload(file);
                 // Ordinary single-codeword frames clear the segment override.
-                station.set_session_segment_floor(100, 100, 1, LinkPhyMode::Ofdm { level: 1 });
+                station
+                    .set_session_segment_floor(100, 100, 1, LinkPhyMode::Ofdm { level: 1 })
+                    .await;
                 let level = station.engine.speed_level();
                 let expected = coppa_protocol::arq::rto_floor(
                     SESSION_ARQ_WINDOW,
@@ -26220,6 +26533,7 @@ mod tests {
     mod cop60_turnaround {
         use super::*;
         use coppa_engine::profiles::get_profile;
+        use tracing_subscriber::prelude::*;
 
         type Edge = (tokio::time::Instant, PttState);
         type Edges = Arc<std::sync::Mutex<Vec<Edge>>>;
@@ -26484,6 +26798,287 @@ mod tests {
                 station.pending_busy_wait_audio.len() + audio_in.available(),
                 CHUNKS * CHUNK,
                 "every written sample is held for decode or still in the ring"
+            );
+        }
+
+        /// Advance virtual time in [`RX_DRAIN_TICK`] steps until both the
+        /// station future and the writer finish, yielding between steps so
+        /// the draining loop keeps pace (the COP-246 test's driver, as a
+        /// loop bounded by progress instead of a step count).
+        async fn drive_while<T>(
+            station_fut: impl std::future::Future<Output = T>,
+            writer_fut: impl std::future::Future<Output = ()>,
+        ) -> T {
+            let station_done = Arc::new(AtomicBool::new(false));
+            let writer_done = Arc::new(AtomicBool::new(false));
+            let station_flag = Arc::clone(&station_done);
+            let writer_flag = Arc::clone(&writer_done);
+            let driver = async {
+                while !(station_flag.load(Ordering::Acquire) && writer_flag.load(Ordering::Acquire))
+                {
+                    tokio::time::advance(RX_DRAIN_TICK).await;
+                    tokio::task::yield_now().await;
+                }
+            };
+            let station = async {
+                let out = station_fut.await;
+                station_done.store(true, Ordering::Release);
+                out
+            };
+            let writer = async {
+                writer_fut.await;
+                writer_done.store(true, Ordering::Release);
+            };
+            let (out, (), ()) = tokio::join!(station, writer, driver);
+            out
+        }
+
+        /// One 20 ms producer round: `chunks` quiet tagged chunks of 960
+        /// samples at 20 ms intervals. Each chunk carries a distinct tiny
+        /// amplitude so a test can verify the parked-then-ring order.
+        async fn write_tagged_chunks(producer: &mut coppa_audio::AudioRingProducer, chunks: usize) {
+            const CHUNK: usize = 960;
+            for i in 0..chunks {
+                let tag = (i as f32) * 1e-6;
+                producer.write(&vec![tag; CHUNK]);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// COP-258 (AC1): the real KISS enqueue/send path holds its level-2
+        /// payload encode for 400 ms -- well past the default 8,192-sample
+        /// ring's 170 ms -- and the input ring never overflows, because the
+        /// event loop keeps draining while the encode job runs. Default
+        /// 50 ms lead, station ID already sent so the payload encode is the
+        /// only held job.
+        #[tokio::test(start_paused = true)]
+        async fn slow_kiss_encode_keeps_draining_the_default_input_ring() {
+            const CHUNK: usize = 960;
+            const CHUNKS: usize = 27; // 540 ms of input, more than 3x the ring
+            let config = arq_config();
+            // arq_config keeps the default [audio] buffer_size and
+            // ptt_pre_delay_ms; both are load-bearing here.
+            assert_eq!(config.audio.buffer_size, 8192);
+            assert_eq!(config.radio.ptt_pre_delay_ms, 50);
+            assert_eq!(config.engine.profile, "HF_STANDARD");
+            let mut station = EventLoop::new(config).unwrap();
+            install_ptt_log(&mut station);
+            mark_identified(&mut station);
+            let (tx_out, out_consumer) = coppa_audio::audio_ring(4_000_000);
+            station.set_audio_out(tx_out);
+            let (mut producer, consumer) = coppa_audio::audio_ring(8192);
+            station.set_audio_in(consumer);
+            station.tx_encode_stall = Some(Duration::from_millis(400));
+            let mut datagram = vec![0x19u8; 900];
+            for (i, byte) in datagram.iter_mut().enumerate().skip(1) {
+                *byte = (i % 251) as u8;
+            }
+
+            drive_while(
+                station.dispatch_event(Some(DaemonEvent::KissDatagram(datagram))),
+                write_tagged_chunks(&mut producer, CHUNKS),
+            )
+            .await;
+
+            assert_eq!(
+                station.tx_generation, 1,
+                "the datagram keyed a transmission"
+            );
+            assert_eq!(
+                station.ptt.get_ptt().unwrap(),
+                PttState::Tx,
+                "keying follows the encode"
+            );
+            let mut input = station.audio_in.take().expect("input ring wired");
+            assert_eq!(input.overflow_count(), 0, "the ring never overflowed");
+            assert!(
+                out_consumer.available() > 0,
+                "the job submitted its encoded output"
+            );
+            // Order preserved: everything written is parked for the next
+            // receive poll, in write order, tagged chunk after chunk.
+            assert_eq!(
+                station.pending_busy_wait_audio.len() + input.available(),
+                CHUNKS * CHUNK
+            );
+            let mut ring_tail = vec![0.0f32; input.available()];
+            let read = input.read(&mut ring_tail);
+            ring_tail.truncate(read);
+            let mut parked = station.pending_busy_wait_audio.clone();
+            parked.extend_from_slice(&ring_tail);
+            let expected: Vec<f32> = (0..CHUNKS)
+                .flat_map(|i| std::iter::repeat_n((i as f32) * 1e-6, CHUNK))
+                .collect();
+            assert_eq!(
+                parked, expected,
+                "input order is preserved for the next poll"
+            );
+            station.tx_encode_stall = None;
+        }
+
+        /// COP-258 (AC2): a due station-ID encode held past the 171 ms the
+        /// default ring holds, before keying: input audio is preserved and
+        /// the ID prefix plays before the payload in one key-up.
+        #[tokio::test(start_paused = true)]
+        async fn slow_station_id_encode_keeps_draining_before_keying() {
+            const CHUNK: usize = 960;
+            const CHUNKS: usize = 27;
+            let mut config = arq_config();
+            config.station_id.id_interval_secs = 600;
+            let mut station = EventLoop::new(config).unwrap();
+            let ptt = install_ptt_log(&mut station);
+            let (tx_out, mut out_consumer) = coppa_audio::audio_ring(4_000_000);
+            station.set_audio_out(tx_out);
+            let (mut producer, consumer) = coppa_audio::audio_ring(8192);
+            station.set_audio_in(consumer);
+            // The payload is already encoded; the ID encode is the held job.
+            let payload = station
+                .engine
+                .encode_bytes(b"payload after the ID")
+                .unwrap();
+            station.tx_encode_stall = Some(Duration::from_millis(400));
+
+            let keyed = drive_while(
+                station.transmit_samples_keyed(&payload),
+                write_tagged_chunks(&mut producer, CHUNKS),
+            )
+            .await;
+            assert!(keyed > 0, "the transmission keyed");
+
+            assert_eq!(
+                ptt.edges().iter().filter(|e| e.1 == PttState::Tx).count(),
+                1,
+                "one key-up"
+            );
+            let mut input = station.audio_in.take().expect("input ring wired");
+            assert_eq!(input.overflow_count(), 0, "the ring never overflowed");
+            assert_eq!(
+                station.pending_busy_wait_audio.len() + input.available(),
+                CHUNKS * CHUNK
+            );
+            let mut ring_tail = vec![0.0f32; input.available()];
+            let read = input.read(&mut ring_tail);
+            ring_tail.truncate(read);
+            let mut parked = station.pending_busy_wait_audio.clone();
+            parked.extend_from_slice(&ring_tail);
+            let expected: Vec<f32> = (0..CHUNKS)
+                .flat_map(|i| std::iter::repeat_n((i as f32) * 1e-6, CHUNK))
+                .collect();
+            assert_eq!(
+                parked, expected,
+                "input order is preserved for the next poll"
+            );
+            // One key-up carrying the ID prefix then the payload, in order.
+            station.tx_encode_stall = None;
+            let id = station
+                .encode_id_beacon_frame()
+                .await
+                .expect("the ID frame rebuilds");
+            let mut whole = id;
+            whole.extend_from_slice(&payload);
+            let mut played = vec![0.0f32; out_consumer.available()];
+            let read = out_consumer.read(&mut played);
+            played.truncate(read);
+            assert_eq!(
+                played, whole,
+                "the ID prefix precedes the payload in one key-up"
+            );
+        }
+
+        /// A `tracing` layer that records WARN events as the console line's
+        /// `message key=value` text (COP-258 AC4's warning capture).
+        struct WarnLines(Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnLines {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() != tracing::Level::WARN {
+                    return;
+                }
+                let mut visitor = WarnVisitor::default();
+                event.record(&mut visitor);
+                let mut line = visitor.message;
+                for (key, value) in visitor.fields {
+                    line.push_str(&format!(" {key}={value}"));
+                }
+                self.0.lock().unwrap().push(line);
+            }
+        }
+
+        #[derive(Default)]
+        struct WarnVisitor {
+            message: String,
+            fields: Vec<(String, String)>,
+        }
+
+        impl tracing::field::Visit for WarnVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.message = format!("{value:?}");
+                } else {
+                    self.fields
+                        .push((field.name().to_string(), format!("{value:?}")));
+                }
+            }
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                self.fields
+                    .push((field.name().to_string(), value.to_string()));
+            }
+        }
+
+        /// COP-258 (AC4): an actual input overflow still logs the exact
+        /// existing WARN once per counter increase, even when the samples
+        /// were dropped while the station was in RX and the next drain runs
+        /// keyed. No suppression was added.
+        #[tokio::test(start_paused = true)]
+        async fn audio_input_overflow_remains_visible_after_keying() {
+            const CHUNK: usize = 960;
+            const FILL: usize = 12; // 11,520 samples: 8,192 kept, 3,328 dropped
+            let mut station = EventLoop::new(arq_config()).unwrap();
+            install_ptt_log(&mut station);
+            let (mut producer, consumer) = coppa_audio::audio_ring(8192);
+            station.set_audio_in(consumer);
+
+            // Dropped while in RX: the station drains nothing yet.
+            for _ in 0..FILL {
+                producer.write(&[0.0; CHUNK]);
+            }
+            // Key before the next drain.
+            station.handle_ptt_change(true).await;
+            assert!(station.is_transmitting);
+
+            let captured: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+            let layer = WarnLines(Arc::clone(&captured));
+            let _guard =
+                tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+            // The next drain, keyed, reports the exact existing warning.
+            station.observe_busy_gate_from_audio_input().await;
+            {
+                let lines = captured.lock().unwrap();
+                assert_eq!(
+                    lines.as_slice(),
+                    ["Audio input buffer overflow dropped=3328 cumulative_dropped=3328"],
+                    "the exact WARN, once, with the correct counters"
+                );
+            }
+            // A second drain with no further loss logs no duplicate.
+            station.observe_busy_gate_from_audio_input().await;
+            assert_eq!(captured.lock().unwrap().len(), 1, "no duplicate warning");
+            // Another increase reports only its own delta.
+            for _ in 0..FILL {
+                producer.write(&[0.0; CHUNK]);
+            }
+            station.observe_busy_gate_from_audio_input().await;
+            assert_eq!(
+                captured.lock().unwrap().as_slice(),
+                [
+                    "Audio input buffer overflow dropped=3328 cumulative_dropped=3328",
+                    "Audio input buffer overflow dropped=3328 cumulative_dropped=6656",
+                ],
+                "the second increase logs its own delta and the new cumulative count"
             );
         }
 
@@ -28655,8 +29250,15 @@ mod tests {
                     let (ar, mut aw) = ardop.split();
                     let mut ardop_reader = BufReader::new(ar);
                     aw.write_all(b"ARQCALL K2XYZ 3\r").await.unwrap();
+                    // COP-258: the connect encode runs off the loop, so the
+                    // runtime can accept and register this client while that
+                    // encode is still running; the active session's PTT
+                    // telemetry ("the session continuing", exactly as the
+                    // VARA-side check below treats it) may therefore reach
+                    // it before the refusal. The refusal pair itself must
+                    // be the first non-telemetry replies, in order.
                     let mut replies = Vec::new();
-                    for _ in 0..2 {
+                    while replies.len() < 2 {
                         let mut line = Vec::new();
                         tokio::time::timeout(
                             Duration::from_secs(5),
@@ -28665,6 +29267,9 @@ mod tests {
                         .await
                         .expect("ARDOP reply in time")
                         .unwrap();
+                        if String::from_utf8_lossy(&line).starts_with("PTT ") {
+                            continue;
+                        }
                         replies.push(
                             String::from_utf8_lossy(&line)
                                 .trim_end_matches('\r')
@@ -29638,15 +30243,15 @@ mod tests {
         /// in its floor request windows and floor RTO floors.
         #[tokio::test]
         async fn station_id_allowance_ignores_local_id_setting() {
-            let allowance = |id_interval_secs| {
+            let allowance = |id_interval_secs: u64| async move {
                 let mut config = DaemonConfig::default();
                 config.engine.callsign = "VK3ABC".to_string();
                 config.station_id.id_interval_secs = id_interval_secs;
-                EventLoop::new(config).unwrap().station_id_allowance()
+                EventLoop::new(config).unwrap().station_id_allowance().await
             };
-            let with_local_id = allowance(540);
+            let with_local_id = allowance(540).await;
             assert!(with_local_id > Duration::ZERO);
-            assert_eq!(allowance(0), with_local_id);
+            assert_eq!(allowance(0).await, with_local_id);
         }
 
         /// COP-202 AC4/AC5: an Auto dial whose host never sent RETRIES keys
@@ -29660,7 +30265,7 @@ mod tests {
             let mut a = FloorStation::new("VK3ABC", SEED_BASE, 0, floor_reference_power());
             let level = a.station.engine.speed_level();
             let turnaround = a.station.turnaround();
-            let allowance = a.station.station_id_allowance();
+            let allowance = a.station.station_id_allowance().await;
             let (keys, reaped) = dial_key_ups(&mut a, 75).await;
             let modes: Vec<_> = keys.iter().map(|&(_, m)| m).collect();
             let mut reference = FloorController::default();
@@ -30911,12 +31516,14 @@ mod tests {
             to_b.extend(
                 a.station
                     .encode_session_mode(&req, LinkPhyMode::Floor)
+                    .await
                     .expect("floor REQ"),
             );
             to_b.extend(vec![0.0f32; 48_000]);
             to_b.extend(
                 a.station
                     .encode_session_mode(&cfm, LinkPhyMode::Floor)
+                    .await
                     .expect("floor CFM"),
             );
             to_b.extend(vec![0.0f32; 96_000]);

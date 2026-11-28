@@ -292,7 +292,7 @@ update. **UPDATE (2026-11-16, COP-183): re-measured on main; one controller cand
 - **`ptt_invert = true` with serial PTT is refused at startup (COP-52, COP-144).** Inverted serial PTT would hold DTR or RTS asserted for RX and deassert it for TX. `docs/OPERATING.md` ("What releases PTT") relies on the operating system deasserting both lines when it closes the port, so once coppad exited, by any path including SIGTERM, an inverted line would sit at its TX level, and the PTT guardian does not cover serial PTT. The owner chose to refuse the combination (COP-144, option A): coppad exits with an error that names the hazard. An active-low rig needs gpio or cm108 PTT. The keyed-after-exit hazard follows from that close behaviour and has not been measured on hardware.
 - **Health and mDNS discovery cover startup state and one Linux host (COP-140, 2026-11-02).** `GET /health` on the WebSocket port reports the startup verdict, the same one that logs `Daemon ready` or `Daemon running degraded`, not live state: a fault that starts later (a dead audio stream, rigctld lost after startup) does not change it, and a build without `cpal-backend` logs `Daemon ready` and so reports `ok` although it moves no audio. The route exists only where the WebSocket listener exists (`--features websocket` and `[host] websocket_enabled = true`); elsewhere a probe gets "connection refused". The mDNS name is fixed at `coppad.local.`; a second station on the same LAN is renamed by `mdns-sd`'s RFC 6762 conflict handling (for example `coppad-2.local.`) and the daemon logs a WARN, but no real conflict was staged in testing, so the rename is read from `mdns-sd`'s source, not observed. Only the WebSocket port is advertised (`_coppa._tcp`); the VARA-style, ARDOP and KISS ports are not. When the event loop stops, cleanly or with an error, the daemon unregisters and sends goodbye packets; a process that is killed or crashes does not, and peers keep the records until their TTL expires. mDNS was verified only between two processes on one Linux host, over IPv4; no IPv6 advertisement, macOS, Windows, second physical host, Avahi or `dns-sd` tool, or phone client was tested. A Linux client resolves `.local` only with nss-mdns (`getent hosts coppad.local` fails without it).
 - **KISS framing is fixed for split TCP reads; nonzero ports remain unsupported (COP-138, COP-148).** The server uses a streaming decoder that holds a partial frame until `FEND`, including an escape split across reads, and since COP-148 the standalone `kiss_decode` API returns only frames closed by `FEND` instead of its historical buffer-end behavior. Regression tests in `crates/coppa-host/src/kiss.rs` cover every split of a 200-byte payload, byte-at-a-time delivery, both escape sequences, shared delimiters, EOF and the 64 KiB pending-byte bound. TCP handler tests observe the TX channel; no RF or audio verification was performed. Data frames with a nonzero KISS port nibble are still dropped, as reproduced by COP-76; TXDELAY, persistence and slot time remain ignored. See `docs/HOST-API.md` for the host contract.
-- **KISS datagrams on OFDM are bounded, unacknowledged broadcasts (COP-138).** One KISS frame is one uncompressed MAC Datagram frame, with no fragmentation or retry. Maximum payloads at levels 1-8 are 434, 922, 922, 1410, 1250, 922, 1410 and 1250 bytes. Full 500-byte Reticulum packets require level 2 or above. The newest packet is dropped when eight wait. Sessions and handshakes refuse datagrams and discard the queue. With `sessionless_tx_enabled` and `arq_enabled` together, datagrams may key between a sessionless ARQ frame and its ACK. Old stations hand unknown type-9 frames raw to VARA-style and ARDOP data clients. The real RNS loop with the default audio ring delivered both 300-byte payloads but logged input overflow during synchronous encode; the harness and setup guide use `buffer_size = 131072`. No RF, fading, collision, multi-hop or HF Reticulum timer assessment has been performed. See [RETICULUM.md](RETICULUM.md).
+- **KISS datagrams on OFDM are bounded, unacknowledged broadcasts (COP-138).** One KISS frame is one uncompressed MAC Datagram frame, with no fragmentation or retry. Maximum payloads at levels 1-8 are 434, 922, 922, 1410, 1250, 922, 1410 and 1250 bytes. Full 500-byte Reticulum packets require level 2 or above. The newest packet is dropped when eight wait. Sessions and handshakes refuse datagrams and discard the queue. With `sessionless_tx_enabled` and `arq_enabled` together, datagrams may key between a sessionless ARQ frame and its ACK. Old stations hand unknown type-9 frames raw to VARA-style and ARDOP data clients. The real RNS loop with the default audio ring delivered both 300-byte payloads but logged input overflow while the sender's pre-COP-258 inline encoder blocked its event loop; the harness and setup guide use `buffer_size = 131072`. No RF, fading, collision, multi-hop or HF Reticulum timer assessment has been performed. See [RETICULUM.md](RETICULUM.md).
 - **The 9600 baud G3RUH demodulator is a bank of five fixed-phase decoders without symbol-timing recovery (COP-116).**
   The committed 100-frame 10 dB fixture delivers 100 frames, matching Direwolf.
   In the planning prototype, individual banks delivered 57–64 percent and their
@@ -641,12 +641,27 @@ stall scenario does (`docs/testing/bpq-session.md`).
   overflow contributed to COP-237's capped VARA-style and ARDOP trials remains
   unmeasured.
 
-- **COP-246 sender-side TX encode can overflow the input ring.** A loaded 2 KB
-  trial at the default ring logged three sender warnings during TX encoding,
-  about 52 ms after PTT keyed, dropping up to 30208 samples of self-monitor
-  audio. The pat and Reticulum zero-overflow rules count both stations, so
-  those warnings can still fail their runs. Follow-up ticket
-  `2f4c9b1e-7a62-4d30-bae6-c0180ec5dcba` tracks draining during encode.
+- **COP-258 sender-side TX encode no longer overflows the input ring.** COP-258
+  moved every transmit encode (KISS datagrams, sessionless sends, ARQ replies
+  and retransmits, session data, outer-code bursts, floor fragments,
+  keepalives, handshakes and station IDs) onto one blocking job at a time,
+  through the additive `coppa-engine` `TransmitHalf` take/put API, and made
+  the PTT pre-delay a draining wait, mirroring COP-246's receive-side fix.
+  While a job runs, the event loop drains the input ring every 5 ms, so the
+  default 8192-sample ring no longer overflows during a slow encode, and the
+  loaded 2 KB KISS trial at the default ring delivered 2048 bytes exactly with
+  zero overflow warnings on either station. The warning itself is unchanged:
+  a real overflow still logs `Audio input buffer overflow` once per counter
+  increase, including one discovered while keyed, and the deterministic tests
+  prove an encode held past the ring's 171 ms drops nothing (COP-258, AC1-AC4).
+  Before the fix, the loaded trial logged three sender warnings about 52 ms
+  after each key-up, dropping up to 31168 samples; COP-258's research showed
+  most of that audio arrived before keying, while the loop was blocked in the
+  encode, and the warning only printed at the next drain after the pre-delay —
+  so the loss was mostly unkeyed channel audio, not self-monitor audio as the
+  old bullet claimed. Host scheduling stalls outside the encode path, a
+  blocking PTT backend, and delivery under eight busy loops remain uncovered:
+  the existing overflow warning still reports such loss.
 
 - **COP-227 re-recorded self-test.** COP-227 re-recorded the six black-box
   self-test rows with coppad 0.18.0 and the seeded payload: 2/6 completed

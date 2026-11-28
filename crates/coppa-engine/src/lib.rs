@@ -45,8 +45,9 @@ pub use config::{EngineConfig, OfdmBand, HF_MAX_SPEED_LEVEL};
 /// `coppa-protocol`; equal to [`WIRE_FORMAT_VERSION`].
 pub use coppa_protocol::AIR_PROTOCOL_VERSION;
 pub use engine::{
-    CoppaCore, ReceiveHalf, StreamFrame, HOST_API_VERSION, MAX_TUNE_SECONDS, TUNE_SINGLE_MAX_HZ,
-    TUNE_SINGLE_MIN_HZ, TUNE_TONE_HIGH_HZ, TUNE_TONE_LOW_HZ, WIRE_FORMAT_VERSION,
+    CoppaCore, ReceiveHalf, StreamFrame, TransmitHalf, HOST_API_VERSION, MAX_TUNE_SECONDS,
+    TUNE_SINGLE_MAX_HZ, TUNE_SINGLE_MIN_HZ, TUNE_TONE_HIGH_HZ, TUNE_TONE_LOW_HZ,
+    WIRE_FORMAT_VERSION,
 };
 pub use link::{DisconnectReason, Link, LinkConfig, LinkError, LinkEvent, LinkPhyMode, LinkState};
 pub use profiles::{Profile, EMERGENCY, HF_ROBUST, HF_STANDARD, VHF_FAST};

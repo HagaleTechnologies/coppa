@@ -50,6 +50,11 @@ pub enum EngineError {
     /// Decompression failed.
     #[error("{0}")]
     Protocol(#[from] coppa_protocol::ProtocolError),
+    /// The transmit half is checked out to a worker (COP-258), so the
+    /// synchronous encode entry points and the batch decode cannot run.
+    /// Return the half with [`CoppaCore::put_transmit`] to restore them.
+    #[error("Transmit half is checked out")]
+    TransmitHalfUnavailable,
     /// A text decode contained non-UTF-8 bytes.
     #[error("{0}")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),

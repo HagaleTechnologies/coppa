@@ -12,6 +12,8 @@ use coppa_protocol::modem::floor::{FloorFrame, FloorStream};
 use coppa_protocol::modem::streaming::StreamingReceiver;
 use coppa_protocol::modem::transceiver::{CoppaTransceiver, HarqPolicy, MAX_CODEWORDS};
 
+use std::sync::Arc;
+
 use crate::config::{EngineConfig, OfdmBand, HF_MAX_SPEED_LEVEL};
 use crate::profiles::Profile;
 
@@ -124,7 +126,18 @@ pub struct StreamFrame {
 /// # Ok::<(), coppa_engine::EngineError>(())
 /// ```
 pub struct CoppaCore {
-    transceiver: CoppaTransceiver,
+    /// Movable OFDM transmit state (COP-258). `None` only while a worker
+    /// holds the half for an off-loop encode; every synchronous encode and
+    /// the batch decode then report [`EngineError::TransmitHalfUnavailable`].
+    transmit: Option<TransmitHalf>,
+    /// Generation stamp for [`Self::take_transmit`]/[`Self::put_transmit`]:
+    /// bumped by every [`Self::reconfigure`], so a half returned after a
+    /// rebuild is dropped instead of replacing the new one.
+    transmit_generation: u64,
+    /// The OFDM profile the transceiver was built for. Held on the core so
+    /// profile metadata (debug output, occupied bandwidth, band queries)
+    /// stays answerable while the transmit half is checked out.
+    ofdm_profile: CoppaProfile,
     config: EngineConfig,
     /// Movable OFDM and floor receive state. Its streaming receiver owns a
     /// transceiver built for the same profile as the transmit path above.
@@ -138,7 +151,179 @@ pub struct CoppaCore {
     /// version 2, COP-190/ADR-014), constructed alongside the OFDM paths.
     /// Link feeds this detector alongside OFDM and selects the codec through
     /// negotiated floor policy. Direct callers may also use it explicitly.
-    floor: FloorFrame,
+    /// Shared with every [`TransmitHalf`] via `Arc` so the floor codec stays
+    /// usable (and one instance) whether the half is resident or taken.
+    floor: Arc<FloorFrame>,
+}
+
+/// Movable OFDM transmit state (COP-258): the transceiver plus the encoder
+/// settings it was built with. The daemon runs encodes on a blocking worker
+/// while its event loop drains audio input, exactly as COP-246 did for the
+/// receive half. See [`CoppaCore::take_transmit`].
+pub struct TransmitHalf {
+    transceiver: CoppaTransceiver,
+    speed_level: u8,
+    compression_enabled: bool,
+    on_vhf: bool,
+    floor: Arc<FloorFrame>,
+    generation: u64,
+}
+
+impl std::fmt::Debug for TransmitHalf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransmitHalf")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TransmitHalf {
+    /// Encode a text message to audio samples.
+    pub fn encode(&self, message: &str) -> Result<Vec<f32>, EngineError> {
+        self.encode_bytes(message.as_bytes())
+    }
+
+    /// COP-69/258 twin of [`CoppaCore::encode_bytes`] on the taken half.
+    pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<f32>, EngineError> {
+        self.encode_bytes_at(data, self.speed_level, 1)
+    }
+
+    /// COP-69/258 twin of [`CoppaCore::encode_bytes_with_codewords`].
+    pub fn encode_bytes_with_codewords(
+        &self,
+        data: &[u8],
+        codewords: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        CoppaCore::check_codewords(codewords)?;
+        self.encode_bytes_at(data, self.speed_level, codewords)
+    }
+
+    /// COP-69/258 twin of [`CoppaCore::encode_uncompressed_with_codewords`].
+    pub fn encode_uncompressed_with_codewords(
+        &self,
+        data: &[u8],
+        codewords: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        CoppaCore::check_codewords(codewords)?;
+        self.transmit_data_packet(data, self.speed_level, codewords, 0, 0)
+    }
+
+    /// COP-69/258 twin of [`CoppaCore::encode_bytes_with_level_and_codewords`].
+    pub fn encode_bytes_with_level_and_codewords(
+        &self,
+        data: &[u8],
+        level: u8,
+        codewords: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        CoppaCore::check_codewords(codewords)?;
+        self.check_level(level)?;
+        self.encode_bytes_at(data, level, codewords)
+    }
+
+    /// COP-168/258 twin of [`CoppaCore::encode_bytes_tagged`].
+    pub fn encode_bytes_tagged(
+        &self,
+        data: &[u8],
+        level: u8,
+        codewords: u8,
+        phy_seq: u8,
+        rv: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        CoppaCore::check_codewords(codewords)?;
+        self.check_level(level)?;
+        let payload = compress_payload(data, self.compression_enabled);
+        self.transmit_data_packet(&payload, level, codewords, phy_seq, rv & 0x03)
+    }
+
+    /// COP-119/258 twin of [`CoppaCore::encode_packet_with_seq`].
+    pub fn encode_packet_with_seq(
+        &self,
+        data: &[u8],
+        level: u8,
+        seq_num: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        self.check_level(level)?;
+        self.transmit_data_packet(data, level, 1, seq_num, 0)
+    }
+
+    /// Phase 4/258 twin of [`CoppaCore::encode_bytes_at_level`] (the
+    /// station-ID/beacon path).
+    pub fn encode_bytes_at_level(&self, data: &[u8], level: u8) -> Result<Vec<f32>, EngineError> {
+        self.check_level(level)?;
+        if data.len() > u16::MAX as usize {
+            return Err(EngineError::PayloadTooLarge {
+                len: data.len(),
+                max: u16::MAX as usize,
+            });
+        }
+
+        let header = CoppaHeader {
+            version: WIRE_FORMAT_VERSION,
+            phy_mode: 0,
+            frame_type: CoppaFrameType::Beacon,
+            bandwidth: self.transceiver.profile().bandwidth_id,
+            fec_type: 0,
+            speed_level: level,
+            seq_num: 0,
+            payload_len: data.len() as u16,
+            codewords: 1,
+        };
+
+        let samples = self.transceiver.transmit(&header, data)?;
+        Ok(samples)
+    }
+
+    /// The shared floor codec (COP-190), as [`CoppaCore::floor`] exposes it.
+    pub fn floor(&self) -> &FloorFrame {
+        &self.floor
+    }
+
+    /// The shared body of the `encode_bytes` family: compress, build a
+    /// `Data` header at `level`, transmit. See
+    /// [`CoppaCore::encode_bytes_at`] for the pipeline contract.
+    fn encode_bytes_at(
+        &self,
+        data: &[u8],
+        level: u8,
+        codewords: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        let payload = compress_payload(data, self.compression_enabled);
+        self.transmit_data_packet(&payload, level, codewords, 0, 0)
+    }
+
+    /// See [`CoppaCore::transmit_data_packet`].
+    fn transmit_data_packet(
+        &self,
+        payload: &[u8],
+        level: u8,
+        codewords: u8,
+        seq_num: u8,
+        fec_type: u8,
+    ) -> Result<Vec<f32>, EngineError> {
+        let payload_len =
+            u16::try_from(payload.len()).map_err(|_| EngineError::PayloadTooLarge {
+                len: payload.len(),
+                max: u16::MAX as usize,
+            })?;
+        let header = CoppaHeader {
+            version: WIRE_FORMAT_VERSION,
+            phy_mode: 0,
+            frame_type: CoppaFrameType::Data,
+            bandwidth: self.transceiver.profile().bandwidth_id,
+            fec_type,
+            speed_level: level,
+            seq_num,
+            payload_len,
+            codewords,
+        };
+        Ok(self.transceiver.transmit(&header, payload)?)
+    }
+
+    /// See [`CoppaCore::check_level`]: level validation against the profile
+    /// this half was built with (the half never rebuilds its profile).
+    fn check_level(&self, level: u8) -> Result<(), EngineError> {
+        CoppaCore::check_level_for(level, self.on_vhf)
+    }
 }
 
 /// Movable streaming OFDM and floor receive state. The daemon runs both
@@ -186,6 +371,25 @@ impl ReceiveHalf {
     }
 }
 
+/// The shared compression step of the `encode_bytes` family (COP-41):
+/// optionally Huffman+LZ4-compress `data` with the marker byte prepended,
+/// otherwise return `data` unchanged. Shared by the core's payload-length
+/// queries and by [`TransmitHalf`] (COP-258), so the two can never measure
+/// and send different bytes.
+fn compress_payload(data: &[u8], compression_enabled: bool) -> Vec<u8> {
+    if compression_enabled {
+        let huffman = HuffmanCodec::new();
+        let huffman_bytes = huffman.encode(data);
+        let lz4_bytes = lz4_compress(&huffman_bytes);
+        let mut out = Vec::with_capacity(1 + lz4_bytes.len());
+        out.push(COMPRESSION_MARKER);
+        out.extend_from_slice(&lz4_bytes);
+        out
+    } else {
+        data.to_vec()
+    }
+}
+
 fn squelched(samples: &[f32], threshold_db: f32) -> bool {
     if threshold_db == f32::NEG_INFINITY {
         return false;
@@ -219,10 +423,9 @@ impl std::fmt::Debug for CoppaCore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The transceiver and streaming receiver own per-level code tables that
         // would print kilobytes; the config and OFDM geometry identify the engine.
-        let profile = self.transceiver.profile();
         f.debug_struct("CoppaCore")
             .field("config", &self.config)
-            .field("fft_size", &profile.fft_size)
+            .field("fft_size", &self.ofdm_profile.fft_size)
             .finish_non_exhaustive()
     }
 }
@@ -254,8 +457,8 @@ impl CoppaCore {
         let ofdm_profile =
             Self::select_ofdm_profile(config.speed_level, config.cp_mode, config.ofdm_band);
         let transceiver = CoppaTransceiver::new(ofdm_profile.clone(), WIRE_FORMAT_VERSION);
-        let streaming = StreamingReceiver::new(ofdm_profile, WIRE_FORMAT_VERSION);
-        let floor = FloorFrame::new();
+        let streaming = StreamingReceiver::new(ofdm_profile.clone(), WIRE_FORMAT_VERSION);
+        let floor = Arc::new(FloorFrame::new());
         let floor_stream = FloorStream::default();
         let receive = Some(ReceiveHalf {
             streaming,
@@ -264,8 +467,18 @@ impl CoppaCore {
             compression_enabled: config.compression_enabled,
             generation: 0,
         });
-        Self {
+        let transmit = Some(TransmitHalf {
             transceiver,
+            speed_level: config.speed_level,
+            compression_enabled: config.compression_enabled,
+            on_vhf: Self::resolves_to_vhf(config.speed_level, config.ofdm_band),
+            floor: Arc::clone(&floor),
+            generation: 0,
+        });
+        Self {
+            transmit,
+            transmit_generation: 0,
+            ofdm_profile,
             config,
             receive,
             receive_generation: 0,
@@ -278,6 +491,7 @@ impl CoppaCore {
     /// (air-protocol version 2, COP-190). Encode and receive floor frames
     /// through it directly. Link selects it for negotiated floor sessions;
     /// coppad's event loop selects it for floor handshakes (COP-202).
+    /// Stays available while a worker holds the transmit half (COP-258).
     #[must_use]
     pub fn floor(&self) -> &FloorFrame {
         &self.floor
@@ -343,15 +557,16 @@ impl CoppaCore {
 
     /// Occupied bandwidth of the OFDM profile in use, in Hz: active carriers
     /// times carrier spacing (2400 on the HF profiles, long or short CP; 5600
-    /// on VHF wide). The VARA `CONNECTED` line reports it.
+    /// on VHF wide). The VARA `CONNECTED` line reports it. Answered from the
+    /// core-held profile, so it works with the transmit half taken out.
     pub fn occupied_bandwidth_hz(&self) -> u32 {
-        Self::profile_occupied_hz(self.transceiver.profile())
+        Self::profile_occupied_hz(&self.ofdm_profile)
     }
 
     /// Spectrum interval [low, high), in Hz, covering the active carriers.
     /// The exclusive upper edge is one carrier spacing above the last carrier.
     pub fn occupied_band_edges_hz(&self) -> (f32, f32) {
-        let profile = self.transceiver.profile();
+        let profile = &self.ofdm_profile;
         let spacing = profile.carrier_spacing_hz();
         let first = profile.first_active_bin();
         (
@@ -383,28 +598,27 @@ impl CoppaCore {
         (profile.total_active_carriers() as f32 * profile.carrier_spacing_hz()).round() as u32
     }
 
+    /// The resident transmit half, or [`EngineError::TransmitHalfUnavailable`]
+    /// while a worker holds it (COP-258).
+    fn transmit_half(&self) -> Result<&TransmitHalf, EngineError> {
+        self.transmit
+            .as_ref()
+            .ok_or(EngineError::TransmitHalfUnavailable)
+    }
+
     /// Encode a text message to audio samples.
     pub fn encode(&self, message: &str) -> Result<Vec<f32>, EngineError> {
-        self.encode_bytes(message.as_bytes())
+        self.transmit_half()?.encode(message)
     }
 
     /// The exact payload `encode_bytes` would hand the transceiver for
     /// `data`: optionally Huffman+LZ4-compressed with the marker byte
     /// prepended, otherwise `data` unchanged (COP-41 refactor out of
     /// `encode_bytes`, which calls this — the two can never measure and send
-    /// different bytes).
+    /// different bytes). Reads only the engine-held config, so it works with
+    /// the transmit half taken out.
     fn compress_payload(&self, data: &[u8]) -> Vec<u8> {
-        if self.config.compression_enabled {
-            let huffman = HuffmanCodec::new();
-            let huffman_bytes = huffman.encode(data);
-            let lz4_bytes = lz4_compress(&huffman_bytes);
-            let mut out = Vec::with_capacity(1 + lz4_bytes.len());
-            out.push(COMPRESSION_MARKER);
-            out.extend_from_slice(&lz4_bytes);
-            out
-        } else {
-            data.to_vec()
-        }
+        compress_payload(data, self.config.compression_enabled)
     }
 
     /// Exact length of the payload `encode_bytes` would hand the transceiver
@@ -423,8 +637,11 @@ impl CoppaCore {
     /// 1. Optionally compress (Huffman + LZ4) with a marker byte
     /// 2. Build CoppaHeader
     /// 3. Transmit via CoppaTransceiver
+    ///
+    /// COP-258: delegates to the resident transmit half and reports
+    /// [`EngineError::TransmitHalfUnavailable`] while a worker holds it.
     pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<f32>, EngineError> {
-        self.encode_bytes_at(data, self.config.speed_level, 1)
+        self.transmit_half()?.encode_bytes(data)
     }
 
     /// COP-69: [`Self::encode_bytes`]' exact pipeline (optional Huffman+LZ4
@@ -448,8 +665,8 @@ impl CoppaCore {
         data: &[u8],
         codewords: u8,
     ) -> Result<Vec<f32>, EngineError> {
-        Self::check_codewords(codewords)?;
-        self.encode_bytes_at(data, self.config.speed_level, codewords)
+        self.transmit_half()?
+            .encode_bytes_with_codewords(data, codewords)
     }
 
     /// Encode a Data frame without applying compression, using 1..=8 codewords.
@@ -462,8 +679,8 @@ impl CoppaCore {
         data: &[u8],
         codewords: u8,
     ) -> Result<Vec<f32>, EngineError> {
-        Self::check_codewords(codewords)?;
-        self.transmit_data_packet(data, self.config.speed_level, codewords, 0, 0)
+        self.transmit_half()?
+            .encode_uncompressed_with_codewords(data, codewords)
     }
 
     /// COP-69: shared codeword-count validation for the codeword-aware
@@ -495,9 +712,8 @@ impl CoppaCore {
         level: u8,
         codewords: u8,
     ) -> Result<Vec<f32>, EngineError> {
-        Self::check_codewords(codewords)?;
-        self.check_level(level, self.on_vhf_profile())?;
-        self.encode_bytes_at(data, level, codewords)
+        self.transmit_half()?
+            .encode_bytes_with_level_and_codewords(data, level, codewords)
     }
 
     /// COP-69: [`Self::encoded_payload_len`]'s answer for a frame that will
@@ -537,24 +753,7 @@ impl CoppaCore {
     /// rejected while this engine is on an HF profile.
     pub fn encode_bytes_with_level(&self, data: &[u8], level: u8) -> Result<Vec<f32>, EngineError> {
         self.check_level(level, self.on_vhf_profile())?;
-        self.encode_bytes_at(data, level, 1)
-    }
-
-    /// The shared body of [`Self::encode_bytes`] and
-    /// [`Self::encode_bytes_with_level`]: compress, build a `Data` header at
-    /// `level`, transmit. Private so the two public entry points (and their
-    /// exact-payload twin [`Self::encoded_payload_len`], which shares
-    /// `compress_payload`) cannot drift apart. COP-69: the header's codeword
-    /// count is threaded through (`1` for the pre-COP-69 entry points,
-    /// caller-chosen for [`Self::encode_bytes_with_codewords`]).
-    fn encode_bytes_at(
-        &self,
-        data: &[u8],
-        level: u8,
-        codewords: u8,
-    ) -> Result<Vec<f32>, EngineError> {
-        let payload = self.compress_payload(data);
-        self.transmit_data_packet(&payload, level, codewords, 0, 0)
+        self.transmit_half()?.encode_bytes_at(data, level, 1)
     }
 
     /// COP-168: [`Self::encode_bytes_with_level_and_codewords`] with an
@@ -574,10 +773,8 @@ impl CoppaCore {
         phy_seq: u8,
         rv: u8,
     ) -> Result<Vec<f32>, EngineError> {
-        Self::check_codewords(codewords)?;
-        self.check_level(level, self.on_vhf_profile())?;
-        let payload = self.compress_payload(data);
-        self.transmit_data_packet(&payload, level, codewords, phy_seq, rv & 0x03)
+        self.transmit_half()?
+            .encode_bytes_tagged(data, level, codewords, phy_seq, rv)
     }
 
     /// COP-168: set the streaming receiver's IR-HARQ combining policy. It
@@ -619,39 +816,8 @@ impl CoppaCore {
         level: u8,
         seq_num: u8,
     ) -> Result<Vec<f32>, EngineError> {
-        self.check_level(level, self.on_vhf_profile())?;
-        self.transmit_data_packet(data, level, 1, seq_num, 0)
-    }
-
-    /// Build and transmit a Data frame from an already prepared payload,
-    /// with an explicit PHY `seq_num` (the HARQ key; every pre-COP-119
-    /// caller passes `0`) and `fec_type` (the redundancy version in its low
-    /// two bits; every caller before COP-168 passes `0`).
-    fn transmit_data_packet(
-        &self,
-        payload: &[u8],
-        level: u8,
-        codewords: u8,
-        seq_num: u8,
-        fec_type: u8,
-    ) -> Result<Vec<f32>, EngineError> {
-        let payload_len =
-            u16::try_from(payload.len()).map_err(|_| EngineError::PayloadTooLarge {
-                len: payload.len(),
-                max: u16::MAX as usize,
-            })?;
-        let header = CoppaHeader {
-            version: WIRE_FORMAT_VERSION,
-            phy_mode: 0,
-            frame_type: CoppaFrameType::Data,
-            bandwidth: self.transceiver.profile().bandwidth_id,
-            fec_type,
-            speed_level: level,
-            seq_num,
-            payload_len,
-            codewords,
-        };
-        Ok(self.transceiver.transmit(&header, payload)?)
+        self.transmit_half()?
+            .encode_packet_with_seq(data, level, seq_num)
     }
 
     /// Drop the streaming receiver's stored soft information for a PHY key.
@@ -687,28 +853,7 @@ impl CoppaCore {
     /// against the profile already in use: level 9 is rejected whenever this
     /// engine is on an HF profile, including a level-derived engine below level 5.
     pub fn encode_bytes_at_level(&self, data: &[u8], level: u8) -> Result<Vec<f32>, EngineError> {
-        self.check_level(level, self.on_vhf_profile())?;
-        if data.len() > u16::MAX as usize {
-            return Err(EngineError::PayloadTooLarge {
-                len: data.len(),
-                max: u16::MAX as usize,
-            });
-        }
-
-        let header = CoppaHeader {
-            version: WIRE_FORMAT_VERSION,
-            phy_mode: 0,
-            frame_type: CoppaFrameType::Beacon,
-            bandwidth: self.transceiver.profile().bandwidth_id,
-            fec_type: 0,
-            speed_level: level,
-            seq_num: 0,
-            payload_len: data.len() as u16,
-            codewords: 1,
-        };
-
-        let samples = self.transceiver.transmit(&header, data)?;
-        Ok(samples)
+        self.transmit_half()?.encode_bytes_at_level(data, level)
     }
 
     /// Generate a TX-level calibration ("TUNE") tone: an operator keys this and
@@ -771,6 +916,11 @@ impl CoppaCore {
     /// 1. Squelch check (reject silence)
     /// 2. Receive via CoppaTransceiver
     /// 3. Optionally decompress (LZ4 + Huffman)
+    ///
+    /// COP-258: the batch decode shares the transmit half's transceiver, so
+    /// it reports [`EngineError::TransmitHalfUnavailable`] while a worker
+    /// holds the half. Streaming decode ([`Self::push_samples`]) is
+    /// unaffected.
     pub fn decode_bytes(&self, samples: &[f32]) -> Result<Vec<u8>, EngineError> {
         if self.is_squelched(samples) {
             return Err(EngineError::NoSignalDetected);
@@ -780,7 +930,8 @@ impl CoppaCore {
             return Err(EngineError::NoSamplesToDecode);
         }
 
-        let (_header, payload, _recommended_level) = self.transceiver.receive(samples)?;
+        let (_header, payload, _recommended_level) =
+            self.transmit_half()?.transceiver.receive(samples)?;
 
         self.decompress_if_needed(payload)
     }
@@ -856,10 +1007,19 @@ impl CoppaCore {
     /// from the engine-held policy, so it also holds when the receive half
     /// is taken out while this runs. The floor detector keeps its history
     /// when the receive half is present.
+    ///
+    /// COP-258: installs a fresh transmit half stamped with a new
+    /// generation, so a half a worker still holds is stale when returned
+    /// (see [`Self::put_transmit`]). The shared floor codec carries over.
     pub fn reconfigure(&mut self, config: EngineConfig) {
         let policy = self.harq_policy;
         let mut new = Self::build(config);
-        self.transceiver = new.transceiver;
+        self.transmit_generation = self.transmit_generation.wrapping_add(1);
+        if let Some(tx) = new.transmit.as_mut() {
+            tx.generation = self.transmit_generation;
+        }
+        self.transmit = new.transmit;
+        self.ofdm_profile = new.ofdm_profile;
         self.config = new.config;
         self.receive_generation = self.receive_generation.wrapping_add(1);
         if let Some(rx) = new.receive.as_mut() {
@@ -870,6 +1030,29 @@ impl CoppaCore {
             }
         }
         self.receive = new.receive;
+    }
+
+    /// Move the transmit state to a worker while retaining the receive
+    /// engine (COP-258, the transmit counterpart of
+    /// [`Self::take_receive`]). Until [`Self::put_transmit`] restores it,
+    /// the synchronous encode entry points and the batch decode report
+    /// [`EngineError::TransmitHalfUnavailable`]; configuration queries,
+    /// streaming receive and the floor codec stay available. A second take
+    /// returns `None`. A reconfigure installs a new half and makes the
+    /// taken one stale, so return it to the same core.
+    pub fn take_transmit(&mut self) -> Option<TransmitHalf> {
+        self.transmit.take()
+    }
+
+    /// Restore a half taken by [`Self::take_transmit`]. If reconfiguration
+    /// installed a new half meanwhile, the stale return is dropped and the
+    /// replacement stays; a return to an occupied slot is ignored the same
+    /// way. The half keeps its own encoder settings (speed level,
+    /// compression) from the build it was taken from.
+    pub fn put_transmit(&mut self, half: TransmitHalf) {
+        if half.generation == self.transmit_generation && self.transmit.is_none() {
+            self.transmit = Some(half);
+        }
     }
 
     /// Move the receive state to a worker while retaining the transmit engine.
@@ -962,6 +1145,12 @@ impl CoppaCore {
     /// Validate `level` for a frame sent on the VHF profile (`on_vhf_profile`)
     /// or on an HF profile, which carries levels 1-8 only.
     pub(crate) fn check_level(&self, level: u8, on_vhf_profile: bool) -> Result<(), EngineError> {
+        Self::check_level_for(level, on_vhf_profile)
+    }
+
+    /// The profile-half of [`Self::check_level`], shared with
+    /// [`TransmitHalf::check_level`] (COP-258).
+    fn check_level_for(level: u8, on_vhf_profile: bool) -> Result<(), EngineError> {
         coppa_protocol::modem::speed_level_components(level)
             .map_err(|_| EngineError::InvalidSpeedLevel { level })?;
         if !on_vhf_profile && level > HF_MAX_SPEED_LEVEL {
@@ -1055,6 +1244,120 @@ mod tests {
         let frames = core.push_samples(&samples);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].payload.as_ref().unwrap(), b"new profile");
+    }
+
+    /// COP-258 (AC5): every moved synchronous entry point produces the same
+    /// samples as the resident core at the same configuration, its errors
+    /// match, and the half can be taken and returned repeatedly.
+    #[test]
+    fn transmit_half_matches_sync_encoding() {
+        let mut core = CoppaCore::with_config(EngineConfig {
+            speed_level: 2,
+            ofdm_band: OfdmBand::Hf,
+            compression_enabled: true,
+            ..Default::default()
+        });
+        let short = b"session frame";
+        let multi = datagram_test_payload();
+        let outer_packet = b"outer shard frame padded to a real length";
+
+        // The synchronous reference answers, recorded with the half resident.
+        let sync_short = core.encode_bytes(short).unwrap();
+        let sync_multi = core.encode_bytes_with_codewords(&multi[..80], 3).unwrap();
+        let sync_uncompressed = core.encode_uncompressed_with_codewords(&multi, 5).unwrap();
+        let sync_fallback = core
+            .encode_bytes_with_level_and_codewords(b"fade-hold fallback frame", 1, 1)
+            .unwrap();
+        let sync_outer = core.encode_packet_with_seq(outer_packet, 2, 0x2B).unwrap();
+        let sync_id = core.encode_bytes_at_level(b"station id beacon", 1).unwrap();
+        let sync_floor = core.floor().encode(b"floor probe").unwrap();
+        assert!(core
+            .encode_bytes_with_level_and_codewords(&multi, 1, 1)
+            .is_err());
+        assert!(core.encode_packet_with_seq(b"x", 9, 1).is_err());
+
+        // A second take while the half is out reports None.
+        let half = core.take_transmit().expect("transmit half resident");
+        assert!(core.take_transmit().is_none(), "double take");
+
+        // Synchronous encode and batch decode report the checked-out error
+        // while the half is out; the floor codec stays available.
+        assert!(matches!(
+            core.encode_bytes(short),
+            Err(EngineError::TransmitHalfUnavailable)
+        ));
+        assert!(matches!(
+            core.decode_bytes(&sync_short),
+            Err(EngineError::TransmitHalfUnavailable)
+        ));
+        assert_eq!(
+            core.floor().encode(b"floor probe").unwrap(),
+            sync_floor,
+            "the floor codec stays available with the half out"
+        );
+        let encoded_floor_from_half = half.floor().encode(b"floor probe").unwrap();
+        assert_eq!(encoded_floor_from_half, sync_floor);
+
+        // The moved half reproduces every entry point byte for byte.
+        assert_eq!(half.encode_bytes(short).unwrap(), sync_short);
+        assert_eq!(
+            half.encode_bytes_with_codewords(&multi[..80], 3).unwrap(),
+            sync_multi
+        );
+        assert_eq!(
+            half.encode_uncompressed_with_codewords(&multi, 5).unwrap(),
+            sync_uncompressed
+        );
+        assert_eq!(
+            half.encode_bytes_with_level_and_codewords(b"fade-hold fallback frame", 1, 1)
+                .unwrap(),
+            sync_fallback
+        );
+        assert_eq!(
+            half.encode_packet_with_seq(outer_packet, 2, 0x2B).unwrap(),
+            sync_outer
+        );
+        assert_eq!(
+            half.encode_bytes_at_level(b"station id beacon", 1).unwrap(),
+            sync_id
+        );
+        assert!(half
+            .encode_bytes_with_level_and_codewords(&multi, 1, 1)
+            .is_err());
+        assert!(half.encode_packet_with_seq(b"x", 9, 1).is_err());
+        assert!(half.encode_bytes_with_codewords(b"x", 9).is_err());
+        assert!(half.encode_bytes_with_codewords(b"x", 0).is_err());
+        // A return after an encode error still restores the half.
+        assert!(half
+            .encode_uncompressed_with_codewords(&vec![0x19; 937], 8)
+            .is_err());
+
+        core.put_transmit(half);
+        // The restored batch path decodes a frame the half encoded above.
+        let encoded = core.encode_bytes(short).unwrap();
+        assert_eq!(core.decode_bytes(&encoded).unwrap(), short);
+        assert_eq!(core.speed_level(), 2);
+    }
+
+    /// COP-258 (AC5): a stale return after a reconfigure drops in favour of
+    /// the replacement half, and the replacement encodes at the new speed.
+    #[test]
+    fn put_transmit_drops_a_stale_half_after_reconfigure() {
+        let mut core = CoppaCore::new();
+        let stale = core.take_transmit().unwrap();
+        core.set_speed_level(3).unwrap();
+        core.put_transmit(stale);
+        assert!(core.transmit.is_some(), "the replacement half stays");
+        assert_eq!(core.speed_level(), 3);
+        let samples = core.encode_bytes(b"reconfigured encoder").unwrap();
+        assert_eq!(
+            core.decode_bytes(&samples).unwrap(),
+            b"reconfigured encoder".as_slice()
+        );
+        // A returned half matching the live generation is accepted.
+        let live = core.take_transmit().unwrap();
+        core.put_transmit(live);
+        assert!(core.transmit.is_some());
     }
 
     #[test]
@@ -1530,7 +1833,13 @@ mod tests {
         let samples = core.encode_packet_with_seq(payload, 2, 0x20).unwrap();
         let mut padded = samples.clone();
         padded.extend(vec![0.0; 2048]);
-        let (header, decoded, _) = core.transceiver.receive(&padded).unwrap();
+        let (header, decoded, _) = core
+            .transmit
+            .as_ref()
+            .unwrap()
+            .transceiver
+            .receive(&padded)
+            .unwrap();
         assert_eq!(header.seq_num, 0x20);
         assert_eq!(header.codewords, 1);
         assert_eq!(decoded, payload);
@@ -2505,7 +2814,7 @@ mod tests {
         core.set_ofdm_band(OfdmBand::Hf).unwrap();
         assert_eq!(core.cp_mode(), CpMode::ShortCp);
         assert_eq!(
-            core.transceiver.profile().cp_samples,
+            core.ofdm_profile.cp_samples,
             CoppaProfile::hf_standard_short_cp().cp_samples
         );
     }

@@ -16,6 +16,17 @@ Older releases have no entry here. Their on-air breaks are listed in
 
 ## Unreleased: 0.18.0
 
+- COP-258: coppad runs each transmit encode (KISS datagrams, sessionless
+  sends, ARQ replies and retransmits, session data, outer-code bursts, floor
+  fragments, keepalives, handshakes and station IDs) on one blocking job at a
+  time while its event loop drains the audio input ring every 5 ms, and the
+  PTT pre-delay is now a draining wait, so a slow encode or a long lead no
+  longer overflows the default 8192-sample ring. A real overflow still logs
+  `Audio input buffer overflow` once per counter increase, including while
+  keyed. `coppa-engine` adds the additive `TransmitHalf` take/put API
+  (`CoppaCore::take_transmit`/`put_transmit`, half-side `encode_*` twins and
+  `EngineError::TransmitHalfUnavailable`) for moving the encoder to a worker,
+  mirroring COP-246's `ReceiveHalf`.
 - COP-246: coppad decodes received frames and runs the floor detector on a
   worker task while its event loop drains the audio input ring. A decode slower
   than the default ring no longer drops the next frame under CPU contention.

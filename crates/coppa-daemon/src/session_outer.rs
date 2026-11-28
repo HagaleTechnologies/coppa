@@ -1,6 +1,6 @@
 //! Session burst construction. Wire rules live in SPEC section 22.
 use anyhow::{Context, Result};
-use coppa_engine::CoppaCore;
+use coppa_engine::TransmitHalf;
 use coppa_protocol::mac::{Callsign, MacFrameType, MacPdu};
 use coppa_protocol::outer_code::{encode_block, harq_key, shard_len_for_level};
 use coppa_protocol::transport::TransportPdu;
@@ -11,8 +11,12 @@ pub(crate) struct OuterTx {
     pub packets_len: usize,
 }
 
+/// Encode one whole outer-code burst through the taken transmit half
+/// (COP-258): the event loop runs this on a blocking worker while it keeps
+/// draining the audio input ring. Identical bytes and errors to the
+/// pre-COP-258 `CoppaCore` path.
 pub(crate) fn encode_burst(
-    engine: &CoppaCore,
+    half: &TransmitHalf,
     addresses: (&Callsign, &Callsign, u8),
     (stream, seq): (u8, u8),
     data: &[u8],
@@ -34,7 +38,7 @@ pub(crate) fn encode_burst(
             packet.to_bytes()?,
         );
         let samples =
-            engine.encode_packet_with_seq(&frame.to_bytes(), level, harq_key(seq, packet.index))?;
+            half.encode_packet_with_seq(&frame.to_bytes(), level, harq_key(seq, packet.index))?;
         packet_len = samples.len();
         burst.extend(samples);
     }
@@ -46,12 +50,13 @@ mod tests {
     use super::*;
     use coppa_codec::ofdm::CoppaProfile;
     use coppa_engine::config::{EngineConfig, OfdmBand};
+    use coppa_engine::CoppaCore;
     use coppa_protocol::modem::streaming::StreamingReceiver;
     use coppa_protocol::outer_code::{InsertOutcome, OuterBlockRx, OuterPacket, OUTER_N};
 
     #[test]
     fn rs_burst_has_twelve_distinct_keys_and_rebuilds_the_transport_segment() {
-        let engine = CoppaCore::with_config(EngineConfig {
+        let mut engine = CoppaCore::with_config(EngineConfig {
             speed_level: 2,
             ofdm_band: OfdmBand::Hf,
             compression_enabled: true,
@@ -60,8 +65,12 @@ mod tests {
         let local = Callsign::new("N0AAA").unwrap();
         let remote = Callsign::new("N0BBB").unwrap();
         let host: Vec<_> = (0..587).map(|i| (i % 251) as u8).collect();
+        // COP-258: the burst encoder takes the movable transmit half and
+        // returns it, exactly as the daemon's worker does.
+        let half = engine.take_transmit().unwrap();
         let (burst, packet_len) =
-            encode_burst(&engine, (&remote, &local, 3), (0, 19), &host, 2).unwrap();
+            encode_burst(&half, (&remote, &local, 3), (0, 19), &host, 2).unwrap();
+        engine.put_transmit(half);
         assert_eq!(burst.len(), OUTER_N * packet_len);
         let mut samples = vec![0.0; 8192];
         samples.extend(burst);
@@ -101,11 +110,17 @@ mod tests {
         });
         let local = Callsign::new("N0AAA").unwrap();
         let remote = Callsign::new("N0BBB").unwrap();
+        // COP-258: restore the half before the speed change so the engine
+        // reconfigures a resident half, then take it again for the retry.
+        let half = engine.take_transmit().unwrap();
         let original =
-            encode_burst(&engine, (&remote, &local, 0), (0, 255), b"pinned block", 2).unwrap();
+            encode_burst(&half, (&remote, &local, 0), (0, 255), b"pinned block", 2).unwrap();
+        engine.put_transmit(half);
         engine.set_speed_level(5).unwrap();
+        let half = engine.take_transmit().unwrap();
         let retransmit =
-            encode_burst(&engine, (&remote, &local, 0), (0, 255), b"pinned block", 2).unwrap();
+            encode_burst(&half, (&remote, &local, 0), (0, 255), b"pinned block", 2).unwrap();
+        engine.put_transmit(half);
         assert_eq!(original, retransmit);
     }
 }

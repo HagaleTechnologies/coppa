@@ -37,7 +37,10 @@ a real bug — breaking them will reintroduce that bug.
   any key-up until `[radio] turnaround_ms` after the last decoded frame and
   drains the input ring while it waits, since a plain sleep overflowed the
   8,192-sample ring. Don't move the wait out of the chokepoint or replace the
-  drain with a sleep. See `docs/OPERATING.md` and
+  drain with a sleep. The same rule now covers the PTT pre-delay and every
+  transmit encode: COP-258 moved the encodes onto blocking jobs and made the
+  pre-delay a draining wait for the same reason (see the COP-258 entry in
+  `docs/LIMITATIONS.md`). See `docs/OPERATING.md` and
   `docs/testing/cable-loop-turnaround.md`.
 - **The first transmission after startup identifies (COP-61).**
   `last_id_time` is `None` until the first ID, and `id_due` treats `None` as
