@@ -232,6 +232,121 @@ impl NativeFormat {
     }
 }
 
+/// COP-256: the capture path of one black-box trial. The native format plus
+/// the fixed whole-dB gain both s16le captures are scaled by after the
+/// channel and before PCM encoding, so signal and noise move together and
+/// the SNR the modem hears is unchanged. f32le, and the probe and
+/// calibration runs, stay at 0 dB and never touch the multiply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capture {
+    /// The format and rate both stations capture in.
+    pub native: NativeFormat,
+    /// The whole-dB amplitude gain, at most 0, one value for both
+    /// directions of a whole trial.
+    pub gain_db: i32,
+}
+
+impl Capture {
+    /// The unity path the probe and the calibration relay use.
+    #[must_use]
+    pub fn unity(native: NativeFormat) -> Self {
+        Self { native, gain_db: 0 }
+    }
+
+    /// The fixed per-trial gain derived from the calibrated TX powers
+    /// ([`capture_gain_db`]): one value for the whole trial, both
+    /// directions, every seed of the cell.
+    #[must_use]
+    pub fn trial(native: NativeFormat, fading: bool, snr_db: i32, ref_power: [f32; 2]) -> Self {
+        Self {
+            native,
+            gain_db: capture_gain_db(native, fading, snr_db, ref_power),
+        }
+    }
+
+    /// The linear amplitude multiplier, exactly 1.0 at unity gain so the
+    /// capture multiply is skipped, including all f32le.
+    #[must_use]
+    pub fn amplitude(self) -> f32 {
+        if self.gain_db == 0 {
+            1.0
+        } else {
+            10.0f32.powf(self.gain_db as f32 / 20.0)
+        }
+    }
+
+    /// Scales one native-rate capture block by the fixed gain, in place,
+    /// after `Converter::down` and before `SampleFormat::encode`.
+    pub fn scale(self, block: &mut [f32]) {
+        let amplitude = self.amplitude();
+        if amplitude != 1.0 {
+            for sample in block.iter_mut() {
+                *sample *= amplitude;
+            }
+        }
+    }
+}
+
+/// The whole-dB s16le capture gain for one trial, derived from the larger
+/// calibrated TX power so one value covers both directions (COP-256). f32le
+/// returns 0 without computing. These are estimates: a crest above the
+/// 12 dB allowance, a fade beyond `F`, or a modem that changes TX level can
+/// still clip, and [`SampleFormat::encode`] still refuses that block.
+///
+/// ```text
+/// P = max(ref_power_a, ref_power_b)
+/// S = min(1, 4 * sqrt(P))                            TX peak estimate, 12 dB crest
+/// sigma_channel = sqrt(P / 10^(snr_db / 10) * (CHANNEL_RATE / 2) / HF_NOISE_BW_HZ)
+/// sigma_capture = sigma_channel * sqrt(sum(h_i^2))   after the capture filter
+/// F = 1 without fading, 4 with fading (MPG, MPP)
+/// E = F * S + 6 * sigma_capture
+/// gain_db = min(0, floor(20 * log10(0.9 / E)))
+/// ```
+///
+/// The estimate runs in f64; the filter factor comes from the same
+/// normalized taps [`Converter::new`] builds, and is exactly 1 on the
+/// 48 kHz bypass. Whole-dB rounding down keeps the recorded CSV identity
+/// stable between nearby calibrations except at gain boundaries.
+#[must_use]
+pub fn capture_gain_db(
+    native: NativeFormat,
+    fading: bool,
+    snr_db: i32,
+    ref_power: [f32; 2],
+) -> i32 {
+    if native.format != SampleFormat::S16le {
+        return 0;
+    }
+    let p = f64::from(ref_power[0].max(ref_power[1])).max(0.0);
+    let tx_peak = (4.0 * p.sqrt()).min(1.0);
+    let snr_linear = 10.0f64.powf(f64::from(snr_db) / 10.0);
+    let sigma_channel =
+        (p / snr_linear * f64::from(CHANNEL_RATE) / 2.0 / f64::from(coppa_channel::HF_NOISE_BW_HZ))
+            .sqrt();
+    let sigma_capture = sigma_channel * filter_noise_gain(native);
+    let fade_allowance = if fading { 4.0 } else { 1.0 };
+    let envelope = fade_allowance * tx_peak + 6.0 * sigma_capture;
+    if envelope <= 0.0 {
+        return 0;
+    }
+    (20.0 * (0.9 / envelope).log10()).floor().min(0.0) as i32
+}
+
+/// The noise-power factor of the native capture filter: white channel noise
+/// of variance sigma^2 reaches the capture with variance
+/// `sigma^2 * sum(h_i^2)` through `Converter::down`. The 48 kHz bypass has
+/// no filter, so its factor is exactly 1.
+fn filter_noise_gain(native: NativeFormat) -> f64 {
+    let taps = &Converter::new(native).taps;
+    if taps.is_empty() {
+        return 1.0;
+    }
+    taps.iter()
+        .map(|&h| f64::from(h) * f64::from(h))
+        .sum::<f64>()
+        .sqrt()
+}
+
 /// An odd-length Blackman-windowed lowpass with unity DC gain, cutoff as a
 /// fraction of the rate it runs at.
 fn lowpass(taps: usize, cutoff: f32) -> Vec<f32> {
@@ -333,6 +448,10 @@ impl Converter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The published coppad calibration and the SNR axis of the grid.
+    const PUBLISHED_POWER: [f32; 2] = [0.023_498, 0.020_689];
+    const GRID_SNRS: [i32; 7] = crate::compare::grid::SNRS_DB;
 
     fn round_trip(native: NativeFormat, signal: &[f32]) -> Vec<f32> {
         let mut converter = Converter::new(native);
@@ -519,5 +638,70 @@ mod tests {
             "{error}"
         );
         assert!(bytes.is_empty(), "a rejected capture block wrote bytes");
+    }
+
+    /// COP-256: f32le never touches the gain, on every rate, channel and
+    /// SNR of the grid.
+    #[test]
+    fn f32le_capture_gain_is_unity_for_the_grid() {
+        for format in ["f32le"] {
+            for rate in RATES {
+                let native = NativeFormat::declared(Some(format), Some(rate), Some(1)).unwrap();
+                for fading in [false, true] {
+                    for snr in GRID_SNRS {
+                        let capture = Capture::trial(native, fading, snr, PUBLISHED_POWER);
+                        assert_eq!(capture.gain_db, 0, "{format} {rate} {snr} dB");
+                        assert_eq!(capture.amplitude(), 1.0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// COP-256: every s16le cell of the grid gets a finite nonpositive
+    /// whole-dB gain with a multiplier in (0, 1], whatever the power order.
+    #[test]
+    fn s16le_capture_gain_covers_the_grid() {
+        for rate in RATES {
+            let native = NativeFormat::declared(Some("s16le"), Some(rate), Some(1)).unwrap();
+            for fading in [false, true] {
+                for snr in GRID_SNRS {
+                    let capture = Capture::trial(native, fading, snr, PUBLISHED_POWER);
+                    assert!(capture.gain_db <= 0, "{rate} {snr} dB: {capture:?}");
+                    let amplitude = capture.amplitude();
+                    assert!(
+                        amplitude.is_finite() && amplitude > 0.0 && amplitude <= 1.0,
+                        "{rate} {snr} dB: {amplitude}"
+                    );
+                    // Swapping the two powers must not move the gain: the
+                    // larger governs both directions.
+                    let swapped = Capture::trial(
+                        native,
+                        fading,
+                        snr,
+                        [PUBLISHED_POWER[1], PUBLISHED_POWER[0]],
+                    );
+                    assert_eq!(swapped.gain_db, capture.gain_db, "{rate} {snr} dB");
+                }
+            }
+        }
+    }
+
+    /// COP-256 AC1's pinned cell: 12 kHz WGN with the published calibrated
+    /// powers gives -7 dB at 0 dB SNR and 0 dB at 30 dB, where unity
+    /// already fits, so a COP-221 row stays valid.
+    #[test]
+    fn s16le_capture_gain_pins_wgn_12k_at_the_published_powers() {
+        let native = NativeFormat::declared(Some("s16le"), Some(12_000), Some(1)).unwrap();
+        assert_eq!(
+            Capture::trial(native, false, 0, PUBLISHED_POWER).gain_db,
+            -7
+        );
+        assert_eq!(
+            Capture::trial(native, false, 30, PUBLISHED_POWER).gain_db,
+            0
+        );
+        // A near-full-scale 0.006 TX power at 0 dB leaves only -1 dB.
+        assert_eq!(Capture::trial(native, false, 0, [0.006, 0.006]).gain_db, -1);
     }
 }

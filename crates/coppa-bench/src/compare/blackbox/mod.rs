@@ -15,10 +15,11 @@ pub mod tnc;
 
 use clap::Args;
 
-/// The black-box trial CSV header (COP-170 Design section 5; COP-227 appended `payload_crc32`).
-pub const CSV_HEADER: &str = "modem,adapter,version_reply,binary_sha256,mode,channel,snr_db,size_bytes,trial,seed,ref_power_a,ref_power_b,cap_s,outcome,connect_s,delivered_bytes,exact,transfer_s,net_bytes_per_min,drops,wall_s,cable_latency_ms,starved_ticks,overflow_ticks,payload_crc32";
+/// The black-box trial CSV header (COP-170 Design section 5; COP-227
+/// appended `payload_crc32`; COP-256 appended `capture_gain_db`).
+pub const CSV_HEADER: &str = "modem,adapter,version_reply,binary_sha256,mode,channel,snr_db,size_bytes,trial,seed,ref_power_a,ref_power_b,cap_s,outcome,connect_s,delivered_bytes,exact,transfer_s,net_bytes_per_min,drops,wall_s,cable_latency_ms,starved_ticks,overflow_ticks,payload_crc32,capture_gain_db";
 /// The number of fields in [`CSV_HEADER`] and in every black-box CSV row.
-pub const CSV_COLUMNS: usize = 25;
+pub const CSV_COLUMNS: usize = 26;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Args)]
@@ -151,7 +152,9 @@ mod tests {
     #[test]
     fn csv_header_has_csv_columns_fields() {
         assert_eq!(CSV_HEADER.split(',').count(), CSV_COLUMNS);
-        assert!(CSV_HEADER.ends_with(",payload_crc32"));
+        assert!(CSV_HEADER.ends_with(",capture_gain_db"));
+        // COP-256 appends the gain; the CRC keeps its index.
+        assert_eq!(CSV_HEADER.split(',').nth(24), Some("payload_crc32"));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 use super::{
     cable::Cable,
     guard, integrity,
-    native::{self, NativeFormat, SampleFormat},
+    native::{self, Capture, NativeFormat, SampleFormat},
     profile::Profile,
     relay::io::Relay,
     resume::{self, CsvIdentity},
@@ -273,7 +273,12 @@ fn run_trials(
     metrics: &integrity::Metrics,
 ) -> Result<()> {
     let channel = cell.channel;
+    let native = profile.audio.native()?;
     let (power, version) = calibrate(profile, root, args.ref_power.as_deref())?;
+    // COP-256: one fixed gain for the whole trial, derived from the
+    // calibrated powers, the cell and the native capture rate, and copied
+    // into every trial context of the batch.
+    let capture = Capture::trial(native, channel.preset().is_some(), args.snr, power);
     guard::check(out_dir, &profile.adapter, version.as_deref())?;
     let path = out_dir.join(format!("blackbox-{}.csv", profile.name));
     fs::create_dir_all(out_dir)?;
@@ -289,6 +294,7 @@ fn run_trials(
             version: version.as_deref().unwrap_or(""),
             seed_base: args.seed_base,
             power,
+            capture_gain_db: capture.gain_db,
             requested: (channel, args.snr, args.size),
         },
     )
@@ -310,6 +316,7 @@ fn run_trials(
             channel,
             args,
             power,
+            capture,
             lead_ms: metrics.cable_latency_ms,
             sha,
             version: version.as_deref().unwrap_or(""),
@@ -451,6 +458,8 @@ struct TrialContext<'a> {
     channel: super::super::grid::Channel,
     args: &'a BlackboxArgs,
     power: [f32; 2],
+    /// COP-256: the fixed capture gain, one value for the whole trial.
+    capture: Capture,
     lead_ms: f64,
     sha: &'a str,
     version: &'a str,
@@ -463,6 +472,7 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
         channel,
         args,
         power,
+        capture,
         lead_ms,
         sha,
         version,
@@ -484,14 +494,7 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
     let home_a = cable.station_home('A')?;
     let home_b = cable.station_home('B')?;
     let fading = channel.preset().map(WattersonPreset::config);
-    let relay = Relay::start(
-        &cable.dir,
-        profile.audio.native()?,
-        fading,
-        Some(args.snr),
-        power,
-        seed,
-    )?;
+    let relay = Relay::start_capture(&cable.dir, capture, fading, Some(args.snr), power, seed)?;
     let a = Station::launch(profile, &cable.dir.join("station-a"), &home_a, 'A')?;
     let b = Station::launch(profile, &cable.dir.join("station-b"), &home_b, 'B')?;
     let mut host_a = Host::connect(&a.command_addr, &a.data_addr)?;
@@ -663,10 +666,10 @@ fn run_trial(context: TrialContext<'_>, trial: u32, seed: u64) -> Result<String>
     eprintln!(
         "compare blackbox: {channel:?} {trial}: {outcome}, {delivered} bytes, wall {wall_s:.1} s"
     );
-    Ok(format!("{},{},{},{},{},{},{},{},{},0x{:x},{:.6},{:.6},{},{},{},{},{},{:.3},{:.3},{},{:.3},{:.0},{},{},{}\n",
+    Ok(format!("{},{},{},{},{},{},{},{},{},0x{:x},{:.6},{:.6},{},{},{},{},{},{:.3},{:.3},{},{:.3},{:.0},{},{},{},{}\n",
         profile.name, profile.adapter, version, sha, profile.mode, channel.name(), args.snr, args.size, trial, seed,
         power[0], power[1], cap_s, outcome, connect_s, delivered, exact, transfer_s, rate, drops, wall_s, lead_ms, starved, overflow,
-        score::payload_crc32(&payload)))
+        score::payload_crc32(&payload), capture.gain_db))
 }
 
 #[cfg(test)]
@@ -701,6 +704,7 @@ mod tests {
             channel: Channel::Wgn,
             args: &args,
             power: [1.0; 2],
+            capture: Capture::unity(NativeFormat::CHANNEL),
             lead_ms: 0.0,
             sha: "",
             version: "",

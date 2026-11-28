@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn blackbox_region_has_one_row_per_cell() {
-        let row = "coppad,vara,VERSION Coppa 0.16.0,abc,HF_STANDARD,wgn,30,2048,0,0x17000000,1,1,600,complete,7,2048,true,50,2457,0,58,370,0,0,0x6887c6a5\n";
+        let row = "coppad,vara,VERSION Coppa 0.16.0,abc,HF_STANDARD,wgn,30,2048,0,0x17000000,1,1,600,complete,7,2048,true,50,2457,0,58,370,0,0,0x6887c6a5,0\n";
         let text = render_blackbox(&format!("{BLACKBOX_HEADER}\n{row}{row}"));
         assert_eq!(
             text.lines()
