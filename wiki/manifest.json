@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-11-21T21:34:39Z",
-  "head_commit": "6fc2560",
+  "generated_at": "2026-11-23T07:28:45Z",
+  "head_commit": "d2bcc0a",
   "pages": [
     {
       "hash": "sha256:f1d4c028ddfd6a12e63a48b8e14db25e6d06f8d2991f85c3c70d123e9e459f6e",
@@ -490,7 +490,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:daf56c38b5e5e7f45b39f82702424b53be9a232edfc65f32b86c0d16a50680d0",
+      "hash": "sha256:5e3cb91f28f1bada5f7f1966565b42b493dc7d8e7b0563e668494cd6b50a7a48",
       "id": "daemon-test-quiet-windows",
       "kind": "gotcha",
       "links": [
@@ -505,8 +505,8 @@
       ],
       "status": "current",
       "title": "What will bite you when a daemon test waits on a quiet window?",
-      "verified_commit": "701a6e4",
-      "verified_date": "2026-11-19",
+      "verified_commit": "d2bcc0a",
+      "verified_date": "2026-11-23",
       "visibility": "public"
     },
     {
