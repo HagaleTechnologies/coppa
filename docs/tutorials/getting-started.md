@@ -318,8 +318,8 @@ applies (it accepts full tracing filter expressions), and an absent or invalid
 
 ```bash
 cargo run -p coppa-daemon --bin coppad -- --config my_config.toml --log-level debug
-# info everywhere, debug for the daemon's own log target (coppad)
-RUST_LOG=info,coppad=debug cargo run -p coppa-daemon --bin coppad
+# info everywhere, debug for the binary and shared daemon modules
+RUST_LOG=info,coppad=debug,coppa_daemon=debug cargo run -p coppa-daemon --bin coppad
 ```
 
 `--tnc` runs the AFSK 1200/AX.25 KISS TNC instead of the OFDM daemon, with its

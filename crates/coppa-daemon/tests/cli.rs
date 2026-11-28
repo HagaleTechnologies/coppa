@@ -1420,6 +1420,115 @@ fn ws_host_toml(extra: &str) -> String {
     )
 }
 
+/// Shared event-loop modules must use the library tracing target on both sinks.
+#[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
+#[tokio::test]
+async fn shared_event_loop_log_targets() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::io::Write;
+    use tokio::time::timeout;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let dir = TempDir::new("shared-log-targets");
+    dir.write(
+        "station.toml",
+        &ws_host_toml("vara_enabled = true\nvara_command_port = 0\nvara_data_port = 0\n"),
+    );
+    let (mut daemon, _) = start_until(
+        dir.path(),
+        &["--config", "station.toml"],
+        &[("RUST_LOG", "info,coppad=debug,coppa_daemon=debug")],
+        "Daemon ready",
+    );
+    let stdout = daemon.stdout();
+    let port = websocket_port(&stdout);
+    let command_addr = stdout
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("command_addr="))
+        .expect("VARA command address")
+        .to_string();
+    let mut request = format!("ws://127.0.0.1:{port}/ws")
+        .into_client_request()
+        .expect("WebSocket request");
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {WS_TOKEN}").parse().expect("bearer header"),
+    );
+    let (mut socket, _) = timeout(DEADLINE, tokio_tungstenite::connect_async(request))
+        .await
+        .expect("WebSocket connect deadline")
+        .expect("WebSocket connect");
+    timeout(
+        DEADLINE,
+        socket.send(Message::text(r#"{"type":"log","enabled":true,"id":1}"#)),
+    )
+    .await
+    .expect("log subscription deadline")
+    .expect("subscribe to logs");
+    let ack = timeout(DEADLINE, async {
+        loop {
+            let frame = socket
+                .next()
+                .await
+                .expect("log acknowledgement frame")
+                .expect("read log acknowledgement");
+            let value: serde_json::Value =
+                serde_json::from_str(frame.to_text().expect("ack text")).expect("ack JSON");
+            if value["type"] == "ack" {
+                break value;
+            }
+        }
+    })
+    .await
+    .expect("log acknowledgement deadline");
+    assert_eq!(ack, serde_json::json!({"type":"ack","id":1}));
+
+    let mut command = std::net::TcpStream::connect(command_addr).expect("VARA command connect");
+    command.write_all(b"LISTEN ON\r").expect("send LISTEN ON");
+    let message = timeout(DEADLINE, async {
+        loop {
+            let frame = socket
+                .next()
+                .await
+                .expect("log frame")
+                .expect("read log frame");
+            let value: serde_json::Value =
+                serde_json::from_str(frame.to_text().expect("log text")).expect("log JSON");
+            if value["type"] == "log"
+                && value["message"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Listening for incoming connections"))
+            {
+                break value;
+            }
+        }
+    })
+    .await
+    .expect("event-loop log deadline");
+    assert_eq!(message["level"], "info");
+    assert!(
+        message["message"]
+            .as_str()
+            .expect("log message")
+            .starts_with("coppa_daemon::event_loop:"),
+        "{message}"
+    );
+    let deadline = Instant::now() + DEADLINE;
+    while !daemon.stdout().contains("VARA command received") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (stdout, stderr) = daemon.kill();
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("DEBUG coppa_daemon::event_loop:")
+                && line.contains("VARA command received")
+                && line.contains("command=LISTEN ON")),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 /// Kill `daemon` and assert the WebSocket token never reached its output.
 #[cfg(all(feature = "websocket", not(feature = "cpal-backend")))]
 fn kill_without_leaking_the_token(daemon: &mut Daemon) {

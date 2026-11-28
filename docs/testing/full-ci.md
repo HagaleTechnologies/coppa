@@ -135,6 +135,18 @@ below 1800 seconds and no test/job timeouts. Report queue time separately
 and include other required jobs in the critical path. Hosted confirmation
 is pending.
 
+## COP-249 daemon-unit deduplication
+
+On 2026-11-27, COP-249 moved `coppad`'s shared daemon modules to the
+`coppa_daemon` library. With the `daemon-unit` group's exact features and `ci`
+profile, the library retains 774 test paths (770 passed, 4 ignored). The binary
+retains 22 bin-only paths (22 passed, 0 ignored). The group now runs 796
+distinct paths: 792 passed and 4 ignored. Before the change, its library and
+binary inventories contained 774 and 743 paths respectively, with 721 shared
+paths. The union of paths and the union of ignored paths are unchanged; each
+shared path now runs once. The COP-200 counts below are a dated historical
+measurement before this deduplication.
+
 ## Local execution record
 
 Measured on 2026-11-13 in the COP-200 working tree. Each cold run started
