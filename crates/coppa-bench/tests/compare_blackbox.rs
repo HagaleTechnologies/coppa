@@ -62,7 +62,9 @@ fn cable_integrity_probe() {
 #[ignore = "requires ALSA file PCM and real time"]
 fn native_s16le_12k_integrity_probe() {
     let root = coppa_bench::compare::repo_root();
-    let source = fs::read_to_string(root.join("tools/compare/coppad.toml")).unwrap();
+    let source = fs::read_to_string(root.join("tools/compare/coppad.toml"))
+        .unwrap()
+        .replace("\r\n", "\n");
     let source = source
         .replace("name = \"coppad\"", "name = \"native-s16le-12k\"")
         .replace("target/release/coppad", "/bin/true")
@@ -98,7 +100,9 @@ fn native_s16le_12k_integrity_probe() {
 #[test]
 fn undeclared_or_unsupported_audio_exits_1_naming_the_key() {
     let root = coppa_bench::compare::repo_root();
-    let source = fs::read_to_string(root.join("tools/compare/coppad.toml")).unwrap();
+    let source = fs::read_to_string(root.join("tools/compare/coppad.toml"))
+        .unwrap()
+        .replace("\r\n", "\n");
     let dir = std::env::temp_dir().join(format!("coppa-audio-key-test-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let start = source.find("\n[audio]\nformat").unwrap();
