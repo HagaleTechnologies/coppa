@@ -18090,36 +18090,16 @@ mod tests {
         }
 
         /// `connect_mock_vara_client`'s socket/server wiring plus the event
-        /// bridge `main.rs` installs: the server's `HostEvent`s are forwarded
-        /// into the loop's own channel, so commands written on the socket
-        /// reach `handle_host_event` for real and get their reply. Tests that
-        /// drive commands through the socket (rather than injecting
-        /// `DaemonEvent::Host` by hand) need this helper AND a running
-        /// `run()` (in a `LocalSet`), or nothing consumes the forwarded
-        /// events.
-        async fn connect_bridged_vara_client(
-            event_loop: &mut EventLoop,
-            cmd_port: u16,
-            data_port: u16,
-        ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
-            let cmd_listener = tokio::net::TcpListener::bind(("127.0.0.1", cmd_port))
-                .await
-                .expect("bind VARA command port");
-            let data_listener = tokio::net::TcpListener::bind(("127.0.0.1", data_port))
-                .await
-                .expect("bind VARA data port");
-            connect_bridged_vara_client_on(event_loop, cmd_listener, data_listener).await
-        }
-
-        /// `connect_bridged_vara_client` on OS-assigned ports: binds both
-        /// listeners to `127.0.0.1:0` and returns the data port's actual
-        /// address alongside the command-port client, so concurrent test runs
-        /// (separate worktrees, parallel CI slots) can never cross-attach.
+        /// bridge `main.rs` installs. Both listeners use OS-assigned ports;
+        /// their addresses are returned for tests with another client or a
+        /// data-port connection. A running `run()` in a `LocalSet` consumes
+        /// the forwarded host events and sends the replies.
         async fn connect_bridged_vara_client_ephemeral(
             event_loop: &mut EventLoop,
         ) -> (
             BufReader<OwnedReadHalf>,
             OwnedWriteHalf,
+            std::net::SocketAddr,
             std::net::SocketAddr,
         ) {
             let cmd_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -18128,18 +18108,8 @@ mod tests {
             let data_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
                 .await
                 .expect("bind VARA data port");
-            let data_addr = data_listener.local_addr().expect("data listener address");
-            let (reader, writer) =
-                connect_bridged_vara_client_on(event_loop, cmd_listener, data_listener).await;
-            (reader, writer, data_addr)
-        }
-
-        async fn connect_bridged_vara_client_on(
-            event_loop: &mut EventLoop,
-            cmd_listener: tokio::net::TcpListener,
-            data_listener: tokio::net::TcpListener,
-        ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
             let cmd_addr = cmd_listener.local_addr().expect("command listener address");
+            let data_addr = data_listener.local_addr().expect("data listener address");
             let mut server = VaraServer::new(cmd_addr.port(), 0);
             event_loop.set_vara_responses(server.response_senders());
             let mut events = server.take_event_rx().expect("fresh server");
@@ -18172,7 +18142,7 @@ mod tests {
                 greeting
             );
 
-            (reader, write_half)
+            (reader, write_half, cmd_addr, data_addr)
         }
 
         /// Read one `\r`-terminated VARA response line, timing out (rather than
@@ -18796,12 +18766,12 @@ mod tests {
         /// ID), commands it accepts-but-ignores (`COMPRESSION`, `LISTEN`),
         /// `MYCALL`, `VERSION` and garbage — each gets exactly one reply, in
         /// order, and no reply is doubled.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn pat_startup_commands_each_get_their_reply() {
             let config = fast_ptt_config();
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, mut write_half) =
-                connect_bridged_vara_client(&mut event_loop, 19448, 19449).await;
+            let (mut reader, mut write_half, _command_addr, _data_addr) =
+                connect_bridged_vara_client_ephemeral(&mut event_loop).await;
 
             let local = tokio::task::LocalSet::new();
             local.spawn_local(async move {
@@ -18856,7 +18826,7 @@ mod tests {
         async fn connect_gets_ok_before_its_outcome() {
             let config = session_config();
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, mut write_half, _data_addr) =
+            let (mut reader, mut write_half, _command_addr, _data_addr) =
                 connect_bridged_vara_client_ephemeral(&mut event_loop).await;
 
             let local = tokio::task::LocalSet::new();
@@ -18911,12 +18881,12 @@ mod tests {
         /// COP-28: `DISCONNECT` gets its `OK` on the socket, whether or not a
         /// session existed (the session-existence cases are covered by
         /// `local_disconnect_timeout_and_failed_connect_push_disconnected`).
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn disconnect_gets_ok() {
             let config = fast_ptt_config();
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, mut write_half) =
-                connect_bridged_vara_client(&mut event_loop, 19458, 19459).await;
+            let (mut reader, mut write_half, _command_addr, _data_addr) =
+                connect_bridged_vara_client_ephemeral(&mut event_loop).await;
 
             let local = tokio::task::LocalSet::new();
             local.spawn_local(async move {
@@ -18937,15 +18907,15 @@ mod tests {
 
         /// COP-28: a reply goes only to the client that asked, never to every
         /// attached command-port client.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn replies_go_only_to_the_client_that_asked() {
             let config = fast_ptt_config();
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader_a, mut write_a) =
-                connect_bridged_vara_client(&mut event_loop, 19452, 19453).await;
+            let (mut reader_a, mut write_a, command_addr, _data_addr) =
+                connect_bridged_vara_client_ephemeral(&mut event_loop).await;
 
             // A second raw client on the same server: greeting, then silence.
-            let stream_b = TcpStream::connect(("127.0.0.1", 19452)).await.unwrap();
+            let stream_b = TcpStream::connect(command_addr).await.unwrap();
             let (read_b, _write_b) = stream_b.into_split();
             let mut reader_b = BufReader::new(read_b);
             assert!(
@@ -19018,14 +18988,14 @@ mod tests {
         /// Uses a shortened `vara_keepalive_period` so the test runs in
         /// milliseconds; the real 60 s constant is pinned by
         /// `keepalive_sends_iamalive_every_sixty_seconds`.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn iamalive_reaches_the_command_port_while_running() {
             let config = fast_ptt_config();
             let mut event_loop = EventLoop::new(config).unwrap();
             event_loop.vara_keepalive_period = Duration::from_millis(250);
-            let (mut reader, _write_half) =
-                connect_bridged_vara_client(&mut event_loop, 19456, 19457).await;
-            let started = Instant::now();
+            let (mut reader, _write_half, _command_addr, _data_addr) =
+                connect_bridged_vara_client_ephemeral(&mut event_loop).await;
+            let started = tokio::time::Instant::now();
 
             let local = tokio::task::LocalSet::new();
             local.spawn_local(async move {
@@ -19488,7 +19458,7 @@ mod tests {
             let mut event_loop = EventLoop::new(fast_ptt_config()).unwrap();
             let (producer, mut consumer) = coppa_audio::audio_ring(1_000_000);
             event_loop.set_audio_out(producer);
-            let (mut reader, _write_half, data_addr) =
+            let (mut reader, _write_half, _command_addr, data_addr) =
                 connect_bridged_vara_client_ephemeral(&mut event_loop).await;
             let mut data = TcpStream::connect(data_addr).await.unwrap();
             let tx = event_loop.event_sender();
@@ -19520,7 +19490,7 @@ mod tests {
             let mut config = fast_ptt_config();
             config.engine.callsign = "N0CALL".into();
             let mut event_loop = EventLoop::new(config).unwrap();
-            let (mut reader, mut writer, data_addr) =
+            let (mut reader, mut writer, _command_addr, data_addr) =
                 connect_bridged_vara_client_ephemeral(&mut event_loop).await;
             let mut data = TcpStream::connect(data_addr).await.unwrap();
             let tx = event_loop.event_sender();
@@ -20165,7 +20135,7 @@ mod tests {
         #[tokio::test]
         async fn session_send_counts_as_activity() {
             let mut event_loop = EventLoop::new(session_config()).unwrap();
-            let (mut reader, _write_half, _data_addr) =
+            let (mut reader, _write_half, _command_addr, _data_addr) =
                 connect_bridged_vara_client_ephemeral(&mut event_loop).await;
             let id = seed_established(&mut event_loop);
 
